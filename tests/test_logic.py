@@ -26,6 +26,7 @@ import MetaTrader5 as mt5
 
 import mt5_core as core
 import mt5_trade as trade
+import strategy
 
 
 # ---------- ตัวช่วย ----------
@@ -220,6 +221,176 @@ def test_corrupt_state_file_is_ignored(tmp_path=None):
         handle.write("{ไม่ใช่ json")
 
     assert core.load_state(path) == {}
+
+
+# ---------- ADX ----------
+
+def test_adx_is_high_in_a_clean_trend():
+    closes = pd.Series(range(100, 200), dtype=float)
+    df = pd.DataFrame({"high": closes + 1, "low": closes - 1, "close": closes})
+    assert core.calculate_adx(df, 14).iloc[-1] > 40
+
+
+def test_adx_is_low_in_chop():
+    """ตลาดเด้งขึ้นลงสลับ ADX ต้องต่ำ — นี่คือสภาพที่ตัวกรองต้องจับได้"""
+    closes = pd.Series([100 + (1 if i % 2 else -1) for i in range(120)], dtype=float)
+    df = pd.DataFrame({"high": closes + 0.5, "low": closes - 0.5, "close": closes})
+    assert core.calculate_adx(df, 14).iloc[-1] < 25
+
+
+def test_ma_trend_reads_the_closed_candle():
+    df = pd.DataFrame({"ma_fast": [1, 1, 1, 5, 0], "ma_slow": [2, 2, 2, 2, 2]})
+    assert core.ma_trend(df) == "UPTREND"
+
+
+# ---------- งบความเสี่ยงกับพอร์ตเล็ก ----------
+
+def test_minimum_lot_can_exceed_the_risk_budget_on_a_small_account():
+    """
+    พอร์ต 1000 USD เสี่ยง 0.5% = งบ 5 USD
+    แต่ไม้เล็กสุด 0.01 lot กับ SL 16.3 USD เสี่ยงจริง 16.3 USD
+    ต้องตรวจจับได้ ไม่ใช่ปล่อยให้ normalize_volume ปัดขึ้นแล้วเทรดเกินงบเงียบๆ
+    """
+    class SmallAccount(FakeAccount):
+        balance = 1000.0
+
+    info = FakeSymbolInfo()
+    sl_distance = 10.87 * 1.5
+
+    assert trade.lot_exceeds_budget(info, SmallAccount(), sl_distance, 0.5)
+    # normalize_volume ยังปัดขึ้นถึง volume_min อยู่ดี — จึงต้องมีตัวตรวจแยก
+    assert trade.calculate_lot(info, SmallAccount(), sl_distance, 0.5) == info.volume_min
+
+
+def test_budget_is_fine_on_a_large_enough_account():
+    info = FakeSymbolInfo()
+    assert not trade.lot_exceeds_budget(info, FakeAccount(), 10.87 * 1.5, 1.0)
+
+
+def test_risk_budget_is_a_percentage_of_balance():
+    assert trade.risk_budget(FakeAccount(), 1.0) == 100.0
+
+
+# ---------- เครื่องตัดสินใจหลาย timeframe ----------
+
+def _passing_context(signal="BUY"):
+    return {
+        "m15_signal": signal,
+        "h1_trend": "UPTREND" if signal == "BUY" else "DOWNTREND",
+        "m5_trend": "UPTREND" if signal == "BUY" else "DOWNTREND",
+        "adx": 28.0,
+        "rsi": 55.0,
+        "spread_points": 20.0,
+        "server_hour": 14,
+    }
+
+
+def _with_filters(**overrides):
+    """ตั้งสวิตช์ตัวกรองชั่วคราวแล้วคืนค่าเดิม"""
+    saved = {name: getattr(strategy, name) for name in overrides}
+    for name, value in overrides.items():
+        setattr(strategy, name, value)
+    return saved
+
+
+def _restore(saved):
+    for name, value in saved.items():
+        setattr(strategy, name, value)
+
+
+def test_hold_signal_never_enters():
+    decision = strategy.evaluate(_passing_context("HOLD"))
+    assert decision.signal == "HOLD"
+    assert not decision.enter
+
+
+def test_all_filters_passing_enters():
+    decision = strategy.evaluate(_passing_context("BUY"))
+    assert decision.enter, decision.summary()
+    assert decision.blockers == []
+
+
+def test_h1_trend_against_the_signal_blocks_entry():
+    context = _passing_context("BUY")
+    context["h1_trend"] = "DOWNTREND"
+
+    decision = strategy.evaluate(context)
+    assert not decision.enter
+    assert any("H1" in check.name for check in decision.blockers)
+
+
+def test_low_adx_blocks_entry():
+    context = _passing_context("BUY")
+    context["adx"] = 12.0
+
+    decision = strategy.evaluate(context)
+    assert not decision.enter
+    assert any("ADX" in check.name for check in decision.blockers)
+
+
+def test_overbought_rsi_blocks_a_buy():
+    context = _passing_context("BUY")
+    context["rsi"] = 82.0
+    assert not strategy.evaluate(context).enter
+
+
+def test_oversold_rsi_blocks_a_sell():
+    context = _passing_context("SELL")
+    context["rsi"] = 18.0
+    assert not strategy.evaluate(context).enter
+
+
+def test_opposite_m5_blocks_entry():
+    context = _passing_context("BUY")
+    context["m5_trend"] = "DOWNTREND"
+    assert not strategy.evaluate(context).enter
+
+
+def test_sideway_m5_does_not_block():
+    """M5 มักตามหลังจุดตัดของ M15 จึงขอแค่ไม่สวนทาง ไม่บังคับให้ตรงทิศ"""
+    context = _passing_context("BUY")
+    context["m5_trend"] = "SIDEWAY"
+    assert strategy.evaluate(context).enter
+
+
+def test_wide_spread_blocks_entry():
+    context = _passing_context("BUY")
+    context["spread_points"] = 500.0
+    assert not strategy.evaluate(context).enter
+
+
+def test_session_filter_blocks_outside_hours_when_enabled():
+    saved = _with_filters(USE_SESSION_FILTER=True)
+    try:
+        context = _passing_context("BUY")
+        context["server_hour"] = 3
+        assert not strategy.evaluate(context).enter
+
+        context["server_hour"] = 14
+        assert strategy.evaluate(context).enter
+    finally:
+        _restore(saved)
+
+
+def test_disabling_a_filter_lets_the_trade_through():
+    context = _passing_context("BUY")
+    context["h1_trend"] = "DOWNTREND"
+    assert not strategy.evaluate(context).enter
+
+    saved = _with_filters(USE_H1_TREND_FILTER=False)
+    try:
+        assert strategy.evaluate(context).enter
+    finally:
+        _restore(saved)
+
+
+def test_report_explains_every_check():
+    context = _passing_context("BUY")
+    context["adx"] = 5.0
+
+    report = strategy.evaluate(context).report()
+    assert "ไม่ผ่าน" in report
+    assert "ADX" in report
 
 
 # ---------- ตัวรันแบบไม่ต้องมี pytest ----------

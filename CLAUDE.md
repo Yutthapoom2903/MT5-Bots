@@ -4,120 +4,125 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-MetaTrader 5 scripts for XAUUSD (gold) on M15, built around a single MA20/MA50 crossover
-rule. Two shared modules hold the logic; every other `.py` file is a thin top-level script
-that connects to MT5, does one job, and shuts down.
+A multi-timeframe XAUUSD bot on MetaTrader 5. MA20/MA50 crossover on M15 is the trigger;
+H1 sets direction, M5 confirms, and ADX/RSI/spread veto. It logs every closed candle with
+its own verdict and reasoning, and places orders only when explicitly told to.
 
-- `mt5_core.py` — connection, symbol setup, rate fetching, indicators, the crossover rule,
-  logging setup, and restart-safe state persistence. Everything imports this.
-- `mt5_trade.py` — everything that talks to the broker: price/volume normalization, stop
-  distance, filling-mode selection, risk-based lot sizing, order send/close. Only
-  `bot_integrated.py` imports it; the logger scripts must stay free of it.
+`run.py` is the single entry point — every capability is a subcommand of it. Do not add
+standalone top-level scripts; add a subcommand instead. Earlier revisions had four separate
+bot scripts each opening its own MT5 connection and re-implementing the crossover; they
+were consolidated for exactly that reason.
+
+```
+run.py          CLI: check | symbols | signal | watch | trade | backtest | test | all
+runner.py       the one loop — fetch once per candle, then log + decide + optionally trade
+strategy.py     pure decision engine: context dict in, Decision out. No MT5 imports.
+mt5_core.py     connect, symbol setup, rates, indicators, the crossover rule, logging, state
+mt5_trade.py    broker-facing only: price/volume normalization, stop distance, filling
+                mode, risk sizing, order send/close. Imported by runner.py alone.
+backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
+tests/          40 logic tests, no MT5 required
+```
 
 ## Running
 
-Every script talks to a **running MT5 terminal on the same machine** through the
-`MetaTrader5` package, which is **Windows-only**. The repo lives under WSL, but the bots
-must run with Windows Python against an open, logged-in MT5 terminal — they cannot execute
-from the Linux side. `backtest_engine.py` is the exception: it only reads a CSV and runs
-anywhere pandas is installed.
+The `MetaTrader5` package is **Windows-only** and talks to an already-running, logged-in
+terminal with Algo Trading enabled. The repo lives under WSL, so most commands cannot run
+from the Linux side.
 
-```powershell
-pip install -r requirements.txt
-
-python check_mt5.py            # verify connection + print account info
-python list_symbols.py         # find the broker's actual gold/EURUSD/BTC symbol names
-python bot_signal.py           # one-shot: print current signal and exit
-python bot_monitor.py          # loop: append signals to signal_log.csv (no orders)
-python bot_feature_logger.py   # loop: append features to market_training_data.csv (no orders)
-python bot_integrated.py       # loop: LIVE — sends real market orders + Telegram alerts
-python backtest_engine.py      # score the hand-labelled decisions in the training CSV
-```
-
-Logic tests run anywhere — they stub `MetaTrader5` when the real package is absent, so
-no terminal is needed:
+`run.py` defers all MT5 imports into the individual command functions, so `backtest` and
+`test` work anywhere pandas is installed. Keep it that way — do not add a module-level
+`import MetaTrader5` to `run.py`.
 
 ```bash
-python tests/test_logic.py     # no extra dependencies
-pytest tests/                  # if pytest is installed
+python run.py test         # 40 logic tests, runs under WSL
+python run.py backtest     # runs under WSL
+pytest tests/              # same tests, if pytest is installed
 ```
 
-They cover the closed-candle invariant and the broker-facing arithmetic (digit rounding,
-volume stepping, stop distance, risk sizing) — the parts that fail silently and cost money.
-Anything that needs a live terminal is out of scope and must be checked on a demo account.
-There is no linter config.
+`tests/stubs/MetaTrader5.py` supplies constants when the real package is missing and is
+skipped when it is present, so the suite tests against real constants on Windows. When you
+reference a new `mt5.CONSTANT` in library code, add it to the stub or the suite breaks
+under WSL.
 
-**`bot_integrated.py` places real orders.** It refuses to start on a non-demo account
-unless `ALLOW_LIVE_ACCOUNT` is set to `True` in the file — do not flip that flag on the
-user's behalf, and never run the script without explicit confirmation.
+**`run.py trade` places real orders.** It refuses to start on a non-demo account unless
+`ALLOW_LIVE_ACCOUNT` is `True` in `runner.py` — never flip that flag on the user's behalf,
+and never run the command without explicit confirmation.
 
-## Signal logic — the invariant to preserve
+## Invariants
 
-`mt5_core.crossover_signal()` is the single implementation; no script may re-derive it.
+**Closed candles only.** `df.iloc[-2]` (`core.CLOSED`) against `df.iloc[-3]`
+(`core.PREVIOUS`). `df.iloc[-1]` (`core.FORMING`) is the candle still building and must
+never reach a decision — reading it makes signals flip mid-candle. `core.crossover_signal()`
+and `core.ma_trend()` are the only implementations; nothing may re-derive them.
 
-- Compare `df.iloc[-3]` (`core.PREVIOUS`) against `df.iloc[-2]` (`core.CLOSED`).
-- `df.iloc[-1]` (`core.FORMING`) is the candle still building and is deliberately never
-  used — reading it would make signals flip mid-candle.
-- Fast crossing above slow → `BUY`; below → `SELL`; otherwise `HOLD`. NaN warm-up rows
-  yield `HOLD`.
+**One fetch per cycle.** `runner.build_context()` pulls M15/H1/M5 once and returns a plain
+dict. `strategy.evaluate()` takes that dict and nothing else — keep it free of MT5 imports
+so it stays testable.
 
-All loops poll every 30s and guard on the closed candle's timestamp so a candle is acted on
-once. `bot_integrated.py` persists that timestamp to `bot_state.json`, so a restart
-mid-candle does not re-fire an order — the in-memory-only guard used by the logger scripts
-is fine for them because they never place orders.
+**Every verdict carries its reasons.** `Decision.checks` records each filter's pass/fail
+and the numbers behind it; blockers land in `bot_blockers` in the feature CSV and in
+`bot.log`. A filter that silently returns a boolean is a regression.
 
-RSI and ATR in `mt5_core.py` use Wilder smoothing (`ewm(alpha=1/period)`) to match what MT5
-and TradingView display. Rows logged before 2026-09-09 used a simple rolling mean instead,
-so early `rsi_14` / `atr_14` values in `market_training_data.csv` are not comparable to
-later ones.
+**The candle timestamp guard persists.** `bot_state.json` holds the last processed candle
+so a restart mid-candle cannot re-fire an order.
 
-## Risk model in bot_integrated.py
+## Risk model
 
-Do not reintroduce fixed point-based stops. On XAUUSD `point` is `0.01`, so the old
-`300 * point` stop was **$3.00** against an ATR around `$11` — inside the noise, and
-usually inside the broker's minimum stop distance as well.
+Do not reintroduce fixed point-based stops. On XAUUSD `point` is `0.01`, so the original
+`300 * point` stop was **$3.00** against an ATR near `$11` — inside the noise and usually
+inside the broker's minimum stop distance.
 
 - SL/TP are `ATR × SL_ATR_MULT` / `ATR × TP_ATR_MULT`, floored at
-  `mt5_trade.min_stop_distance()` (the larger of `trade_stops_level`, 3× spread, and 10
-  points — brokers that report `trade_stops_level = 0` use a dynamic spread-based limit).
-- Lot size is derived from `RISK_PERCENT` of balance and the SL distance via
-  `trade_tick_value` / `trade_tick_size`, then floored to `volume_step`. Set
-  `USE_FIXED_LOT = True` to bypass.
-- Levels are computed from the live tick, never from the closed candle's `close`.
-- `pick_filling_modes()` reads the symbol's `filling_mode` bitmask and the order retries
-  down the list on retcode 10030; retcodes are numeric constants in `mt5_trade.py` because
-  their names vary across package versions.
-- Before entering: symbol tradable, spread under `MAX_SPREAD_POINTS`, ATR valid, and no
-  existing position with the same `MAGIC` (an opposite one is closed first when
-  `CLOSE_ON_REVERSE`).
+  `trade.min_stop_distance()` (max of `trade_stops_level`, 3× spread, 10 points — brokers
+  reporting `trade_stops_level = 0` use a dynamic spread-based limit).
+- Levels come from the live tick, never the closed candle's `close`.
+- Lot size derives from `RISK_PERCENT` and the SL distance via `trade_tick_value` /
+  `trade_tick_size`, floored to `volume_step`.
+- **`normalize_volume()` clamps up to `volume_min`, which can silently exceed the risk
+  budget on a small account** — 0.01 lot with a $16 stop risks $16, which is 1.6% of a
+  $1,000 account, not the configured 1%. `trade.lot_exceeds_budget()` catches this and
+  `runner.execute()` refuses the trade unless `ALLOW_RISK_OVER_BUDGET`. Any new sizing path
+  must keep that check.
+- `pick_filling_modes()` reads the symbol's `filling_mode` bitmask and retries down the list
+  on retcode 10030. Retcodes are numeric constants in `mt5_trade.py` because their names
+  vary across package versions.
+
+`run.py check` prints this arithmetic against the live account and is the fastest way to
+answer "why is the bot not entering anything".
 
 ## Data files
 
 CSVs are appended in place (`mode="a"`, header only when absent) and committed to git —
-accumulating data, not build output. `bot.log` and `bot_state.json` are runtime artifacts
-and are gitignored.
+accumulating data, not build output. `bot.log` and `bot_state.json` are gitignored.
 
-- `signal_log.csv` — one row per closed candle from `bot_monitor.py`.
-- `trade_log.csv` — one row per order attempt from `bot_integrated.py`, successes and
-  failures alike.
-- `market_training_data.csv` — one row per closed candle from `bot_feature_logger.py`. The
-  trailing columns (`your_decision`, `your_reason`, `entry_price`, `stop_loss`,
-  `take_profit`, `trade_result`) are intentionally blank for the user to fill in by hand in
-  Excel. `backtest_engine.py` reads only those hand-labelled columns — it scores the
-  human's decisions, not the bot's signal.
+- `signal_log.csv` — one row per closed candle.
+- `trade_log.csv` — one row per order attempt, successes and failures alike.
+- `market_training_data.csv` — full market state plus `bot_decision` / `bot_blockers`, with
+  `your_decision`, `your_reason`, `entry_price`, `stop_loss`, `take_profit`, `trade_result`
+  left blank for the user to fill in by hand. `backtest_engine.py` reads only the
+  hand-labelled columns — it scores the human, not the bot.
+
+Column sets have changed over time: rows before 2026-09-09 used a simple rolling mean for
+RSI/ATR (now Wilder) and lack `adx_14`, `m5_trend`, `bot_decision`, `bot_blockers`.
 
 ## Conventions
 
-Console output, log messages, and comments are Thai; identifiers, config constants, and CSV
-column names are English. Config lives as UPPERCASE module-level constants at the top of
-each script — keep new settings in that form rather than introducing a config file. Scripts
-put their work in `main()` behind `if __name__ == "__main__":` with `mt5.shutdown()` in a
-`finally`, and raise `core.MT5Error` for unrecoverable MT5 failures.
+Console output, log messages, docstrings, and comments are Thai; identifiers, config
+constants, and CSV column names are English. Config lives as UPPERCASE module-level
+constants at the top of `runner.py` (market, risk, files) and `strategy.py` (filter
+switches) — no config file. Strategy filters must stay individually toggleable so their
+effect can be measured one at a time.
 
-Broker symbol names vary (`XAUUSD`, `XAUUSD.m`, `GOLD`…). `SYMBOL` is hardcoded to
-`"XAUUSD"` everywhere; use `list_symbols.py` to confirm what the connected broker exposes.
+Unrecoverable MT5 failures raise `core.MT5Error`; `run.py` catches it and puts
+`mt5.shutdown()` in a `finally`.
+
+Broker symbol names vary (`XAUUSD`, `XAUUSD.m`, `GOLD`…). `SYMBOL` in `runner.py` is
+hardcoded to `"XAUUSD"`; `run.py symbols` confirms what the connected broker exposes.
 
 ## Outstanding
 
-The Telegram token in the first two commits (`git show a30efaf:.env`) has not been
-confirmed rotated. `.env` is untracked now, but the old value is still readable in history.
+- Never verified against a live MT5 terminal. Broker behaviour — retcodes, stop levels,
+  filling modes — is unproven. Demo first.
+- The Telegram token in the first two commits (`git show a30efaf:.env`) has not been
+  confirmed rotated. `.env` is untracked now, but the old value remains in history.

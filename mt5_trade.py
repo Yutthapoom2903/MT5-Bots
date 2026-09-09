@@ -121,6 +121,28 @@ def calculate_lot(info, account, sl_distance, risk_percent):
     return normalize_volume(info, risk_money / loss_per_lot)
 
 
+def lot_exceeds_budget(info, account, sl_distance, risk_percent):
+    """
+    True เมื่อไม้เล็กที่สุดที่ broker ยอมให้เปิด ยังเสี่ยงเกินงบที่ตั้งไว้
+
+    เกิดได้จริงกับพอร์ตเล็ก: XAUUSD lot ขั้นต่ำ 0.01 กับ SL ราว 16 USD
+    เท่ากับเสี่ยง 16 USD ต่อไม้ ซึ่งเกิน 0.5% ของพอร์ต 1000 USD ไปหลายเท่า
+    normalize_volume จะปัดขึ้นให้ถึง volume_min เสมอ ความเสี่ยงจึงเกินงบเงียบๆ
+    ถ้าไม่ตรวจตรงนี้
+    """
+    minimum_loss = estimated_loss(info, info.volume_min, sl_distance)
+
+    if minimum_loss is None:
+        return False
+
+    return minimum_loss > risk_budget(account, risk_percent)
+
+
+def risk_budget(account, risk_percent):
+    """จำนวนเงินที่ยอมเสียได้ต่อไม้ตามเปอร์เซ็นต์ที่ตั้งไว้"""
+    return account.balance * (risk_percent / 100)
+
+
 def estimated_loss(info, lots, sl_distance):
     """ประมาณเงินที่จะเสียถ้าโดน SL — ใช้แสดงใน log และ Telegram"""
     tick_value = getattr(info, "trade_tick_value", 0) or 0

@@ -200,3 +200,56 @@ def save_state(path, state):
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(state, handle, ensure_ascii=False, indent=2)
     os.replace(temp_path, path)
+
+
+def calculate_adx(df, period=14):
+    """
+    ADX แบบ Wilder — วัดว่า "มีเทรนด์แค่ไหน" ไม่ได้บอกทิศ
+
+    ต่ำกว่า 20 ถือว่าตลาดไม่มีเทรนด์ (sideway) ซึ่งเป็นสภาพที่ MA crossover
+    ให้สัญญาณหลอกถี่ที่สุด จึงใช้เป็นตัวกรองหลักของบอท
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move.clip(lower=0)
+    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move.clip(lower=0)
+
+    previous_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - previous_close).abs(),
+        (low - previous_close).abs(),
+    ], axis=1).max(axis=1)
+
+    alpha = 1 / period
+    atr = true_range.ewm(alpha=alpha, adjust=False).mean()
+
+    plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, float("nan"))
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr.replace(0, float("nan"))
+
+    di_sum = (plus_di + minus_di).replace(0, float("nan"))
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+
+    return dx.ewm(alpha=alpha, adjust=False).mean()
+
+
+def ma_trend(df):
+    """ทิศของ MA บนแท่งที่ปิดแล้ว — UPTREND / DOWNTREND / SIDEWAY / UNKNOWN"""
+    if df is None or len(df) < abs(PREVIOUS):
+        return "UNKNOWN"
+
+    candle = df.iloc[CLOSED]
+
+    if pd.isna(candle.get("ma_fast")) or pd.isna(candle.get("ma_slow")):
+        return "UNKNOWN"
+
+    if candle["ma_fast"] > candle["ma_slow"]:
+        return "UPTREND"
+
+    if candle["ma_fast"] < candle["ma_slow"]:
+        return "DOWNTREND"
+
+    return "SIDEWAY"

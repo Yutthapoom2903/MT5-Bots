@@ -7,7 +7,9 @@ Stub ของแพ็กเกจ MetaTrader5 สำหรับรันเ�
 """
 
 # ค่าคงที่ตรงตามที่แพ็กเกจจริงประกาศไว้
+TIMEFRAME_M5 = 5
 TIMEFRAME_M15 = 15
+TIMEFRAME_M30 = 30
 TIMEFRAME_H1 = 16385
 
 ORDER_TYPE_BUY = 0

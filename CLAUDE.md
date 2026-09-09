@@ -273,5 +273,10 @@ Candidates starting with the full requested name win first.
 
 - Never verified against a live MT5 terminal. Broker behaviour — retcodes, stop levels,
   filling modes — is unproven. Demo first.
-- The Telegram token in the first two commits (`git show a30efaf:.env`) has not been
-  confirmed rotated. `.env` is untracked now, but the old value remains in history.
+- The Telegram token that used to sit in `.env` in the first two commits is **gone from
+  git history** as of 2026-09-10: `git filter-branch --index-filter` dropped the file from
+  every commit and `main` was force-pushed, so all SHAs below `2700dec` changed and the old
+  `a30efaf` no longer exists. Any older clone of this repo still carries it, and GitHub may
+  keep the pre-rewrite commits reachable by SHA for a while, so **rotating the token at
+  @BotFather is what actually retires it** — the rewrite only stops it spreading further.
+  Confirm the rotation happened before treating this as closed.

@@ -1,0 +1,257 @@
+"""
+ชั้นจัดการคำสั่งซื้อขาย — ทุกอย่างที่ต้องคุยกับ broker จริง
+
+แยกออกจาก mt5_core.py เพราะสคริปต์ที่แค่บันทึกข้อมูลไม่ควรต้อง import ส่วนนี้เลย
+งานหลักคือทำให้ order ผ่านการตรวจของ broker: ปัดราคาตามจำนวนหลัก, เคารพระยะ
+stop ขั้นต่ำ, เลือก filling mode ที่ broker รองรับ และปัด lot ตาม volume step
+"""
+
+import math
+from decimal import Decimal
+
+import MetaTrader5 as mt5
+
+# retcode ที่ต้องรับมือ — ระบุเป็นตัวเลขตรงๆ เพราะชื่อค่าคงที่ต่างกันตามเวอร์ชันแพ็กเกจ
+RETCODE_DONE = 10009
+RETCODE_REQUOTE = 10004
+RETCODE_INVALID_STOPS = 10016
+RETCODE_MARKET_CLOSED = 10018
+RETCODE_NO_MONEY = 10019
+RETCODE_PRICE_CHANGED = 10020
+RETCODE_PRICE_OFF = 10021
+RETCODE_INVALID_FILL = 10030
+
+RETRYABLE = (RETCODE_REQUOTE, RETCODE_PRICE_CHANGED, RETCODE_PRICE_OFF)
+
+RETCODE_MESSAGES = {
+    RETCODE_DONE: "สำเร็จ",
+    RETCODE_REQUOTE: "ราคาเปลี่ยน (requote)",
+    RETCODE_INVALID_STOPS: "SL/TP ใกล้ราคาเกินกว่าที่ broker ยอม",
+    RETCODE_MARKET_CLOSED: "ตลาดปิด",
+    RETCODE_NO_MONEY: "เงินในบัญชีไม่พอ",
+    RETCODE_PRICE_CHANGED: "ราคาเปลี่ยนระหว่างส่งคำสั่ง",
+    RETCODE_PRICE_OFF: "ไม่มีราคาให้เทรดตอนนี้",
+    RETCODE_INVALID_FILL: "broker ไม่รองรับ filling mode ที่ส่งไป",
+}
+
+
+def describe_result(result):
+    """แปลงผลลัพธ์ order_send เป็นข้อความอ่านออก"""
+    if result is None:
+        return "order_send คืน None"
+
+    meaning = RETCODE_MESSAGES.get(result.retcode, "")
+    suffix = f" — {meaning}" if meaning else ""
+    return f"retcode {result.retcode}{suffix}: {result.comment}"
+
+
+# ---------- การปัดค่าให้ broker ยอมรับ ----------
+
+def normalize_price(info, price):
+    """ปัดราคาตามจำนวนหลักของ Symbol — ถ้าไม่ปัด broker จะตีกลับด้วย invalid price"""
+    return round(float(price), info.digits)
+
+
+def normalize_volume(info, volume):
+    """ปัด lot ลงให้ลงตัวกับ volume_step แล้วบีบให้อยู่ในช่วง min/max ที่ broker ยอม"""
+    step = info.volume_step or 0.01
+    decimals = max(0, -Decimal(str(step)).as_tuple().exponent)
+
+    # ปัดลงเสมอ เพื่อไม่ให้ความเสี่ยงเกินที่ตั้งไว้
+    lots = math.floor(float(volume) / step) * step
+    lots = round(lots, decimals)
+
+    lots = max(lots, info.volume_min)
+    lots = min(lots, info.volume_max)
+    return round(lots, decimals)
+
+
+def min_stop_distance(info, tick):
+    """
+    ระยะขั้นต่ำระหว่างราคาเข้ากับ SL/TP ที่ broker ยอมรับ
+
+    broker บางรายคืน trade_stops_level เป็น 0 ซึ่งแปลว่าใช้ระยะแบบ dynamic
+    อิง spread จึงเผื่อเป็น 3 เท่าของ spread ปัจจุบันไว้ด้วย
+    """
+    level_distance = (getattr(info, "trade_stops_level", 0) or 0) * info.point
+    spread_distance = (tick.ask - tick.bid) * 3 if tick else 0
+    return max(level_distance, spread_distance, info.point * 10)
+
+
+def pick_filling_modes(info):
+    """
+    ไล่ filling mode ตามที่ Symbol ประกาศว่ารองรับ
+
+    filling_mode เป็น bitmask: bit 0 = FOK, bit 1 = IOC
+    คืนเป็น list เพื่อให้ผู้เรียกลองตัวถัดไปได้เมื่อโดน retcode 10030
+    """
+    modes = []
+    allowed = getattr(info, "filling_mode", 0) or 0
+
+    if allowed & 1:
+        modes.append(mt5.ORDER_FILLING_FOK)
+    if allowed & 2:
+        modes.append(mt5.ORDER_FILLING_IOC)
+
+    modes.append(mt5.ORDER_FILLING_RETURN)
+    return modes
+
+
+# ---------- ขนาดไม้ ----------
+
+def calculate_lot(info, account, sl_distance, risk_percent):
+    """
+    คำนวณ lot จากจำนวนเงินที่ยอมเสียได้ต่อไม้
+
+    ขาดทุนต่อ 1 lot = (ระยะ SL / tick_size) * tick_value
+    lot = เงินที่ยอมเสีย / ขาดทุนต่อ 1 lot
+    """
+    tick_value = getattr(info, "trade_tick_value", 0) or 0
+    tick_size = getattr(info, "trade_tick_size", 0) or info.point
+
+    if sl_distance <= 0 or tick_value <= 0 or tick_size <= 0:
+        return info.volume_min
+
+    risk_money = account.balance * (risk_percent / 100)
+    loss_per_lot = (sl_distance / tick_size) * tick_value
+
+    if loss_per_lot <= 0:
+        return info.volume_min
+
+    return normalize_volume(info, risk_money / loss_per_lot)
+
+
+def estimated_loss(info, lots, sl_distance):
+    """ประมาณเงินที่จะเสียถ้าโดน SL — ใช้แสดงใน log และ Telegram"""
+    tick_value = getattr(info, "trade_tick_value", 0) or 0
+    tick_size = getattr(info, "trade_tick_size", 0) or info.point
+
+    if tick_value <= 0 or tick_size <= 0:
+        return None
+
+    return (sl_distance / tick_size) * tick_value * lots
+
+
+# ---------- สถานะพอร์ต ----------
+
+def symbol_is_tradable(info):
+    """True เมื่อ Symbol เปิดให้ส่งคำสั่งได้เต็มรูปแบบ"""
+    return info.trade_mode == mt5.SYMBOL_TRADE_MODE_FULL
+
+
+def open_positions(symbol, magic):
+    """position ของ Symbol นี้ที่เปิดโดยบอทตัวนี้ (กรองด้วย magic)"""
+    positions = mt5.positions_get(symbol=symbol)
+
+    if positions is None:
+        return []
+
+    return [position for position in positions if position.magic == magic]
+
+
+# ---------- ส่งคำสั่ง ----------
+
+def send_market_order(symbol, action, lots, sl, tp, magic, deviation, logger, attempts=3):
+    """
+    ส่งคำสั่ง market พร้อม SL/TP
+
+    ดึงราคาใหม่ทุกครั้งที่ลองใหม่ เพราะสาเหตุที่ต้องลองใหม่คือราคาขยับ
+    และไล่ filling mode ตัวถัดไปเมื่อ broker ตอบว่าไม่รองรับตัวที่ส่งไป
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return None
+
+    filling_modes = pick_filling_modes(info)
+    filling_index = 0
+
+    for attempt in range(1, attempts + 1):
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            logger.warning("ดึงราคาไม่ได้ ข้ามการส่งคำสั่งรอบนี้")
+            return None
+
+        if action == "BUY":
+            price = tick.ask
+            order_type = mt5.ORDER_TYPE_BUY
+        else:
+            price = tick.bid
+            order_type = mt5.ORDER_TYPE_SELL
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lots,
+            "type": order_type,
+            "price": normalize_price(info, price),
+            "sl": normalize_price(info, sl),
+            "tp": normalize_price(info, tp),
+            "magic": magic,
+            "deviation": deviation,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling_modes[filling_index],
+            "comment": "ma-cross bot",
+        }
+
+        result = mt5.order_send(request)
+
+        if result is not None and result.retcode == RETCODE_DONE:
+            return result
+
+        logger.warning("ส่งคำสั่งครั้งที่ %d ไม่ผ่าน: %s", attempt, describe_result(result))
+
+        if result is None:
+            return None
+
+        if result.retcode == RETCODE_INVALID_FILL and filling_index + 1 < len(filling_modes):
+            filling_index += 1
+            logger.info("เปลี่ยน filling mode แล้วลองใหม่")
+            continue
+
+        if result.retcode not in RETRYABLE:
+            return result
+
+    return result
+
+
+def close_position(position, deviation, logger):
+    """ปิด position ที่ถืออยู่ด้วยคำสั่งสวนทาง"""
+    info = mt5.symbol_info(position.symbol)
+    tick = mt5.symbol_info_tick(position.symbol)
+
+    if info is None or tick is None:
+        logger.warning("ปิด position ไม่ได้: ดึงข้อมูล Symbol ไม่สำเร็จ")
+        return None
+
+    if position.type == mt5.POSITION_TYPE_BUY:
+        order_type = mt5.ORDER_TYPE_SELL
+        price = tick.bid
+    else:
+        order_type = mt5.ORDER_TYPE_BUY
+        price = tick.ask
+
+    for filling_mode in pick_filling_modes(info):
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": position.volume,
+            "type": order_type,
+            "position": position.ticket,
+            "price": normalize_price(info, price),
+            "deviation": deviation,
+            "magic": position.magic,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling_mode,
+            "comment": "ma-cross close",
+        }
+
+        result = mt5.order_send(request)
+
+        if result is not None and result.retcode == RETCODE_DONE:
+            return result
+
+        if result is None or result.retcode != RETCODE_INVALID_FILL:
+            logger.warning("ปิด position ไม่สำเร็จ: %s", describe_result(result))
+            return result
+
+    return None

@@ -1,11 +1,18 @@
-import time
+"""
+เก็บสถานะตลาดของทุกแท่งที่ปิดลง CSV เพื่อเอาไปติดป้ายกำกับและเรียนรู้ภายหลัง
+
+ไม่ส่งคำสั่งซื้อขายใดๆ คอลัมน์ท้ายตารางเว้นว่างไว้ให้กรอกเองใน Excel
+"""
+
 import os
+import time
 from datetime import datetime
 
 import MetaTrader5 as mt5
 import pandas as pd
 
-# ---------- ตั้งค่าหลัก ----------
+import mt5_core as core
+
 SYMBOL = "XAUUSD"
 ENTRY_TIMEFRAME = mt5.TIMEFRAME_M15
 TREND_TIMEFRAME = mt5.TIMEFRAME_H1
@@ -22,113 +29,63 @@ CHECK_EVERY_SECONDS = 30
 CSV_FILE = "market_training_data.csv"
 
 
-def calculate_rsi(series, period=14):
-    """คำนวณ RSI จากราคาปิด"""
-    delta = series.diff()
-
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
-
-    avg_gain = gains.rolling(period).mean()
-    avg_loss = losses.rolling(period).mean()
-
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_atr(df, period=14):
-    """คำนวณ ATR เพื่อวัดความผันผวน"""
-    previous_close = df["close"].shift(1)
-
-    true_range = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - previous_close).abs(),
-        (df["low"] - previous_close).abs(),
-    ], axis=1).max(axis=1)
-
-    return true_range.rolling(period).mean()
-
-
 def get_h1_trend():
-    """ดูแนวโน้มใหญ่จาก H1 ด้วย MA20 / MA50"""
-    rates = mt5.copy_rates_from_pos(SYMBOL, TREND_TIMEFRAME, 0, BARS_H1)
+    """ดูแนวโน้มใหญ่จาก H1 ด้วย MA20 / MA50 บนแท่งที่ปิดแล้ว"""
+    df = core.get_rates(SYMBOL, TREND_TIMEFRAME, BARS_H1, min_bars=SLOW_MA + 3)
 
-    if rates is None or len(rates) < SLOW_MA + 3:
+    if df is None:
         return "UNKNOWN"
 
-    df = pd.DataFrame(rates)
-    df["ma_fast"] = df["close"].rolling(FAST_MA).mean()
-    df["ma_slow"] = df["close"].rolling(SLOW_MA).mean()
+    core.add_moving_averages(df, FAST_MA, SLOW_MA)
+    candle = core.closed_candle(df)
 
-    # ใช้แท่งที่ปิดแล้ว
-    candle = df.iloc[-2]
+    if pd.isna(candle["ma_fast"]) or pd.isna(candle["ma_slow"]):
+        return "UNKNOWN"
 
     if candle["ma_fast"] > candle["ma_slow"]:
         return "UPTREND"
-    elif candle["ma_fast"] < candle["ma_slow"]:
+
+    if candle["ma_fast"] < candle["ma_slow"]:
         return "DOWNTREND"
 
     return "SIDEWAY"
 
 
 def get_market_features():
-    """ดึงข้อมูลกราฟ M15 และคำนวณ feature สำหรับนำไปเรียนรู้"""
-    rates = mt5.copy_rates_from_pos(SYMBOL, ENTRY_TIMEFRAME, 0, BARS_M15)
+    """ดึงกราฟ M15 แล้วคำนวณ feature ทั้งหมดของแท่งที่ปิดล่าสุด"""
+    min_bars = SLOW_MA + RSI_PERIOD + 5
+    df = core.get_rates(SYMBOL, ENTRY_TIMEFRAME, BARS_M15, min_bars)
 
-    if rates is None or len(rates) < SLOW_MA + RSI_PERIOD + 5:
-        print("ดึงข้อมูลแท่งราคาไม่สำเร็จ:", mt5.last_error())
+    if df is None:
+        print("ดึงข้อมูลแท่งราคาไม่สำเร็จ:", core.last_error_text())
         return None
 
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s")
+    core.add_moving_averages(df, FAST_MA, SLOW_MA)
+    df["rsi"] = core.calculate_rsi(df["close"], RSI_PERIOD)
+    df["atr"] = core.calculate_atr(df, ATR_PERIOD)
 
-    df["ma_fast"] = df["close"].rolling(FAST_MA).mean()
-    df["ma_slow"] = df["close"].rolling(SLOW_MA).mean()
-    df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
-    df["atr"] = calculate_atr(df, ATR_PERIOD)
-
-    # -1 = แท่งที่กำลังก่อตัว, -2 = แท่งที่ปิดล่าสุด
-    previous = df.iloc[-3]
-    current = df.iloc[-2]
-
-    signal = "HOLD"
-
-    if previous["ma_fast"] <= previous["ma_slow"] and current["ma_fast"] > current["ma_slow"]:
-        signal = "BUY"
-    elif previous["ma_fast"] >= previous["ma_slow"] and current["ma_fast"] < current["ma_slow"]:
-        signal = "SELL"
-
-    tick = mt5.symbol_info_tick(SYMBOL)
-    point = mt5.symbol_info(SYMBOL).point
-
-    if tick is None or point is None:
-        spread_points = None
-    else:
-        spread_points = round((tick.ask - tick.bid) / point, 1)
-
-    candle_range = current["high"] - current["low"]
-    candle_body = abs(current["close"] - current["open"])
+    candle = core.closed_candle(df)
 
     return {
-        "candle_time": current["time"],
-        "open": current["open"],
-        "high": current["high"],
-        "low": current["low"],
-        "close": current["close"],
-        "ma_fast": current["ma_fast"],
-        "ma_slow": current["ma_slow"],
-        "rsi": current["rsi"],
-        "atr": current["atr"],
+        "candle_time": candle["time"],
+        "open": candle["open"],
+        "high": candle["high"],
+        "low": candle["low"],
+        "close": candle["close"],
+        "ma_fast": candle["ma_fast"],
+        "ma_slow": candle["ma_slow"],
+        "rsi": candle["rsi"],
+        "atr": candle["atr"],
         "h1_trend": get_h1_trend(),
-        "spread_points": spread_points,
-        "candle_range": candle_range,
-        "candle_body": candle_body,
-        "signal": signal,
+        "spread_points": core.spread_points(SYMBOL),
+        "candle_range": candle["high"] - candle["low"],
+        "candle_body": abs(candle["close"] - candle["open"]),
+        "signal": core.crossover_signal(df),
     }
 
 
 def save_training_row(data):
-    """บันทึกสถานะตลาด พร้อมช่องว่างให้คุณติดป้ายกำกับภายหลัง"""
+    """บันทึกสถานะตลาด พร้อมช่องว่างให้ติดป้ายกำกับภายหลัง"""
     row = pd.DataFrame([{
         "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "candle_time": data["candle_time"],
@@ -150,7 +107,7 @@ def save_training_row(data):
         "candle_body": round(data["candle_body"], 2),
         "bot_signal": data["signal"],
 
-        # คุณกรอกภายหลังใน Excel/CSV
+        # กรอกภายหลังใน Excel/CSV
         "your_decision": "",
         "your_reason": "",
         "entry_price": "",
@@ -159,27 +116,20 @@ def save_training_row(data):
         "trade_result": "",
     }])
 
-    file_exists = os.path.exists(CSV_FILE)
-    row.to_csv(CSV_FILE, mode="a", header=not file_exists, index=False)
+    row.to_csv(CSV_FILE, mode="a", header=not os.path.exists(CSV_FILE), index=False)
 
 
-if not mt5.initialize():
-    print("เชื่อมต่อ MT5 ไม่สำเร็จ:", mt5.last_error())
-    raise SystemExit(1)
+def main():
+    core.connect()
+    core.prepare_symbol(SYMBOL)
 
-if not mt5.symbol_select(SYMBOL, True):
-    print(f"เลือก Symbol ไม่สำเร็จ: {SYMBOL}")
-    mt5.shutdown()
-    raise SystemExit(1)
+    print(f"เริ่มเก็บข้อมูลฝึกสอน: {SYMBOL} / M15")
+    print("ไม่มีการเปิดออเดอร์")
+    print(f"ข้อมูลจะถูกบันทึกใน: {CSV_FILE}")
+    print("กด Ctrl+C เพื่อหยุด\n")
 
-print(f"เริ่มเก็บข้อมูลฝึกสอน: {SYMBOL} / M15")
-print("ยังไม่มีการเปิดออเดอร์")
-print(f"ข้อมูลจะถูกบันทึกใน: {CSV_FILE}")
-print("กด Ctrl+C เพื่อหยุด\n")
+    last_candle_time = None
 
-last_candle_time = None
-
-try:
     while True:
         data = get_market_features()
 
@@ -200,8 +150,14 @@ try:
 
         time.sleep(CHECK_EVERY_SECONDS)
 
-except KeyboardInterrupt:
-    print("\nหยุดบอทแล้ว")
 
-finally:
-    mt5.shutdown()
+if __name__ == "__main__":
+    try:
+        main()
+    except core.MT5Error as error:
+        print(error)
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        print("\nหยุดบอทแล้ว")
+    finally:
+        mt5.shutdown()

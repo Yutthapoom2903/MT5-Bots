@@ -17,6 +17,7 @@ else:
     print(f"Balance: {account.balance}")
     print(f"Equity: {account.equity}")
     print(f"Leverage: 1:{account.leverage}")
-    print(f"โหมดบัญชี: {account.trade_mode}")  # 0 มักเป็น Demo
+    mode = "Demo" if account.trade_mode == 0 else "บัญชีจริง"
+    print(f"โหมดบัญชี: {account.trade_mode} ({mode})")
 
 mt5.shutdown()

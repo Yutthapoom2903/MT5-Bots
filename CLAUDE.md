@@ -4,82 +4,109 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A set of standalone MetaTrader 5 scripts for XAUUSD (gold) on M15, built around a single
-MA20/MA50 crossover rule. There is no package, no framework, and no shared module — each
-`.py` file is a top-level script that connects to MT5, does one job, and shuts down.
+MetaTrader 5 scripts for XAUUSD (gold) on M15, built around a single MA20/MA50 crossover
+rule. Two shared modules hold the logic; every other `.py` file is a thin top-level script
+that connects to MT5, does one job, and shuts down.
+
+- `mt5_core.py` — connection, symbol setup, rate fetching, indicators, the crossover rule,
+  logging setup, and restart-safe state persistence. Everything imports this.
+- `mt5_trade.py` — everything that talks to the broker: price/volume normalization, stop
+  distance, filling-mode selection, risk-based lot sizing, order send/close. Only
+  `bot_integrated.py` imports it; the logger scripts must stay free of it.
 
 ## Running
 
 Every script talks to a **running MT5 terminal on the same machine** through the
-`MetaTrader5` Python package, which is **Windows-only**. The repo lives under WSL, but
-the scripts must be run with Windows Python against an open, logged-in MT5 terminal —
-they cannot be executed from the Linux side.
+`MetaTrader5` package, which is **Windows-only**. The repo lives under WSL, but the bots
+must run with Windows Python against an open, logged-in MT5 terminal — they cannot execute
+from the Linux side. `backtest_engine.py` is the exception: it only reads a CSV and runs
+anywhere pandas is installed.
 
 ```powershell
+pip install -r requirements.txt
+
 python check_mt5.py            # verify connection + print account info
 python list_symbols.py         # find the broker's actual gold/EURUSD/BTC symbol names
 python bot_signal.py           # one-shot: print current signal and exit
 python bot_monitor.py          # loop: append signals to signal_log.csv (no orders)
-python bot_feature_logger.py   # loop: append richer features to market_training_data.csv (no orders)
+python bot_feature_logger.py   # loop: append features to market_training_data.csv (no orders)
 python bot_integrated.py       # loop: LIVE — sends real market orders + Telegram alerts
-python backtest_engine.py      # read market_training_data.csv, print manual-decision win rate
+python backtest_engine.py      # score the hand-labelled decisions in the training CSV
 ```
 
-There is no test suite, no linter config, and no `requirements.txt`. Dependencies used:
-`MetaTrader5`, `pandas`, `requests`, `python-dotenv`.
+There is no test suite and no linter config.
 
-**`bot_integrated.py` places real orders.** Never run it, or suggest running it, without
-explicit confirmation, and verify the connected MT5 account is a demo account first
-(`check_mt5.py` prints `trade_mode`; `0` is demo).
+**`bot_integrated.py` places real orders.** It refuses to start on a non-demo account
+unless `ALLOW_LIVE_ACCOUNT` is set to `True` in the file — do not flip that flag on the
+user's behalf, and never run the script without explicit confirmation.
 
 ## Signal logic — the invariant to preserve
 
-All four bot scripts implement the same crossover and must stay consistent:
+`mt5_core.crossover_signal()` is the single implementation; no script may re-derive it.
 
-- Pull `BARS` of M15 rates, compute `close.rolling(20).mean()` and `.rolling(50).mean()`.
-- Compare `df.iloc[-3]` (previous) against `df.iloc[-2]` (last **closed** candle).
-  `iloc[-1]` is the candle still forming and is deliberately never used — using it would
-  make signals flip mid-candle.
-- Fast crossing above slow → `BUY`; below → `SELL`; otherwise `HOLD`.
+- Compare `df.iloc[-3]` (`core.PREVIOUS`) against `df.iloc[-2]` (`core.CLOSED`).
+- `df.iloc[-1]` (`core.FORMING`) is the candle still building and is deliberately never
+  used — reading it would make signals flip mid-candle.
+- Fast crossing above slow → `BUY`; below → `SELL`; otherwise `HOLD`. NaN warm-up rows
+  yield `HOLD`.
 
-The loops are all polling loops (`time.sleep(30)`) guarded by a `last_candle_time` /
-`last_signal_time` variable so a given closed candle is only acted on once.
+All loops poll every 30s and guard on the closed candle's timestamp so a candle is acted on
+once. `bot_integrated.py` persists that timestamp to `bot_state.json`, so a restart
+mid-candle does not re-fire an order — the in-memory-only guard used by the logger scripts
+is fine for them because they never place orders.
 
-`bot_feature_logger.py` layers extra features on the same skeleton: hand-rolled RSI(14)
-(simple rolling mean, not Wilder's), ATR(14), an H1 MA20/MA50 trend label, and live spread
-in points.
+RSI and ATR in `mt5_core.py` use Wilder smoothing (`ewm(alpha=1/period)`) to match what MT5
+and TradingView display. Rows logged before 2026-09-09 used a simple rolling mean instead,
+so early `rsi_14` / `atr_14` values in `market_training_data.csv` are not comparable to
+later ones.
+
+## Risk model in bot_integrated.py
+
+Do not reintroduce fixed point-based stops. On XAUUSD `point` is `0.01`, so the old
+`300 * point` stop was **$3.00** against an ATR around `$11` — inside the noise, and
+usually inside the broker's minimum stop distance as well.
+
+- SL/TP are `ATR × SL_ATR_MULT` / `ATR × TP_ATR_MULT`, floored at
+  `mt5_trade.min_stop_distance()` (the larger of `trade_stops_level`, 3× spread, and 10
+  points — brokers that report `trade_stops_level = 0` use a dynamic spread-based limit).
+- Lot size is derived from `RISK_PERCENT` of balance and the SL distance via
+  `trade_tick_value` / `trade_tick_size`, then floored to `volume_step`. Set
+  `USE_FIXED_LOT = True` to bypass.
+- Levels are computed from the live tick, never from the closed candle's `close`.
+- `pick_filling_modes()` reads the symbol's `filling_mode` bitmask and the order retries
+  down the list on retcode 10030; retcodes are numeric constants in `mt5_trade.py` because
+  their names vary across package versions.
+- Before entering: symbol tradable, spread under `MAX_SPREAD_POINTS`, ATR valid, and no
+  existing position with the same `MAGIC` (an opposite one is closed first when
+  `CLOSE_ON_REVERSE`).
 
 ## Data files
 
-Both CSVs are appended to in place (`mode="a"`, header only when the file is absent) and
-are committed to git — treat them as accumulating data, not build output.
+CSVs are appended in place (`mode="a"`, header only when absent) and committed to git —
+accumulating data, not build output. `bot.log` and `bot_state.json` are runtime artifacts
+and are gitignored.
 
-- `signal_log.csv` — one row per closed M15 candle from `bot_monitor.py`.
-- `market_training_data.csv` — one row per closed candle from `bot_feature_logger.py`,
-  with trailing columns (`your_decision`, `your_reason`, `entry_price`, `stop_loss`,
-  `take_profit`, `trade_result`) intentionally left blank for the user to fill in by hand
-  in Excel. `backtest_engine.py` reads only those hand-labelled columns — it scores the
+- `signal_log.csv` — one row per closed candle from `bot_monitor.py`.
+- `trade_log.csv` — one row per order attempt from `bot_integrated.py`, successes and
+  failures alike.
+- `market_training_data.csv` — one row per closed candle from `bot_feature_logger.py`. The
+  trailing columns (`your_decision`, `your_reason`, `entry_price`, `stop_loss`,
+  `take_profit`, `trade_result`) are intentionally blank for the user to fill in by hand in
+  Excel. `backtest_engine.py` reads only those hand-labelled columns — it scores the
   human's decisions, not the bot's signal.
-
-## Known issues in the current code
-
-- `backtest_engine.py` calls `os.path.exists` but never imports `os` — it raises
-  `NameError` on any run.
-- `.env` (with a live `TELEGRAM_TOKEN`) is committed to the repo and there is no
-  `.gitignore`. If the user touches secrets handling, raise this: the token should be
-  rotated and the file untracked.
-- `bot_integrated.py` has no `symbol_select` call, no filling-mode fallback, a bare
-  `except: pass` around the Telegram send, and hardcodes volume `0.01` and a fixed
-  300/600-point SL/TP. Its `except KeyboardInterrupt` only shuts MT5 down on Ctrl+C, not
-  on other exits.
 
 ## Conventions
 
-Console output and code comments are in Thai; identifiers, config constants, and CSV
+Console output, log messages, and comments are Thai; identifiers, config constants, and CSV
 column names are English. Config lives as UPPERCASE module-level constants at the top of
-each script (`SYMBOL`, `TIMEFRAME`, `FAST_MA`, `SLOW_MA`, `BARS`, `CHECK_EVERY_SECONDS`,
-`CSV_FILE`) — keep new settings in that same form rather than introducing a config file.
+each script — keep new settings in that form rather than introducing a config file. Scripts
+put their work in `main()` behind `if __name__ == "__main__":` with `mt5.shutdown()` in a
+`finally`, and raise `core.MT5Error` for unrecoverable MT5 failures.
 
 Broker symbol names vary (`XAUUSD`, `XAUUSD.m`, `GOLD`…). `SYMBOL` is hardcoded to
-`"XAUUSD"` everywhere; use `list_symbols.py` to confirm what the connected broker actually
-exposes before assuming it works.
+`"XAUUSD"` everywhere; use `list_symbols.py` to confirm what the connected broker exposes.
+
+## Outstanding
+
+The Telegram token in the first two commits (`git show a30efaf:.env`) has not been
+confirmed rotated. `.env` is untracked now, but the old value is still readable in history.

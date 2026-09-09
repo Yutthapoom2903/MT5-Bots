@@ -1,6 +1,11 @@
 # Secrets
 .env
 
+# Runtime state and logs
+bot_state.json
+bot_state.json.tmp
+bot.log
+
 # Python
 __pycache__/
 *.py[cod]

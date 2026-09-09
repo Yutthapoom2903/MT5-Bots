@@ -1129,6 +1129,114 @@ def test_a_partially_closed_position_averages_its_exit_price():
     assert closed["profit"] == 40.0
 
 
+# ---------- การรายงานไม้ที่ปิดไปแล้ว ----------
+
+class ClosedPositionHarness:
+    """
+    สลับ runner ให้อ่านประวัติดีลปลอมและจับการแจ้งเตือนแทนการส่งจริง
+
+    ทางนี้เป็น path เดียวในโปรเจกต์ที่ยังไม่เคยพิสูจน์กับ terminal จริง
+    จึงต้องพิสูจน์ตรรกะรอบๆ มันให้แน่นแทน
+    """
+
+    def __init__(self, lookups):
+        import runner
+
+        self.runner = runner
+        self.lookups = lookups      # ผลที่ closing_deals จะคืนทีละครั้ง
+        self.calls = 0
+        self.reported = []
+
+    def __enter__(self):
+        self._deals = self.runner.trade.closing_deals
+        self._notifier = self.runner.NOTIFIER
+        self.runner.trade.closing_deals = self._fake_deals
+        self.runner.NOTIFIER = self
+        return self
+
+    def __exit__(self, *error):
+        self.runner.trade.closing_deals = self._deals
+        self.runner.NOTIFIER = self._notifier
+
+    def _fake_deals(self, ticket, logger=None):
+        result = self.lookups[min(self.calls, len(self.lookups) - 1)]
+        self.calls += 1
+        return result
+
+    def position_closed(self, symbol, ticket, meta, profit, currency, price=None):
+        self.reported.append((ticket, profit))
+
+
+def test_a_closed_position_is_reported_from_the_deal_history():
+    deals = [FakeClosingDeal(mt5.DEAL_ENTRY_OUT, profit=12.0, volume=0.01, price=4380.0)]
+    state = {"position_meta": {"111": {"signal": "SELL", "risk_money": 6.0}}}
+
+    with ClosedPositionHarness([deals]) as harness:
+        pending = harness.runner.report_closed_positions(set(), state, FakeLogger())
+
+    assert harness.reported == [("111", 12.0)]
+    assert pending == set()
+
+
+def test_a_position_that_is_still_open_is_not_reported_as_closed():
+    state = {"position_meta": {"111": {"signal": "SELL"}}}
+
+    with ClosedPositionHarness([None]) as harness:
+        harness.runner.report_closed_positions({"111"}, state, FakeLogger())
+
+    assert harness.reported == []
+    assert harness.calls == 0
+
+
+def test_a_history_that_has_not_landed_yet_is_kept_for_the_next_cycle():
+    """ประวัติดีลไม่ได้ลงทันทีเสมอ ล้าง meta ทิ้งรอบแรกคือไม่มีวันได้รายงาน"""
+    state = {"position_meta": {"111": {"signal": "SELL"}}}
+
+    with ClosedPositionHarness([None]) as harness:
+        pending = harness.runner.report_closed_positions(set(), state, FakeLogger())
+
+    assert harness.reported == []
+    assert pending == {"111"}
+    assert state["position_meta"]["111"]["close_lookups"] == 1
+
+
+def test_a_history_that_lands_late_is_still_reported():
+    deals = [FakeClosingDeal(mt5.DEAL_ENTRY_OUT, profit=-4.0, volume=0.01, price=4420.0)]
+    state = {"position_meta": {"111": {"signal": "BUY"}}}
+
+    with ClosedPositionHarness([None, None, deals]) as harness:
+        for _ in range(3):
+            harness.runner.report_closed_positions(set(), state, FakeLogger())
+
+    assert harness.reported == [("111", -4.0)]
+
+
+def test_the_bot_stops_waiting_for_a_history_that_never_lands():
+    import runner
+
+    state = {"position_meta": {"111": {"signal": "SELL"}}}
+
+    with ClosedPositionHarness([None]) as harness:
+        for _ in range(runner.CLOSE_LOOKUP_ATTEMPTS):
+            pending = harness.runner.report_closed_positions(set(), state, FakeLogger())
+
+    assert pending == set()
+
+
+def test_a_broker_that_rejects_the_history_lookup_does_not_stop_the_loop():
+    """position= ไม่ได้มีในแพ็กเกจทุกเวอร์ชัน ล้มตรงนี้ต้องไม่ล้มลูปที่กำลังดูแล SL"""
+    def explode(*args, **kwargs):
+        raise TypeError("unexpected keyword argument 'position'")
+
+    original = mt5.history_deals_get
+    mt5.history_deals_get = explode
+
+    try:
+        assert trade.closing_deals(111, FakeLogger()) is None
+    finally:
+        mt5.history_deals_get = original
+
+
 # ---------- ไฟล์ CSV ที่ชุดคอลัมน์เปลี่ยนไปตามเวลา ----------
 
 def _read_rows(path):

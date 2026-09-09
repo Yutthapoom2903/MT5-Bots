@@ -32,7 +32,7 @@ mt5_trade.py    broker-facing only: price/volume normalization, stop distance, f
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          110 logic tests, no MT5 required
+tests/          116 logic tests, no MT5 required
 ```
 
 ## Running
@@ -45,8 +45,16 @@ from the Linux side.
 `test` work anywhere pandas is installed. Keep it that way — do not add a module-level
 `import MetaTrader5` to `run.py`.
 
+`requirements.txt` pins `MetaTrader5`, which has no Linux wheel, so `pip install -r` fails
+under WSL. Install the rest into a venv instead — `.venv/` is gitignored:
+
 ```bash
-python run.py test         # 110 logic tests, runs under WSL
+python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
+.venv/bin/python run.py test
+```
+
+```bash
+python run.py test         # 116 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -142,6 +150,14 @@ orders of magnitude.
   restart going silent because it wrongly believes it already sent is not.
 - **Failures never propagate.** `_post()` retries once, honours a 429 `retry_after`, and on
   400 re-sends with the tags stripped rather than losing the message.
+
+`report_closed_positions()` is the one notification path that cannot be proven offline:
+`history_deals_get(position=...)` has never run against a real terminal and the keyword is
+not in every package version. So `trade.closing_deals()` swallows the failure and returns
+`None`, and the caller keeps the ticket's `position_meta` for `CLOSE_LOOKUP_ATTEMPTS`
+cycles before giving up — deal history does not always land the instant a position closes,
+and pruning on the first miss means the close is never reported at all. Reporting a closed
+trade is a bonus; it must never take down the loop that is managing a live stop.
 
 `run.py notify --dry` renders one sample of every message shape offline. It calls every
 `Notifier` event method, so a shape that raises fails there instead of at 3am.

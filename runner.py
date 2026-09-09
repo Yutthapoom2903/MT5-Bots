@@ -69,6 +69,7 @@ MAX_CONSECUTIVE_LOSSES = 3
 # ---------- ความทนทานของลูป ----------
 MARKET_CLOSED_SLEEP = 300     # ตลาดปิดแล้วไม่ต้อง poll ถี่
 RECONNECT_DELAY = 30
+CLOSE_LOOKUP_ATTEMPTS = 10    # รอประวัติดีลของไม้ที่เพิ่งปิดกี่รอบก่อนเลิกรอ
 HEARTBEAT_EVERY_HOURS = 12    # แจ้ง Telegram เป็นระยะว่ายังทำงานอยู่ 0 = ปิด
 
 # ---------- ไฟล์ ----------
@@ -482,16 +483,35 @@ def report_closed_positions(live_tickets, state, logger):
     เดิมบอทเงียบสนิทตอนโดน SL หรือ TP ซึ่งเป็นเหตุการณ์ที่ควรรู้ที่สุด
     ผลอ่านจากประวัติดีลจริง ไม่ใช่เดาจากราคา เพราะกำไรที่นับได้ต้องรวม commission
     กับ swap ด้วย ไม่งั้นไม้ที่ชนะเฉียดฉิวจะรายงานกลับทาง
+
+    คืน set ของ ticket ที่ยังรอประวัติอยู่ ผู้เรียกต้องเก็บ meta ของพวกนี้ไว้ก่อน
+    ประวัติดีลไม่ได้ลงทันทีที่ไม้ปิดเสมอไป ถ้าล้าง meta ทิ้งเลยก็ไม่มีวันได้รายงาน
+    แต่รอตลอดกาลก็ไม่ได้ ไม้ที่หา 10 รอบแล้วยังไม่เจอถือว่าแพ้แล้วปล่อยไป
     """
+    pending = set()
+
     for ticket, meta in list(state.get("position_meta", {}).items()):
         if ticket in live_tickets:
             continue
 
         # key ใน state เป็น string แต่ MT5 ต้องการ ticket เป็นตัวเลข
-        closed = trade.summarize_position_close(trade.closing_deals(int(ticket)))
+        deals = trade.closing_deals(int(ticket), logger)
+        closed = trade.summarize_position_close(deals)
 
         if closed is None:
-            logger.warning("ticket %s ปิดไปแล้วแต่หาดีลขาออกในประวัติไม่เจอ", ticket)
+            attempts = meta.get("close_lookups", 0) + 1
+            meta["close_lookups"] = attempts
+
+            if attempts < CLOSE_LOOKUP_ATTEMPTS:
+                logger.debug("ticket %s ปิดแล้วแต่ประวัติยังไม่ลง (ครั้งที่ %d)",
+                             ticket, attempts)
+                pending.add(ticket)
+            else:
+                logger.warning(
+                    "ticket %s ปิดไปแล้วแต่หาดีลขาออกไม่เจอครบ %d รอบ เลิกรอ",
+                    ticket, attempts,
+                )
+
             continue
 
         logger.info(
@@ -503,6 +523,8 @@ def report_closed_positions(live_tickets, state, logger):
             meta.get("currency", ""), closed["price"],
         )
 
+    return pending
+
 
 def manage_positions(context, state, logger):
     """เรียกทุกรอบ ไม่ใช่แค่ตอนแท่งปิด — ราคาวิ่งระหว่างแท่งก็ต้องดูแล SL"""
@@ -510,12 +532,15 @@ def manage_positions(context, state, logger):
 
     # ไม้ที่หายไปจากรายการแปลว่าปิดไปแล้ว — รายงานผลก่อน แล้วค่อยล้าง state ทิ้ง
     live_tickets = {str(position.ticket) for position in positions}
-    report_closed_positions(live_tickets, state, logger)
+    pending = report_closed_positions(live_tickets, state, logger)
 
     for bucket in ("position_risk", "partial_taken", "position_meta"):
         records = state.setdefault(bucket, {})
+        # meta ของไม้ที่ยังรอประวัติต้องอยู่ต่อ ไม่งั้นรอบหน้าไม่เหลืออะไรให้รายงาน
+        keep = pending if bucket == "position_meta" else set()
+
         for ticket in list(records):
-            if ticket not in live_tickets:
+            if ticket not in live_tickets and ticket not in keep:
                 del records[ticket]
 
     if not positions:

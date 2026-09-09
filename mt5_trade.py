@@ -438,9 +438,21 @@ def summarize_position_close(deals):
     return {"profit": profit, "volume": volume, "price": price, "deals": len(closing)}
 
 
-def closing_deals(ticket):
-    """ดีลทั้งหมดของ position หนึ่งจากประวัติ — ใช้ตอนไม้หายไปจากรายการที่เปิดอยู่"""
-    return mt5.history_deals_get(position=ticket)
+def closing_deals(ticket, logger=None):
+    """
+    ดีลทั้งหมดของ position หนึ่งจากประวัติ — ใช้ตอนไม้หายไปจากรายการที่เปิดอยู่
+
+    ยังไม่เคยพิสูจน์กับ terminal จริง และคีย์เวิร์ด position= ก็ไม่ได้มีในแพ็กเกจ
+    ทุกเวอร์ชัน จึงกลืนความล้มเหลวไว้ตรงนี้ การรายงานผลไม้ที่ปิดแล้วเป็นของแถม
+    ปล่อยให้มันล้มลูปที่กำลังดูแล SL ของไม้ที่ยังเปิดอยู่ไม่ได้เด็ดขาด
+    """
+    try:
+        return mt5.history_deals_get(position=ticket)
+    except Exception as error:
+        if logger is not None:
+            logger.warning("อ่านประวัติดีลของ ticket %s ไม่ได้: %s", ticket, error)
+
+        return None
 
 
 def deals_today(symbol, magic, now=None):

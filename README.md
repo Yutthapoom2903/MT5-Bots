@@ -21,6 +21,14 @@
 pip install -r requirements.txt
 ```
 
+บน WSL/Linux ติดตั้งแบบนี้ไม่ได้เพราะ `MetaTrader5` มีแต่ตัว Windows — ถ้าอยากรันเทส
+จากฝั่ง Linux ให้ลงเฉพาะที่เหลือใน venv (`.venv/` อยู่ใน `.gitignore` แล้ว)
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
+.venv/bin/python run.py test
+```
+
 สร้างไฟล์ `.env` (คัดลอกจาก `.env.example`) ถ้าต้องการแจ้งเตือนผ่าน Telegram —
 ไม่ใส่ก็ได้ บอททำงานปกติ แค่ไม่ส่งข้อความ
 
@@ -167,7 +175,7 @@ Drawdown สูงสุด: -6.41R
 | `python run.py report` | **สรุปว่าบอททำอะไรไปบ้าง** จากไฟล์ที่มันเขียน | ไม่ |
 | `python run.py review` | สรุปผลจากข้อมูลที่คุณติดป้ายกำกับเอง | ไม่ |
 | `python run.py notify` | ส่งตัวอย่างแจ้งเตือนครบทุกหมวด (`--dry` = พิมพ์ลงจอ) | ไม่ |
-| `python run.py test` | รันเทส logic 110 ข้อ | ไม่ |
+| `python run.py test` | รันเทส logic 116 ข้อ | ไม่ |
 
 ---
 
@@ -370,7 +378,7 @@ backtest.py     จำลองกลยุทธ์ย้อนหลัง ใ
 backtest_engine.py  สรุปผลจาก CSV ที่ติดป้ายกำกับแล้ว
 report.py       สรุปการทำงานจากไฟล์ที่บอทเขียนไว้ (ไม่ต้องต่อ MT5)
 notify.py       แจ้งเตือน Telegram แยกหมวด จัดรูปแบบ กันสแปม
-tests/          เทส logic 110 ข้อ รันได้โดยไม่ต้องมี MT5
+tests/          เทส logic 116 ข้อ รันได้โดยไม่ต้องมี MT5
 ```
 
 ตั้งค่าทั้งหมดอยู่เป็นค่าคงที่ตัวใหญ่ที่หัวไฟล์ `runner.py` (ตลาด ความเสี่ยง SL/TP),

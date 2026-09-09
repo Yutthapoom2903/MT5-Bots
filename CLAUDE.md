@@ -34,7 +34,18 @@ python bot_integrated.py       # loop: LIVE — sends real market orders + Teleg
 python backtest_engine.py      # score the hand-labelled decisions in the training CSV
 ```
 
-There is no test suite and no linter config.
+Logic tests run anywhere — they stub `MetaTrader5` when the real package is absent, so
+no terminal is needed:
+
+```bash
+python tests/test_logic.py     # no extra dependencies
+pytest tests/                  # if pytest is installed
+```
+
+They cover the closed-candle invariant and the broker-facing arithmetic (digit rounding,
+volume stepping, stop distance, risk sizing) — the parts that fail silently and cost money.
+Anything that needs a live terminal is out of scope and must be checked on a demo account.
+There is no linter config.
 
 **`bot_integrated.py` places real orders.** It refuses to start on a non-demo account
 unless `ALLOW_LIVE_ACCOUNT` is set to `True` in the file — do not flip that flag on the

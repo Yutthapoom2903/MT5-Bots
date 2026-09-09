@@ -1,0 +1,258 @@
+"""
+เทส logic ที่ไม่ต้องต่อ MT5 จริง
+
+รันได้สองแบบ:
+    python tests/test_logic.py     (ไม่ต้องติดตั้งอะไรเพิ่ม)
+    pytest tests/                  (ถ้ามี pytest อยู่แล้ว)
+
+ครอบคลุมส่วนที่พังเงียบแล้วเสียเงิน: กฎ crossover ต้องใช้แท่งที่ปิดแล้วเท่านั้น
+และการคำนวณค่าที่ต้องผ่านการตรวจของ broker (ปัดราคา ปัด lot ระยะ stop ขั้นต่ำ)
+"""
+
+import os
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+
+# ใช้ stub ต่อเมื่อเครื่องนี้ไม่มีแพ็กเกจ MetaTrader5 จริง
+try:
+    import MetaTrader5  # noqa: F401
+except ImportError:
+    sys.path.insert(0, os.path.join(REPO_ROOT, "tests", "stubs"))
+
+import pandas as pd
+import MetaTrader5 as mt5
+
+import mt5_core as core
+import mt5_trade as trade
+
+
+# ---------- ตัวช่วย ----------
+
+class FakeSymbolInfo:
+    """ค่าประมาณของ XAUUSD จาก broker ทั่วไป: 2 หลัก, point 0.01, IOC อย่างเดียว"""
+    digits = 2
+    point = 0.01
+    volume_min = 0.01
+    volume_max = 50.0
+    volume_step = 0.01
+    trade_stops_level = 30
+    trade_tick_value = 1.0
+    trade_tick_size = 0.01
+    filling_mode = 2
+    trade_mode = mt5.SYMBOL_TRADE_MODE_FULL
+
+
+class FakeTick:
+    ask = 4390.26
+    bid = 4390.00
+
+
+class FakeAccount:
+    balance = 10000.0
+    currency = "USD"
+    trade_mode = mt5.ACCOUNT_TRADE_MODE_DEMO
+
+
+def ma_frame(fast_values, slow_values):
+    return pd.DataFrame({"ma_fast": fast_values, "ma_slow": slow_values})
+
+
+# ---------- กฎสัญญาณ ----------
+
+def test_crossover_up_on_closed_candle_gives_buy():
+    # -3 อยู่ใต้, -2 ตัดขึ้นเหนือ
+    df = ma_frame([1, 1, 1, 5, 99], [2, 2, 2, 2, 2])
+    assert core.crossover_signal(df) == "BUY"
+
+
+def test_crossover_down_on_closed_candle_gives_sell():
+    df = ma_frame([3, 3, 3, 1, 99], [2, 2, 2, 2, 2])
+    assert core.crossover_signal(df) == "SELL"
+
+
+def test_forming_candle_never_creates_a_signal():
+    """แท่ง -1 ตัดขึ้นชัดเจน แต่ยังไม่ปิด จึงต้องได้ HOLD"""
+    df = ma_frame([1, 1, 1, 1, 99], [2, 2, 2, 2, 2])
+    assert core.crossover_signal(df) == "HOLD"
+
+
+def test_touching_without_crossing_is_hold():
+    df = ma_frame([1, 1, 2, 2, 2], [2, 2, 2, 2, 2])
+    assert core.crossover_signal(df) == "HOLD"
+
+
+def test_nan_warmup_rows_are_hold():
+    df = ma_frame([1, 1, float("nan"), 5, 9], [2, 2, 2, 2, 2])
+    assert core.crossover_signal(df) == "HOLD"
+
+
+def test_short_frame_is_hold():
+    df = ma_frame([1, 5], [2, 2])
+    assert core.crossover_signal(df) == "HOLD"
+
+
+# ---------- indicator ----------
+
+def _sample_closes():
+    return pd.Series([100 + (i % 7) - 3 for i in range(60)], dtype=float)
+
+
+def test_rsi_stays_within_bounds():
+    rsi = core.calculate_rsi(_sample_closes(), 14).dropna()
+    assert ((rsi >= 0) & (rsi <= 100)).all()
+
+
+def test_rsi_is_high_when_price_only_rises():
+    rising = pd.Series(range(100, 160), dtype=float)
+    assert core.calculate_rsi(rising, 14).iloc[-1] > 95
+
+
+def test_atr_is_positive():
+    closes = _sample_closes()
+    ohlc = pd.DataFrame({"high": closes + 2, "low": closes - 2, "close": closes})
+    assert (core.calculate_atr(ohlc, 14).dropna() > 0).all()
+
+
+# ---------- การปัดค่าให้ broker ยอมรับ ----------
+
+def test_price_is_rounded_to_symbol_digits():
+    assert trade.normalize_price(FakeSymbolInfo(), 4390.123456) == 4390.12
+
+
+def test_volume_rounds_down_to_step():
+    """ต้องปัดลง ไม่ใช่ปัดใกล้สุด เพื่อไม่ให้ความเสี่ยงเกินที่ตั้งไว้"""
+    assert trade.normalize_volume(FakeSymbolInfo(), 0.1789) == 0.17
+
+
+def test_volume_is_clamped_to_broker_limits():
+    info = FakeSymbolInfo()
+    assert trade.normalize_volume(info, 0.0001) == info.volume_min
+    assert trade.normalize_volume(info, 999) == info.volume_max
+
+
+def test_min_stop_distance_covers_spread_when_wider_than_stops_level():
+    # stops_level 30 point = 0.30 แต่ spread 0.26 x3 = 0.78 จึงต้องได้ 0.78
+    assert abs(trade.min_stop_distance(FakeSymbolInfo(), FakeTick()) - 0.78) < 1e-9
+
+
+def test_min_stop_distance_falls_back_when_broker_reports_zero():
+    """broker ที่คืน trade_stops_level = 0 ใช้ระยะ dynamic ต้องไม่ได้ 0"""
+    class ZeroLevel(FakeSymbolInfo):
+        trade_stops_level = 0
+
+    assert trade.min_stop_distance(ZeroLevel(), FakeTick()) > 0
+
+
+def test_filling_mode_follows_symbol_bitmask():
+    modes = trade.pick_filling_modes(FakeSymbolInfo())
+    assert modes[0] == mt5.ORDER_FILLING_IOC
+    # ต้องมีตัวสำรองไว้ลองต่อเมื่อโดน retcode 10030
+    assert len(modes) > 1
+
+
+# ---------- ขนาดไม้และความเสี่ยง ----------
+
+def test_lot_is_sized_from_risk_and_stop_distance():
+    # ATR 10.87 x 1.5 = 16.305 ; เสี่ยง 0.5% ของ 10000 = 50 USD
+    # ขาดทุนต่อ 1 lot = (16.305 / 0.01) * 1.0 = 1630.5 -> 50/1630.5 = 0.0306 -> 0.03
+    lots = trade.calculate_lot(FakeSymbolInfo(), FakeAccount(), 10.87 * 1.5, 0.5)
+    assert lots == 0.03
+
+
+def test_estimated_loss_never_exceeds_risk_budget():
+    info, account = FakeSymbolInfo(), FakeAccount()
+    sl_distance = 10.87 * 1.5
+    lots = trade.calculate_lot(info, account, sl_distance, 0.5)
+
+    budget = account.balance * 0.005
+    assert trade.estimated_loss(info, lots, sl_distance) <= budget
+
+
+def test_wider_stop_gives_smaller_lot():
+    info, account = FakeSymbolInfo(), FakeAccount()
+    narrow = trade.calculate_lot(info, account, 10.0, 1.0)
+    wide = trade.calculate_lot(info, account, 40.0, 1.0)
+    assert wide < narrow
+
+
+def test_lot_falls_back_to_minimum_on_unusable_inputs():
+    info = FakeSymbolInfo()
+    assert trade.calculate_lot(info, FakeAccount(), 0, 0.5) == info.volume_min
+
+
+def test_old_fixed_point_stop_was_inside_the_noise():
+    """
+    บันทึกเหตุผลที่เลิกใช้ SL แบบจุดคงที่
+
+    ของเดิมคือ 300 * point = 3.00 USD บน XAUUSD ขณะที่ ATR จริงราว 10.87
+    เท่ากับกัน stop ไว้แค่ 0.28 ATR ซึ่งโดน noise กินแทบทุกไม้
+    """
+    old_stop = 300 * FakeSymbolInfo.point
+    observed_atr = 10.87
+
+    assert old_stop == 3.0
+    assert old_stop < observed_atr * 0.5
+
+
+# ---------- state ข้ามการ restart ----------
+
+def test_state_round_trips_through_disk(tmp_path=None):
+    import tempfile
+
+    directory = str(tmp_path) if tmp_path else tempfile.mkdtemp()
+    path = os.path.join(directory, "state.json")
+
+    assert core.load_state(path) == {}
+
+    core.save_state(path, {"last_candle_time": "2026-09-08 19:15:00"})
+    assert core.load_state(path)["last_candle_time"] == "2026-09-08 19:15:00"
+
+
+def test_corrupt_state_file_is_ignored(tmp_path=None):
+    import tempfile
+
+    directory = str(tmp_path) if tmp_path else tempfile.mkdtemp()
+    path = os.path.join(directory, "state.json")
+
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("{ไม่ใช่ json")
+
+    assert core.load_state(path) == {}
+
+
+# ---------- ตัวรันแบบไม่ต้องมี pytest ----------
+
+def _run_all():
+    tests = sorted(
+        (name, function)
+        for name, function in globals().items()
+        if name.startswith("test_") and callable(function)
+    )
+
+    failed = []
+
+    for name, function in tests:
+        try:
+            function()
+        except AssertionError as error:
+            failed.append(name)
+            print(f"FAIL  {name}  {error}")
+        except Exception as error:  # ข้อผิดพลาดอื่นก็ถือว่าเทสไม่ผ่าน
+            failed.append(name)
+            print(f"ERROR {name}  {type(error).__name__}: {error}")
+        else:
+            print(f"PASS  {name}")
+
+    print()
+    if failed:
+        print(f"ไม่ผ่าน {len(failed)} จาก {len(tests)} ข้อ: {', '.join(failed)}")
+        return 1
+
+    print(f"ผ่านทั้งหมด {len(tests)} ข้อ")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_all())

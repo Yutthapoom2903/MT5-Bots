@@ -11,8 +11,11 @@
 
 import json
 import logging
+import logging.handlers
 import os
 import sys
+import time as _time
+from datetime import datetime, timezone
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -29,19 +32,36 @@ class MT5Error(RuntimeError):
 
 # ---------- logging ----------
 
-def setup_logging(log_file=None, level=logging.INFO):
-    """ตั้ง logger ให้พิมพ์ออกจอและเขียนไฟล์พร้อมกัน รองรับภาษาไทยบน Windows console"""
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUPS = 5
+
+
+def setup_logging(log_file=None, level=logging.INFO, console_level=logging.INFO):
+    """
+    ตั้ง logger ให้พิมพ์ออกจอและเขียนไฟล์พร้อมกัน รองรับภาษาไทยบน Windows console
+
+    ไฟล์เก็บละเอียดกว่าจอเสมอ (DEBUG ลงไฟล์ แต่จอเห็นแค่ INFO) เพราะบอทรันทิ้งไว้
+    เป็นวันๆ เวลามีปัญหาต้องย้อนดูได้ว่าเกิดอะไรขึ้นทีละรอบ
+    ไฟล์หมุนเมื่อโตถึง 5MB เก็บย้อนหลัง 5 ไฟล์ จะได้ไม่กินดิสก์ไม่จำกัด
+    """
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except (AttributeError, OSError):
         pass
 
-    handlers = [logging.StreamHandler(sys.stdout)]
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(console_level)
+    handlers = [console]
+
     if log_file:
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        rotating = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8",
+        )
+        rotating.setLevel(level)
+        handlers.append(rotating)
 
     logging.basicConfig(
-        level=level,
+        level=min(level, console_level),
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=handlers,
@@ -167,6 +187,25 @@ def calculate_atr(df, period=14):
     ], axis=1).max(axis=1)
 
     return true_range.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def broker_gmt_offset(symbol):
+    """
+    ส่วนต่างเวลาเซิร์ฟเวอร์ broker กับ UTC เป็นชั่วโมง
+
+    จำเป็นสำหรับตั้ง SESSION_HOURS ให้ถูก เพราะเวลาในแท่งราคาเป็นเวลาเซิร์ฟเวอร์
+    ไม่ใช่เวลาไทยและไม่ใช่ UTC  broker ส่วนใหญ่อยู่ GMT+2/+3 และขยับตาม DST ด้วย
+    คืน None ถ้าดึงราคาไม่ได้
+    """
+    tick = mt5.symbol_info_tick(symbol)
+
+    if tick is None or not tick.time:
+        return None
+
+    server = datetime.fromtimestamp(tick.time, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+
+    return round((server - now).total_seconds() / 3600)
 
 
 def spread_points(symbol):

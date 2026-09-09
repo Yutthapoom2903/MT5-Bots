@@ -18,6 +18,7 @@ simulate() เป็นฟังก์ชันบริสุทธิ์ ร�
   - ข้อมูลย้อนหลังของ broker ไม่ได้สะท้อนสภาพคล่องจริงในอดีตทั้งหมด
 """
 
+import numpy as np
 import pandas as pd
 
 import mt5_core as core
@@ -75,6 +76,24 @@ def _align(source, target_times, lag):
     return [values[position] if position >= 0 else "UNKNOWN" for position in positions]
 
 
+def signal_series(bars):
+    """
+    สัญญาณ crossover ของทุกแท่งในครั้งเดียว
+
+    ให้ผลเท่ากับการเรียก core.crossover_signal() ทีละแท่ง แต่เร็วกว่ามาก เพราะการ
+    slice DataFrame ในลูปทำให้เวลาเป็น O(n^2)  ความเท่ากันถูกยืนยันด้วยเทส
+    test_vectorised_signal_matches_the_live_rule ห้ามแก้ฟังก์ชันนี้โดยไม่รันเทสนั้น
+    """
+    fast, slow = bars["ma_fast"], bars["ma_slow"]
+    previous_fast, previous_slow = fast.shift(1), slow.shift(1)
+
+    signals = np.where(
+        (previous_fast <= previous_slow) & (fast > slow), "BUY",
+        np.where((previous_fast >= previous_slow) & (fast < slow), "SELL", "HOLD"),
+    )
+    return pd.Series(signals, index=bars.index, dtype=object)
+
+
 def prepare(m15, h1, m5, config):
     """คำนวณ indicator ทั้งหมดและจับคู่ timeframe ให้ตรงเวลา"""
     fast, slow = config["fast_ma"], config["slow_ma"]
@@ -98,64 +117,66 @@ def prepare(m15, h1, m5, config):
     else:
         m15["m5_trend"] = "UNKNOWN"
 
+    m15["signal"] = signal_series(m15)
     return m15
 
 
 # ---------- จำลองไม้เดียว ----------
 
-def _simulate_position(bars, start, direction, entry, initial_risk, target, config):
+def _simulate_position(series, start, direction, entry, initial_risk, target, config):
     """
     เดินไปข้างหน้าทีละแท่งจนกว่าไม้จะปิด
 
+    รับ series เป็น dict ของ numpy array ไม่ใช่ DataFrame เพราะการอ่านทีละแถวด้วย
+    .iloc ช้ากว่าหลายสิบเท่า ทำให้การกวาดค่าใช้เวลาเป็นนาทีแทนที่จะเป็นวินาที
+
     คืน (ผลลัพธ์เป็น R, index ที่ปิด, เหตุผลที่ปิด)
     """
-    stop = entry - initial_risk if direction == "BUY" else entry + initial_risk
+    high, low, close, atr = series["high"], series["low"], series["close"], series["atr"]
+    is_buy = direction == "BUY"
+    stop = entry - initial_risk if is_buy else entry + initial_risk
 
-    for index in range(start, len(bars)):
-        bar = bars.iloc[index]
-
-        if direction == "BUY":
+    for index in range(start, len(close)):
+        if is_buy:
             # สมมติฝั่งแย่: ชนทั้งคู่ในแท่งเดียวให้ SL ชนก่อน
-            if bar["low"] <= stop:
+            if low[index] <= stop:
                 return (stop - entry) / initial_risk, index, "SL"
-            if bar["high"] >= target:
+            if high[index] >= target:
                 return (target - entry) / initial_risk, index, "TP"
         else:
-            if bar["high"] >= stop:
+            if high[index] >= stop:
                 return (entry - stop) / initial_risk, index, "SL"
-            if bar["low"] <= target:
+            if low[index] <= target:
                 return (entry - target) / initial_risk, index, "TP"
 
-        stop = _updated_stop(direction, entry, bar, stop, initial_risk, config)
+        stop = _updated_stop(is_buy, entry, close[index], atr[index], stop, initial_risk, config)
 
-    last = bars.iloc[-1]
-    result = (last["close"] - entry) if direction == "BUY" else (entry - last["close"])
-    return result / initial_risk, len(bars) - 1, "ยังไม่ปิด"
+    result = (close[-1] - entry) if is_buy else (entry - close[-1])
+    return result / initial_risk, len(close) - 1, "ยังไม่ปิด"
 
 
-def _updated_stop(direction, entry, bar, stop, initial_risk, config):
+def _updated_stop(is_buy, entry, price, atr, stop, initial_risk, config):
     """ขยับ stop ตามราคาปิดแท่งนี้ ใช้กติกาเดียวกับบอทจริง"""
     import mt5_trade as trade
     import MetaTrader5 as mt5
 
-    position_type = mt5.POSITION_TYPE_BUY if direction == "BUY" else mt5.POSITION_TYPE_SELL
-    price = bar["close"]
-    candidates = []
+    position_type = mt5.POSITION_TYPE_BUY if is_buy else mt5.POSITION_TYPE_SELL
+    best = stop
 
     if config["use_breakeven"]:
-        candidates.append(trade.breakeven_level(
+        candidate = trade.breakeven_level(
             position_type, entry, price, initial_risk,
             config["breakeven_at_r"], config["breakeven_buffer_r"],
-        ))
+        )
+        improved = trade.better_stop(position_type, best, candidate)
+        if improved is not None:
+            best = improved
 
     if config["use_trailing"]:
-        candidates.append(trade.trailing_level(
+        candidate = trade.trailing_level(
             position_type, entry, price, initial_risk,
-            config["trail_start_r"], bar["atr"], config["trail_atr_mult"],
-        ))
-
-    best = stop
-    for candidate in candidates:
+            config["trail_start_r"], atr, config["trail_atr_mult"],
+        )
         improved = trade.better_stop(position_type, best, candidate)
         if improved is not None:
             best = improved
@@ -165,17 +186,28 @@ def _updated_stop(direction, entry, bar, stop, initial_risk, config):
 
 # ---------- ลูปจำลอง ----------
 
-def simulate(m15, h1=None, m5=None, config=None):
+def simulate(m15=None, h1=None, m5=None, config=None, prepared=None):
     """
     เดินทีละแท่งตั้งแต่ต้นจนจบ ใช้ข้อมูลถึงแท่งปัจจุบันเท่านั้น
 
     เข้าไม้ที่ราคาเปิดของแท่งถัดไป ซึ่งตรงกับพฤติกรรมจริง: บอทเห็นแท่งปิดแล้วยิงคำสั่ง
+    ส่ง prepared เข้ามาได้ถ้าคำนวณ indicator ไว้แล้ว ใช้ตอนกวาดค่าเพื่อไม่คำนวณซ้ำ
     """
     config = {**DEFAULTS, **(config or {})}
-    bars = prepare(m15.copy(), h1, m5, config)
+    bars = prepared if prepared is not None else prepare(m15.copy(), h1, m5, config)
 
     spread = config["spread_points"] * config["point"]
     warmup = config["slow_ma"] + max(config["rsi_period"], config["adx_period"]) + 5
+
+    series = {
+        name: bars[name].to_numpy()
+        for name in ("open", "high", "low", "close", "atr", "adx", "rsi")
+    }
+    signals = bars["signal"].to_numpy()
+    h1_trend = bars["h1_trend"].to_numpy()
+    m5_trend = bars["m5_trend"].to_numpy()
+    times = bars["time"].to_numpy()
+    hours = bars["time"].dt.hour.to_numpy()
 
     trades = []
     blocked = {}
@@ -185,41 +217,35 @@ def simulate(m15, h1=None, m5=None, config=None):
         if index <= busy_until:
             continue
 
-        window = bars.iloc[: index + 1]
-        candle = window.iloc[-1]
-
-        # crossover_signal อ่าน iloc[-2] เป็นแท่งปิด จึงต้องส่ง window ที่ยาวกว่า 1 แท่ง
-        signal = core.crossover_signal(bars.iloc[: index + 2])
+        signal = signals[index]
 
         if signal == "HOLD":
             continue
 
-        context = {
-            "m15_signal": signal,
-            "h1_trend": candle["h1_trend"],
-            "m5_trend": candle["m5_trend"],
-            "adx": candle["adx"],
-            "rsi": candle["rsi"],
-            "spread_points": config["spread_points"],
-            "server_hour": candle["time"].hour,
-            "fast_ma": config["fast_ma"],
-            "slow_ma": config["slow_ma"],
-        }
-
         if config["use_filters"]:
-            decision = strategy.evaluate(context)
+            decision = strategy.evaluate({
+                "m15_signal": signal,
+                "h1_trend": h1_trend[index],
+                "m5_trend": m5_trend[index],
+                "adx": series["adx"][index],
+                "rsi": series["rsi"][index],
+                "spread_points": config["spread_points"],
+                "server_hour": int(hours[index]),
+                "fast_ma": config["fast_ma"],
+                "slow_ma": config["slow_ma"],
+            })
 
             if not decision.enter:
                 for check in decision.blockers:
                     blocked[check.name] = blocked.get(check.name, 0) + 1
                 continue
 
-        atr = candle["atr"]
-        if pd.isna(atr) or atr <= 0:
+        atr = series["atr"][index]
+        if not atr or atr != atr or atr <= 0:
             continue
 
         # เข้าที่ราคาเปิดแท่งถัดไป บวก spread เป็นต้นทุนการเข้า
-        next_open = bars.iloc[index + 1]["open"]
+        next_open = series["open"][index + 1]
         entry = next_open + spread if signal == "BUY" else next_open - spread
 
         initial_risk = atr * config["sl_atr_mult"]
@@ -227,19 +253,19 @@ def simulate(m15, h1=None, m5=None, config=None):
             else (entry - atr * config["tp_atr_mult"])
 
         result, exit_index, reason = _simulate_position(
-            bars, index + 1, signal, entry, initial_risk, target, config,
+            series, index + 1, signal, entry, initial_risk, target, config,
         )
 
         trades.append({
-            "entry_time": bars.iloc[index + 1]["time"],
-            "exit_time": bars.iloc[exit_index]["time"],
+            "entry_time": pd.Timestamp(times[index + 1]),
+            "exit_time": pd.Timestamp(times[exit_index]),
             "direction": signal,
-            "entry": round(entry, 2),
-            "r": round(result, 3),
+            "entry": round(float(entry), 2),
+            "r": round(float(result), 3),
             "reason": reason,
             "bars_held": exit_index - index,
-            "h1_trend": candle["h1_trend"],
-            "adx": round(float(candle["adx"]), 1) if not pd.isna(candle["adx"]) else None,
+            "h1_trend": h1_trend[index],
+            "adx": round(float(series["adx"][index]), 1),
         })
 
         busy_until = exit_index
@@ -351,7 +377,101 @@ def compare(m15, h1, m5, config=None):
     """
     base = {**DEFAULTS, **(config or {})}
 
-    with_filters = simulate(m15, h1, m5, {**base, "use_filters": True})
-    without = simulate(m15, h1, m5, {**base, "use_filters": False})
+    prepared = prepare(m15.copy(), h1, m5, base)
+
+    with_filters = simulate(config={**base, "use_filters": True}, prepared=prepared)
+    without = simulate(config={**base, "use_filters": False}, prepared=prepared)
 
     return with_filters, without
+
+
+# ---------- กวาดหาค่าพารามิเตอร์ ----------
+
+DEFAULT_GRID = {
+    "sl_atr_mult": (1.0, 1.5, 2.0),
+    "tp_atr_mult": (2.0, 3.0, 4.0),
+    "adx_min": (15.0, 20.0, 25.0),
+}
+
+
+def sweep(m15, h1=None, m5=None, base=None, grid=None, progress=None):
+    """
+    รันจำลองหลายชุดค่าแล้วเรียงตามคาดหวังต่อไม้
+
+    จุดประสงค์ไม่ใช่หา "ค่าที่ดีที่สุด" ไปใช้ตรงๆ แต่ดูว่าผลลัพธ์ **ทน** ต่อการเปลี่ยนค่าไหม
+    ถ้ามีแค่ชุดเดียวที่กำไรและชุดข้างเคียงติดลบหมด แปลว่าฟลุค ไม่ใช่ขอบจริง
+    ค่าที่ควรเลือกคือค่าที่อยู่กลางย่านที่กำไรทั้งย่าน
+    """
+    from itertools import product
+
+    grid = grid or DEFAULT_GRID
+    base = {**DEFAULTS, **(base or {})}
+
+    keys = list(grid)
+    combinations = list(product(*(grid[key] for key in keys)))
+
+    # คำนวณ indicator ครั้งเดียวแล้วใช้ซ้ำทุกชุดค่า — ค่าที่กวาดไม่กระทบ indicator
+    prepared = prepare(m15.copy(), h1, m5, base)
+
+    original_adx = strategy.ADX_MIN
+    rows = []
+
+    try:
+        for number, values in enumerate(combinations, start=1):
+            settings = dict(zip(keys, values))
+
+            if progress:
+                progress(number, len(combinations), settings)
+
+            # ADX_MIN อยู่ใน strategy ไม่ใช่ config ของ backtest
+            if "adx_min" in settings:
+                strategy.ADX_MIN = settings["adx_min"]
+
+            config = {**base, **{k: v for k, v in settings.items() if k != "adx_min"}}
+            stats = metrics(simulate(config=config, prepared=prepared))
+
+            rows.append({**settings, **{
+                "trades": stats.get("trades", 0),
+                "expectancy_r": stats.get("expectancy_r", 0.0),
+                "total_r": stats.get("total_r", 0.0),
+                "win_rate": stats.get("win_rate", 0.0),
+                "max_drawdown_r": stats.get("max_drawdown_r", 0.0),
+                "profit_factor": stats.get("profit_factor", 0.0),
+            }})
+    finally:
+        strategy.ADX_MIN = original_adx
+
+    return sorted(rows, key=lambda row: row["expectancy_r"], reverse=True)
+
+
+def format_sweep(rows, top=15):
+    """ตารางผลการกวาดค่า เรียงจากดีที่สุด"""
+    if not rows:
+        return "ไม่มีผลลัพธ์"
+
+    lines = [
+        "--- ผลการกวาดค่าพารามิเตอร์ ---",
+        f"{'SL':>5} {'TP':>5} {'ADX':>5} {'ไม้':>5} {'ชนะ%':>7} "
+        f"{'ต่อไม้':>9} {'รวม':>9} {'DD':>8} {'PF':>6}",
+    ]
+
+    for row in rows[:top]:
+        lines.append(
+            f"{row.get('sl_atr_mult', 0):>5.1f} {row.get('tp_atr_mult', 0):>5.1f} "
+            f"{row.get('adx_min', 0):>5.0f} {row['trades']:>5} {row['win_rate']:>6.1f}% "
+            f"{row['expectancy_r']:>+9.3f} {row['total_r']:>+9.2f} "
+            f"{row['max_drawdown_r']:>8.2f} {row['profit_factor']:>6.2f}"
+        )
+
+    profitable = [row for row in rows if row["expectancy_r"] > 0]
+    lines.append("")
+    lines.append(f"ชุดค่าที่คาดหวังเป็นบวก: {len(profitable)} จาก {len(rows)}")
+
+    if not profitable:
+        lines.append("ไม่มีชุดไหนเป็นบวกเลย — กลยุทธ์นี้ยังไม่มีขอบในช่วงข้อมูลนี้")
+    elif len(profitable) < len(rows) * 0.3:
+        lines.append("บวกแค่ไม่กี่ชุด ระวังฟลุค อย่าเลือกค่าที่ดีที่สุดไปใช้ตรงๆ")
+    else:
+        lines.append("บวกเป็นย่านกว้าง สัญญาณว่ามีขอบจริง เลือกค่ากลางย่านจะทนกว่าค่าที่ดีที่สุด")
+
+    return "\n".join(lines)

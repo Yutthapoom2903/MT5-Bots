@@ -8,9 +8,10 @@ feature log -> ให้ strategy ตัดสินใจ -> ส่งคำส
 โหมดเทรดปิดเป็นค่าเริ่มต้น ต้องสั่ง --trade เองเท่านั้นถึงจะส่งคำสั่งจริง
 """
 
+import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -57,6 +58,9 @@ BREAKEVEN_BUFFER_R = 0.1      # เผื่อเหนือทุนเล็
 USE_TRAILING = True           # ไล่ SL ตามราคาเมื่อกำไรวิ่งต่อ
 TRAIL_START_R = 1.5
 TRAIL_ATR_MULT = 2.0
+USE_PARTIAL_TP = True         # เก็บกำไรบางส่วนแล้วปล่อยที่เหลือวิ่ง
+PARTIAL_TP_AT_R = 1.0
+PARTIAL_TP_FRACTION = 0.5
 
 # ---------- ตัวตัดวงจร หยุดเองเมื่อวันนี้ไม่เข้าทาง ----------
 MAX_DAILY_LOSS_PERCENT = 3.0  # ขาดทุนถึงกี่ % ของทุนต้นวันแล้วหยุดเทรดทั้งวัน
@@ -66,6 +70,7 @@ MAX_CONSECUTIVE_LOSSES = 3
 # ---------- ความทนทานของลูป ----------
 MARKET_CLOSED_SLEEP = 300     # ตลาดปิดแล้วไม่ต้อง poll ถี่
 RECONNECT_DELAY = 30
+HEARTBEAT_EVERY_HOURS = 12    # แจ้ง Telegram เป็นระยะว่ายังทำงานอยู่ 0 = ปิด
 
 # ---------- ไฟล์ ----------
 SIGNAL_LOG = "signal_log.csv"
@@ -416,19 +421,74 @@ def _best_candidate(position, entry, price, initial_risk, atr):
     return best
 
 
+def take_partial_profit(position, price, initial_risk, info, state, logger):
+    """
+    ปิดครึ่งไม้เมื่อกำไรถึงเป้าแรก แล้วปล่อยที่เหลือวิ่งต่อ
+
+    ทำครั้งเดียวต่อไม้ จึงต้องจำไว้ใน state ไม่งั้นจะทยอยปิดจนหมดไม้
+    """
+    if not USE_PARTIAL_TP:
+        return
+
+    taken = state.setdefault("partial_taken", {})
+    key = str(position.ticket)
+
+    if taken.get(key):
+        return
+
+    profit = (price - position.price_open) if position.type == mt5.POSITION_TYPE_BUY \
+        else (position.price_open - price)
+
+    if profit < initial_risk * PARTIAL_TP_AT_R:
+        return
+
+    volume = trade.partial_close_volume(info, position.volume, PARTIAL_TP_FRACTION)
+
+    if volume is None:
+        # ปกติของพอร์ตเล็กที่เปิดแค่ 0.01 lot — ปิดครึ่งไม่ได้ บอกครั้งเดียวพอ
+        taken[key] = "เล็กเกินจะแบ่งปิด"
+        logger.info(
+            "ticket %s ถึง %.1fR แล้วแต่ %.2f lot เล็กเกินจะแบ่งปิด ปล่อยเต็มไม้ต่อ",
+            position.ticket, PARTIAL_TP_AT_R, position.volume,
+        )
+        return
+
+    result = trade.close_partial(position, volume, DEVIATION, logger)
+
+    if result is not None and result.retcode == trade.RETCODE_DONE:
+        taken[key] = True
+        logger.info(
+            "เก็บกำไรบางส่วน ticket %s: ปิด %.2f จาก %.2f lot ที่ %.1fR",
+            position.ticket, volume, position.volume, PARTIAL_TP_AT_R,
+        )
+        send_telegram(
+            f"เก็บกำไรครึ่งไม้ ticket {position.ticket}\n"
+            f"ปิด {volume} จาก {position.volume} lot ที่ {PARTIAL_TP_AT_R}R", logger,
+        )
+
+
 def manage_positions(context, state, logger):
     """เรียกทุกรอบ ไม่ใช่แค่ตอนแท่งปิด — ราคาวิ่งระหว่างแท่งก็ต้องดูแล SL"""
     positions = trade.open_positions(SYMBOL, MAGIC)
 
     # ล้าง state ของไม้ที่ปิดไปแล้ว
     live_tickets = {str(position.ticket) for position in positions}
-    risks = state.setdefault("position_risk", {})
-    for ticket in list(risks):
-        if ticket not in live_tickets:
-            del risks[ticket]
+    for bucket in ("position_risk", "partial_taken"):
+        records = state.setdefault(bucket, {})
+        for ticket in list(records):
+            if ticket not in live_tickets:
+                del records[ticket]
 
     if not positions:
         return
+
+    for position in positions:
+        logger.debug(
+            "ถืออยู่ ticket %s %s %.2f lot เข้าที่ %.2f SL %.2f TP %.2f กำไร %.2f",
+            position.ticket,
+            "BUY" if position.type == mt5.POSITION_TYPE_BUY else "SELL",
+            position.volume, position.price_open, position.sl, position.tp, position.profit,
+        )
 
     info = mt5.symbol_info(SYMBOL)
     tick = mt5.symbol_info_tick(SYMBOL)
@@ -446,6 +506,8 @@ def manage_positions(context, state, logger):
 
         # ราคาที่ใช้ปิดไม้คือฝั่งที่เสียเปรียบ จึงเป็นตัววัดกำไรที่ถูกต้อง
         price = tick.bid if position.type == mt5.POSITION_TYPE_BUY else tick.ask
+
+        take_partial_profit(position, price, initial_risk, info, state, logger)
 
         candidate = _best_candidate(position, position.price_open, price, initial_risk, context["atr"])
         new_sl = trade.better_stop(position.type, position.sl, candidate)
@@ -493,6 +555,42 @@ def trading_allowed(state, logger):
     return True, "", summary
 
 
+def heartbeat(state, account, logger):
+    """
+    แจ้งเป็นระยะว่ายังทำงานอยู่ — บอทที่ตายเงียบคือบอทที่แย่ที่สุด
+
+    เก็บเวลาส่งล่าสุดไว้ใน state จึงไม่สแปมซ้ำหลัง restart
+    """
+    if not HEARTBEAT_EVERY_HOURS:
+        return
+
+    now = datetime.now()
+    last = state.get("last_heartbeat")
+
+    if last:
+        try:
+            if now - datetime.fromisoformat(last) < timedelta(hours=HEARTBEAT_EVERY_HOURS):
+                return
+        except ValueError:
+            pass
+
+    state["last_heartbeat"] = now.isoformat(timespec="seconds")
+
+    positions = trade.open_positions(SYMBOL, MAGIC)
+    summary = state.get("day_summary") or {}
+
+    message = (
+        f"บอท {SYMBOL} ยังทำงานอยู่\n"
+        f"Equity {account.equity:.2f} {account.currency}\n"
+        f"ถืออยู่ {len(positions)} ไม้\n"
+        f"วันนี้ {summary.get('trades', 0)} ไม้ กำไรสุทธิ {summary.get('profit', 0.0):.2f}\n"
+        f"แท่งล่าสุด {state.get('last_candle_time', '-')}"
+    )
+
+    logger.info("ส่ง heartbeat: ถืออยู่ %d ไม้ equity %.2f", len(positions), account.equity)
+    send_telegram(message, logger)
+
+
 def roll_over_day(state, account, logger):
     """ตัดวันใหม่ — สรุปวันเก่าส่ง Telegram แล้วรีเซ็ตฐานทุนของวัน"""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -537,11 +635,12 @@ def guard_account(account, trade_enabled, logger):
 
 def run(trade_enabled=False):
     """ลูปเดียวที่ทำทุกอย่าง — ดูแลไม้ที่เปิดอยู่ บันทึกข้อมูล ตัดสินใจ และเทรดถ้าเปิดไว้"""
-    logger = core.setup_logging(LOG_FILE)
+    # ไฟล์เก็บ DEBUG ทั้งหมด จอเห็นแค่ INFO เวลามีปัญหาจะได้ย้อนดูได้ทีละรอบ
+    logger = core.setup_logging(LOG_FILE, level=logging.DEBUG, console_level=logging.INFO)
 
     account = core.connect()
     guard_account(account, trade_enabled, logger)
-    core.prepare_symbol(SYMBOL)
+    info = core.prepare_symbol(SYMBOL)
 
     state = core.load_state(STATE_FILE)
     last_candle_time = state.get("last_candle_time")
@@ -558,6 +657,21 @@ def run(trade_enabled=False):
         "ดูแลไม้: %s | ตัวตัดวงจร: ขาดทุน %.1f%%/วัน, %d ไม้/วัน, แพ้ติดกัน %d",
         _management_summary(), MAX_DAILY_LOSS_PERCENT, MAX_TRADES_PER_DAY, MAX_CONSECUTIVE_LOSSES,
     )
+
+    logger.info(
+        "เก็บกำไรบางส่วน: %s | heartbeat ทุก %s",
+        f"{PARTIAL_TP_FRACTION:.0%} ที่ {PARTIAL_TP_AT_R}R" if USE_PARTIAL_TP else "ปิด",
+        f"{HEARTBEAT_EVERY_HOURS} ชั่วโมง" if HEARTBEAT_EVERY_HOURS else "ปิด",
+    )
+    logger.info(
+        "Symbol: %d หลัก, point %s, lot %.2f-%.2f ก้าว %.2f, stops level %s points",
+        info.digits, info.point, info.volume_min, info.volume_max,
+        info.volume_step, info.trade_stops_level,
+    )
+
+    offset = core.broker_gmt_offset(SYMBOL)
+    if offset is not None:
+        logger.info("เวลาเซิร์ฟเวอร์ broker = GMT%+d (ใช้ตั้ง SESSION_HOURS)", offset)
 
     if trade_enabled:
         send_telegram(
@@ -578,6 +692,7 @@ def run(trade_enabled=False):
             continue
 
         roll_over_day(state, account, logger)
+        heartbeat(state, account, logger)
 
         info = mt5.symbol_info(SYMBOL)
         if info is not None and not trade.symbol_is_tradable(info):
@@ -599,6 +714,12 @@ def run(trade_enabled=False):
 
         candle_time = str(context["candle_time"])
 
+        logger.debug(
+            "รอบตรวจ: แท่งล่าสุด %s close %.2f spread %s %s",
+            candle_time, context["close"], context["spread_points"],
+            "(ประมวลผลแล้ว)" if candle_time == last_candle_time else "(แท่งใหม่)",
+        )
+
         if candle_time == last_candle_time:
             core.save_state(STATE_FILE, state)
             time.sleep(CHECK_EVERY_SECONDS)
@@ -618,6 +739,11 @@ def run(trade_enabled=False):
             context["rsi"], context["adx"], context["atr"], context["spread_points"],
         )
         logger.info("คำตัดสิน: %s", decision.summary())
+
+        # เหตุผลเต็มลงไฟล์เสมอ จะได้ย้อนดูได้ว่าตัวกรองไหนบล็อกและด้วยตัวเลขอะไร
+        for check in decision.checks:
+            logger.debug("  [%s] %s: %s", "ผ่าน" if check.passed else "ไม่ผ่าน",
+                         check.name, check.detail)
 
         if decision.enter:
             if not trade_enabled:

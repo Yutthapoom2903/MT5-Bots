@@ -22,7 +22,8 @@ mt5_trade.py    broker-facing only: price/volume normalization, stop distance, f
                 mode, risk sizing, order send/close. Imported by runner.py alone.
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
-tests/          67 logic tests, no MT5 required
+report.py       offline digest of the CSVs and bot.log
+tests/          77 logic tests, no MT5 required
 ```
 
 ## Running
@@ -36,8 +37,9 @@ from the Linux side.
 `import MetaTrader5` to `run.py`.
 
 ```bash
-python run.py test         # 67 logic tests, runs under WSL
-python run.py review       # runs under WSL (backtest needs MT5 for history)
+python run.py test         # 77 logic tests, runs under WSL
+python run.py review       # runs under WSL
+python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
 pytest tests/              # same tests, if pytest is installed
 ```
 
@@ -118,6 +120,16 @@ Stop progression reuses `mt5_trade.breakeven_level` / `trailing_level` / `better
 the simulation cannot drift from live behaviour. If you change a stop rule, change it in
 `mt5_trade.py` and both paths follow.
 
+**`backtest.signal_series()` is a vectorised copy of the crossover rule** — the one place
+the invariant is duplicated, because slicing the frame per bar made the loop O(n²) (a
+27-combo sweep took 166s; it now takes 0.3s). `test_vectorised_signal_matches_the_live_rule`
+compares it against `core.crossover_signal()` bar by bar. Never edit it without running
+that test. The inner position loop takes numpy arrays, not DataFrames, for the same reason.
+
+`sweep()` prepares indicators once and reuses them, and restores `strategy.ADX_MIN` in a
+`finally`. Its point is robustness, not optimisation — a grid that is profitable only in one
+cell is noise, and `format_sweep()` says so rather than reporting a winner.
+
 Results are in R (risk multiples), not currency — independent of balance and lot size.
 `compare()` runs with and without filters; that delta is the point of the tool.
 
@@ -136,6 +148,12 @@ The bot is meant to run at home without a watcher, so the loop is defensive:
   only; open positions keep being managed. The halt reason is announced once, not per
   candle.
 - `roll_over_day()` resets `day_start_balance` and sends the previous day's summary.
+- `heartbeat()` posts equity, open positions and the last candle every
+  `HEARTBEAT_EVERY_HOURS`, timestamped in state so a restart does not spam.
+- `bot.log` records DEBUG (every cycle, every filter check with its numbers, position state)
+  while the console stays at INFO. It rotates at 5MB x 5 backups. `run.py report` is the
+  intended way to read all of it back — it groups repeated log lines by shape, so a
+  thousand identical warnings collapse to one row with a count.
 - Market closed (`symbol_is_tradable()` false) backs the poll off to `MARKET_CLOSED_SLEEP`.
 
 `trade.summarize_deals()` is pure and takes a deal list so the breaker is testable; only
@@ -155,6 +173,15 @@ accumulating data, not build output. `bot.log` and `bot_state.json` are gitignor
 
 Column sets have changed over time: rows before 2026-09-09 used a simple rolling mean for
 RSI/ATR (now Wilder) and lack `adx_14`, `m5_trend`, `bot_decision`, `bot_blockers`.
+
+## Deliberately not built
+
+- **Multiple symbols.** Every risk limit, the circuit breaker, and the state file are
+  single-symbol. Adding symbols multiplies exposure and needs per-symbol config and
+  correlation handling; it should wait until the single-symbol version has a proven record.
+- **Session filter is off by default.** `SESSION_HOURS` is broker server time, which is
+  usually GMT+2/+3 and shifts with DST. `core.broker_gmt_offset()` reports it (shown by
+  `run.py check` and at startup); do not enable the filter without setting hours from that.
 
 ## Conventions
 

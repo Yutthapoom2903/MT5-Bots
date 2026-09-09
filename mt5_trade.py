@@ -416,3 +416,74 @@ def deals_today(symbol, magic, now=None):
     deals = mt5.history_deals_get(start, now + timedelta(days=1))
 
     return summarize_deals(deals, symbol, magic)
+
+
+def close_partial(position, volume, deviation, logger):
+    """
+    ปิดไม้บางส่วน ใช้ตอนเก็บกำไรครึ่งไม้แล้วปล่อยที่เหลือวิ่งต่อ
+
+    volume ต้องลงตัวกับ volume_step และส่วนที่เหลือต้องไม่ต่ำกว่า volume_min
+    ไม่งั้น broker ตีกลับ ผู้เรียกต้องตรวจก่อน
+    """
+    info = mt5.symbol_info(position.symbol)
+    tick = mt5.symbol_info_tick(position.symbol)
+
+    if info is None or tick is None:
+        return None
+
+    if position.type == mt5.POSITION_TYPE_BUY:
+        order_type = mt5.ORDER_TYPE_SELL
+        price = tick.bid
+    else:
+        order_type = mt5.ORDER_TYPE_BUY
+        price = tick.ask
+
+    for filling_mode in pick_filling_modes(info):
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": volume,
+            "type": order_type,
+            "position": position.ticket,
+            "price": normalize_price(info, price),
+            "deviation": deviation,
+            "magic": position.magic,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling_mode,
+            "comment": "ma-cross partial",
+        }
+
+        result = mt5.order_send(request)
+
+        if result is not None and result.retcode == RETCODE_DONE:
+            return result
+
+        if result is None or result.retcode != RETCODE_INVALID_FILL:
+            logger.warning("ปิดบางส่วน ticket %s ไม่สำเร็จ: %s",
+                           position.ticket, describe_result(result))
+            return result
+
+    return None
+
+
+def partial_close_volume(info, position_volume, fraction):
+    """
+    ปริมาณที่ปิดได้จริงเมื่ออยากปิดตามสัดส่วนที่กำหนด
+
+    คืน None ถ้าปิดไม่ได้ — ไม้เล็กเกินจนปิดครึ่งแล้วส่วนที่เหลือต่ำกว่าขั้นต่ำ
+    ซึ่งเป็นกรณีปกติของพอร์ตเล็กที่เปิดแค่ 0.01 lot
+    """
+    step = info.volume_step or 0.01
+    decimals = max(0, -Decimal(str(step)).as_tuple().exponent)
+
+    wanted = math.floor((position_volume * fraction) / step) * step
+    wanted = round(wanted, decimals)
+
+    if wanted < info.volume_min:
+        return None
+
+    remaining = round(position_volume - wanted, decimals)
+    if remaining < info.volume_min:
+        return None
+
+    return wanted

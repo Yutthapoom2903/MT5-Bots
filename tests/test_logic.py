@@ -662,6 +662,122 @@ def test_report_is_readable_when_nothing_traded():
     assert "ไม่มีไม้" in report
 
 
+# ---------- สัญญาณแบบเวคเตอร์ต้องเท่ากับของจริง ----------
+
+def test_vectorised_signal_matches_the_live_rule():
+    """
+    backtest ใช้ signal_series() เพื่อความเร็ว แต่บอทจริงใช้ core.crossover_signal()
+    ถ้าสองอันให้ผลต่างกันเมื่อไหร่ backtest จะวัดกลยุทธ์คนละตัวกับที่รันจริง
+    """
+    market = _trending_market(cycles=3, length=80)
+    prepared = backtest.prepare(market, None, None, backtest.DEFAULTS)
+
+    mismatches = [
+        index for index in range(60, len(prepared))
+        if core.crossover_signal(prepared.iloc[: index + 2]) != prepared["signal"].iloc[index]
+    ]
+
+    assert mismatches == []
+
+
+# ---------- ปิดไม้บางส่วน ----------
+
+def test_partial_close_splits_a_large_enough_position():
+    assert trade.partial_close_volume(FakeSymbolInfo(), 0.10, 0.5) == 0.05
+
+
+def test_partial_close_refuses_when_the_minimum_lot_cannot_be_split():
+    """0.01 lot แบ่งครึ่งไม่ได้ ต้องคืน None ไม่ใช่ส่งคำสั่งที่ broker จะตีกลับ"""
+    assert trade.partial_close_volume(FakeSymbolInfo(), 0.01, 0.5) is None
+
+
+def test_partial_close_refuses_when_nothing_would_be_left():
+    """ปิดทั้งไม้ไม่ใช่การปิดบางส่วน ต้องคืน None ไม่ใช่เผลอปิดหมด"""
+    assert trade.partial_close_volume(FakeSymbolInfo(), 0.02, 1.0) is None
+    # 0.9 ของ 0.02 ปัดลงเหลือ 0.01 และยังเหลือ 0.01 ซึ่งถึงขั้นต่ำพอดี จึงทำได้
+    assert trade.partial_close_volume(FakeSymbolInfo(), 0.02, 0.9) == 0.01
+
+
+def test_partial_close_rounds_down_to_the_volume_step():
+    assert trade.partial_close_volume(FakeSymbolInfo(), 0.07, 0.5) == 0.03
+
+
+# ---------- การกวาดค่า ----------
+
+def test_sweep_covers_the_whole_grid_and_restores_globals():
+    market = _trending_market(cycles=3, length=90)
+    grid = {"sl_atr_mult": (1.0, 2.0), "tp_atr_mult": (2.0, 4.0)}
+    before = strategy.ADX_MIN
+
+    rows = backtest.sweep(market, None, None, {"use_filters": False}, grid)
+
+    assert len(rows) == 4
+    assert strategy.ADX_MIN == before
+    # เรียงจากคาดหวังสูงสุดลงมา
+    assert rows == sorted(rows, key=lambda row: row["expectancy_r"], reverse=True)
+
+
+def test_sweep_restores_globals_even_if_it_fails():
+    before = strategy.ADX_MIN
+
+    try:
+        backtest.sweep(None, None, None, {}, {"adx_min": (99.0,)})
+    except Exception:
+        pass
+
+    assert strategy.ADX_MIN == before
+
+
+def test_sweep_report_calls_out_a_strategy_with_no_edge():
+    rows = [{"sl_atr_mult": 1.5, "tp_atr_mult": 3.0, "adx_min": 20, "trades": 10,
+             "expectancy_r": -0.2, "total_r": -2.0, "win_rate": 40.0,
+             "max_drawdown_r": -3.0, "profit_factor": 0.5}]
+
+    assert "ไม่มีชุดไหนเป็นบวก" in backtest.format_sweep(rows)
+
+
+# ---------- รายงานสรุป ----------
+
+def test_report_survives_a_directory_with_no_files():
+    import tempfile
+    import report
+
+    original = os.getcwd()
+    try:
+        os.chdir(tempfile.mkdtemp())
+        text = report.build_report()
+    finally:
+        os.chdir(original)
+
+    assert "สรุปการทำงานของบอท" in text
+    assert "ยังไม่บันทึกแท่งไหนเลย" in text
+
+
+def test_report_groups_repeated_log_problems():
+    import tempfile
+    import report
+
+    directory = tempfile.mkdtemp()
+    original = os.getcwd()
+
+    try:
+        os.chdir(directory)
+        with open("bot.log", "w", encoding="utf-8") as handle:
+            for number in range(4):
+                handle.write(f"2026-09-09 10:0{number}:00 [WARNING] spread 8{number}.0 กว้างเกิน 50\n")
+            handle.write("2026-09-09 10:05:00 [INFO] ปกติ\n")
+
+        lines = []
+        report.summarise_log(lines)
+    finally:
+        os.chdir(original)
+
+    text = "\n".join(lines)
+    assert "พบ 4 รายการ" in text
+    # ข้อความเดียวกันที่ต่างแค่ตัวเลข ต้องถูกยุบเป็นบรรทัดเดียว
+    assert "x4" in text
+
+
 # ---------- ตัวรันแบบไม่ต้องมี pytest ----------
 
 def _run_all():

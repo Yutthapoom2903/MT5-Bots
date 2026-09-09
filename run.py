@@ -8,6 +8,8 @@
     python run.py watch        เฝ้าดูและบันทึกข้อมูลต่อเนื่อง ไม่ส่งคำสั่ง
     python run.py trade        เฝ้าดูและส่งคำสั่งจริง
     python run.py backtest     จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริง
+    python run.py sweep        กวาดหลายชุดค่าเพื่อดูว่าผลทนต่อการเปลี่ยนค่าไหม
+    python run.py report       สรุปว่าบอททำอะไรไปบ้าง จากไฟล์ที่มันเขียนไว้
     python run.py review       สรุปผลจากข้อมูลที่คุณติดป้ายกำกับไว้เอง
     python run.py test         รันเทส logic (ไม่ต้องต่อ MT5)
 """
@@ -48,6 +50,10 @@ def command_check(args):
     print(f"lot ต่ำสุด/สูงสุด/ก้าว: {info.volume_min} / {info.volume_max} / {info.volume_step}")
     print(f"ระยะ stop ขั้นต่ำ: {info.trade_stops_level} points")
     print(f"spread ตอนนี้: {core.spread_points(runner.SYMBOL)} points")
+
+    offset = core.broker_gmt_offset(runner.SYMBOL)
+    if offset is not None:
+        print(f"เวลาเซิร์ฟเวอร์ broker: GMT{offset:+d} (ใช้ตั้ง SESSION_HOURS ใน strategy.py)")
 
     context, _ = runner.build_context()
     if context is None:
@@ -129,15 +135,41 @@ def command_trade(args):
     runner.run(trade_enabled=True)
 
 
+def command_report(args):
+    """สรุปการทำงานจากไฟล์ที่บอทเขียนไว้ ไม่ต้องต่อ MT5"""
+    import report
+    print(report.build_report())
+
+
+def command_sweep(args):
+    """กวาดหลายชุดค่า ดูว่าผลลัพธ์ทนต่อการเปลี่ยนค่าหรือแค่ฟลุค"""
+    import backtest
+    import runner
+
+    m15, h1, m5 = _load_history(args.months)
+
+    grid = dict(backtest.DEFAULT_GRID)
+    if args.quick:
+        grid = {"sl_atr_mult": (1.0, 1.5, 2.0), "tp_atr_mult": (2.0, 3.0, 4.0)}
+
+    total = 1
+    for values in grid.values():
+        total *= len(values)
+    print(f"กำลังกวาด {total} ชุดค่า ...\n")
+
+    rows = backtest.sweep(m15, h1, m5, {"spread_points": args.spread}, grid)
+    print(backtest.format_sweep(rows, top=args.top))
+    print("\nอย่าหยิบค่าที่ดีที่สุดไปใช้ตรงๆ ค่าที่อยู่กลางย่านที่กำไรทั้งย่านทนกว่ามาก")
+
+
 def command_review(args):
     import backtest_engine
     backtest_engine.run_backtest(args.csv)
 
 
-def command_backtest(args):
-    """จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริงจาก MT5"""
+def _load_history(months):
+    """ดึงข้อมูลย้อนหลังทุก timeframe ที่กลยุทธ์ใช้"""
     import mt5_core as core
-    import backtest
     import runner
 
     core.connect()
@@ -145,7 +177,6 @@ def command_backtest(args):
 
     # จำนวนแท่งต่อเดือนโดยประมาณของแต่ละ timeframe
     per_month = {"m15": 2880, "h1": 720, "m5": 8640}
-    months = args.months
 
     print(f"กำลังดึงข้อมูลย้อนหลัง {months} เดือนของ {runner.SYMBOL} ...")
 
@@ -158,6 +189,16 @@ def command_backtest(args):
 
     print(f"ได้ M15 {len(m15)} แท่ง, H1 {len(h1) if h1 is not None else 0}, "
           f"M5 {len(m5) if m5 is not None else 0}\n")
+
+    return m15, h1, m5
+
+
+def command_backtest(args):
+    """จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริงจาก MT5"""
+    import backtest
+    import runner
+
+    m15, h1, m5 = _load_history(args.months)
 
     overrides = {
         "sl_atr_mult": runner.SL_ATR_MULT,
@@ -246,6 +287,14 @@ def build_parser():
     simulate.add_argument("--spread", type=float, default=30.0, help="spread สมมติเป็น points")
     simulate.add_argument("--no-compare", action="store_true", help="ไม่ต้องเทียบกับ crossover เปล่า")
 
+    sweep = subparsers.add_parser("sweep", help="กวาดหลายชุดค่าเพื่อดูความทนของผล")
+    sweep.add_argument("--months", type=int, default=6)
+    sweep.add_argument("--spread", type=float, default=30.0)
+    sweep.add_argument("--top", type=int, default=15, help="แสดงกี่แถว")
+    sweep.add_argument("--quick", action="store_true", help="กวาดเฉพาะ SL/TP ไม่รวม ADX")
+
+    subparsers.add_parser("report", help="สรุปว่าบอททำอะไรไปบ้าง")
+
     review = subparsers.add_parser("review", help="สรุปผลจากข้อมูลที่คุณติดป้ายเอง")
     review.add_argument("csv", nargs="?", default="market_training_data.csv")
 
@@ -264,13 +313,15 @@ COMMANDS = {
     "watch": command_watch,
     "trade": command_trade,
     "backtest": command_backtest,
+    "sweep": command_sweep,
+    "report": command_report,
     "review": command_review,
     "test": command_test,
     "all": command_all,
 }
 
 # คำสั่งที่ไม่ต้องต่อ MT5 จึงไม่ต้อง shutdown
-OFFLINE_COMMANDS = {"review", "test"}
+OFFLINE_COMMANDS = {"review", "report", "test"}
 
 
 def main():

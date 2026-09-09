@@ -14,12 +14,11 @@ import time
 from datetime import datetime, timedelta
 
 import MetaTrader5 as mt5
-import pandas as pd
-import requests
 from dotenv import load_dotenv
 
 import mt5_core as core
 import mt5_trade as trade
+import notify
 import strategy
 
 # ---------- ตลาดที่เฝ้า ----------
@@ -86,23 +85,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ---------- แจ้งเตือน ----------
 
-def send_telegram(message, logger):
-    """ส่งเข้า Telegram — ล้มเหลวได้โดยไม่ทำให้บอทหยุด แต่ต้องเห็นใน log"""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+# ตัวเดียวทั้งโปรเจกต์ เพราะมันต้องจำว่าเพิ่งส่งอะไรไปถึงจะกันข้อความซ้ำได้
+# ผูกกับ root logger ตัวเดียวกับที่ core.setup_logging() จะตั้งค่าให้ตอน run()
+NOTIFIER = notify.Notifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, logging.getLogger())
 
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
-            timeout=10,
-        )
-    except requests.RequestException as error:
-        logger.warning("ส่ง Telegram ไม่สำเร็จ: %s", error)
-
-
-def append_csv(path, row):
-    pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+# ใช้บอกอายุการทำงานใน heartbeat — เพิ่ง restart กับรันมาสามวันคนละเรื่องกัน
+STARTED_AT = time.time()
 
 
 # ---------- รวบรวมข้อมูลตลาด ----------
@@ -161,7 +149,7 @@ def build_context():
 # ---------- บันทึกข้อมูล ----------
 
 def log_signal(context):
-    append_csv(SIGNAL_LOG, {
+    core.append_csv(SIGNAL_LOG, {
         "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "candle_time": context["candle_time"],
         "symbol": SYMBOL,
@@ -174,7 +162,7 @@ def log_signal(context):
 
 def log_features(context, candle, decision):
     """บันทึกสถานะตลาดพร้อมคำตัดสินของบอท และเว้นช่องให้ติดป้ายกำกับเองภายหลัง"""
-    append_csv(FEATURE_LOG, {
+    core.append_csv(FEATURE_LOG, {
         "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "candle_time": context["candle_time"],
         "symbol": SYMBOL,
@@ -252,7 +240,7 @@ def handle_existing_positions(signal, logger):
             logger.error("ปิดไม้เดิมไม่สำเร็จ ยกเลิกการเปิดไม้ใหม่รอบนี้")
             return False
 
-        send_telegram(f"ปิดไม้เดิม ticket {position.ticket} เพราะสัญญาณกลับเป็น {signal}", logger)
+        NOTIFIER.closed_on_reverse(SYMBOL, position.ticket, signal)
 
     return True
 
@@ -306,9 +294,8 @@ def execute(decision, state, logger):
                     info.volume_min, minimum_loss, account.currency, actual_percent,
                     budget, needed,
                 )
-                send_telegram(
-                    f"ข้าม {signal}: ไม้ขั้นต่ำเสี่ยง {minimum_loss:.2f} เกินงบ {budget:.2f}",
-                    logger,
+                NOTIFIER.entry_over_budget(
+                    SYMBOL, signal, minimum_loss, budget, account.currency, needed,
                 )
                 return
 
@@ -329,16 +316,27 @@ def execute(decision, state, logger):
         logger.info("เข้าไม้สำเร็จ ticket %s ที่ราคา %.2f", result.order, result.price)
         # จำ 1R ไว้ให้ตัวดูแลไม้ใช้ เพราะ SL จริงจะถูกขยับภายหลัง
         state.setdefault("position_risk", {})[str(result.order)] = sl_distance
-        send_telegram(
-            f"เข้า {signal} {lots} lot\nราคา: {result.price:.2f}\n"
-            f"SL: {sl:.2f}  TP: {tp:.2f}\nเสี่ยงราว {risk_text} {account.currency}",
-            logger,
+
+        # รายละเอียดไม้เก็บแยกอีกก้อน เพราะตอนไม้ปิดเอง position object หายไปแล้ว
+        # แต่ยังต้องรายงานให้ได้ว่าเข้าทางไหน ที่ราคาเท่าไร และ 1R คิดเป็นเงินเท่าไร
+        state.setdefault("position_meta", {})[str(result.order)] = {
+            "signal": signal,
+            "entry": round(result.price, 2),
+            "volume": lots,
+            "risk_money": round(risk, 2) if risk is not None else None,
+            "currency": account.currency,
+            "opened_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        NOTIFIER.entry_filled(
+            SYMBOL, signal, lots, result.price, sl, tp,
+            risk_text, account.currency, result.order,
         )
     else:
         logger.error("เข้าไม้ไม่สำเร็จ: %s", trade.describe_result(result))
-        send_telegram(f"เข้า {signal} ไม่สำเร็จ\n{trade.describe_result(result)}", logger)
+        NOTIFIER.entry_failed(SYMBOL, signal, trade.describe_result(result))
 
-    append_csv(TRADE_LOG, {
+    core.append_csv(TRADE_LOG, {
         "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "candle_time": context["candle_time"],
         "symbol": SYMBOL,
@@ -451,6 +449,7 @@ def take_partial_profit(position, price, initial_risk, info, state, logger):
             "ticket %s ถึง %.1fR แล้วแต่ %.2f lot เล็กเกินจะแบ่งปิด ปล่อยเต็มไม้ต่อ",
             position.ticket, PARTIAL_TP_AT_R, position.volume,
         )
+        NOTIFIER.partial_too_small(SYMBOL, position.ticket, position.volume, PARTIAL_TP_AT_R)
         return
 
     result = trade.close_partial(position, volume, DEVIATION, logger)
@@ -461,9 +460,47 @@ def take_partial_profit(position, price, initial_risk, info, state, logger):
             "เก็บกำไรบางส่วน ticket %s: ปิด %.2f จาก %.2f lot ที่ %.1fR",
             position.ticket, volume, position.volume, PARTIAL_TP_AT_R,
         )
-        send_telegram(
-            f"เก็บกำไรครึ่งไม้ ticket {position.ticket}\n"
-            f"ปิด {volume} จาก {position.volume} lot ที่ {PARTIAL_TP_AT_R}R", logger,
+        NOTIFIER.partial_taken(
+            SYMBOL, position.ticket, volume, position.volume, PARTIAL_TP_AT_R,
+        )
+
+
+def _stop_reason(position, new_sl):
+    """บอกว่า SL ใหม่หมายถึงอะไร — คนอ่านอยากรู้ว่าเสมอทุนแล้วหรือแค่ไล่ตามราคา"""
+    if position.type == mt5.POSITION_TYPE_BUY:
+        beyond_entry = new_sl >= position.price_open
+    else:
+        beyond_entry = new_sl <= position.price_open
+
+    return "เสมอทุนแล้ว" if beyond_entry else "ไล่ตามราคา"
+
+
+def report_closed_positions(live_tickets, state, logger):
+    """
+    ไม้ที่เคยจำไว้แต่ไม่อยู่ในรายการที่เปิดอยู่ = ปิดไปแล้ว ต้องรู้ว่าจบยังไง
+
+    เดิมบอทเงียบสนิทตอนโดน SL หรือ TP ซึ่งเป็นเหตุการณ์ที่ควรรู้ที่สุด
+    ผลอ่านจากประวัติดีลจริง ไม่ใช่เดาจากราคา เพราะกำไรที่นับได้ต้องรวม commission
+    กับ swap ด้วย ไม่งั้นไม้ที่ชนะเฉียดฉิวจะรายงานกลับทาง
+    """
+    for ticket, meta in list(state.get("position_meta", {}).items()):
+        if ticket in live_tickets:
+            continue
+
+        # key ใน state เป็น string แต่ MT5 ต้องการ ticket เป็นตัวเลข
+        closed = trade.summarize_position_close(trade.closing_deals(int(ticket)))
+
+        if closed is None:
+            logger.warning("ticket %s ปิดไปแล้วแต่หาดีลขาออกในประวัติไม่เจอ", ticket)
+            continue
+
+        logger.info(
+            "ไม้ปิดแล้ว ticket %s: %.2f lot กำไรสุทธิ %.2f ที่ราคา %.2f",
+            ticket, closed["volume"], closed["profit"], closed["price"],
+        )
+        NOTIFIER.position_closed(
+            SYMBOL, ticket, meta, closed["profit"],
+            meta.get("currency", ""), closed["price"],
         )
 
 
@@ -471,9 +508,11 @@ def manage_positions(context, state, logger):
     """เรียกทุกรอบ ไม่ใช่แค่ตอนแท่งปิด — ราคาวิ่งระหว่างแท่งก็ต้องดูแล SL"""
     positions = trade.open_positions(SYMBOL, MAGIC)
 
-    # ล้าง state ของไม้ที่ปิดไปแล้ว
+    # ไม้ที่หายไปจากรายการแปลว่าปิดไปแล้ว — รายงานผลก่อน แล้วค่อยล้าง state ทิ้ง
     live_tickets = {str(position.ticket) for position in positions}
-    for bucket in ("position_risk", "partial_taken"):
+    report_closed_positions(live_tickets, state, logger)
+
+    for bucket in ("position_risk", "partial_taken", "position_meta"):
         records = state.setdefault(bucket, {})
         for ticket in list(records):
             if ticket not in live_tickets:
@@ -524,6 +563,10 @@ def manage_positions(context, state, logger):
             logger.info(
                 "ขยับ SL ticket %s: %.2f -> %.2f (เข้าที่ %.2f, ราคาตอนนี้ %.2f)",
                 position.ticket, position.sl, new_sl, position.price_open, price,
+            )
+            NOTIFIER.stop_moved(
+                SYMBOL, position.ticket, position.sl, new_sl,
+                position.price_open, price, _stop_reason(position, new_sl),
             )
 
 
@@ -579,16 +622,11 @@ def heartbeat(state, account, logger):
     positions = trade.open_positions(SYMBOL, MAGIC)
     summary = state.get("day_summary") or {}
 
-    message = (
-        f"บอท {SYMBOL} ยังทำงานอยู่\n"
-        f"Equity {account.equity:.2f} {account.currency}\n"
-        f"ถืออยู่ {len(positions)} ไม้\n"
-        f"วันนี้ {summary.get('trades', 0)} ไม้ กำไรสุทธิ {summary.get('profit', 0.0):.2f}\n"
-        f"แท่งล่าสุด {state.get('last_candle_time', '-')}"
-    )
-
     logger.info("ส่ง heartbeat: ถืออยู่ %d ไม้ equity %.2f", len(positions), account.equity)
-    send_telegram(message, logger)
+    NOTIFIER.heartbeat(
+        SYMBOL, account.equity, account.currency, positions, summary,
+        state.get("last_candle_time", "-"), time.time() - STARTED_AT,
+    )
 
 
 def roll_over_day(state, account, logger):
@@ -606,11 +644,8 @@ def roll_over_day(state, account, logger):
             previous, summary.get("trades", 0), summary.get("wins", 0),
             summary.get("losses", 0), summary.get("profit", 0.0),
         )
-        send_telegram(
-            f"สรุป {previous}\nเทรด {summary.get('trades', 0)} ไม้ "
-            f"(ชนะ {summary.get('wins', 0)} แพ้ {summary.get('losses', 0)})\n"
-            f"กำไรสุทธิ {summary.get('profit', 0.0):.2f}",
-            logger,
+        NOTIFIER.daily_summary(
+            SYMBOL, previous, summary, account.balance, account.currency,
         )
 
     state["day"] = today
@@ -673,18 +708,40 @@ def run(trade_enabled=False):
     if offset is not None:
         logger.info("เวลาเซิร์ฟเวอร์ broker = GMT%+d (ใช้ตั้ง SESSION_HOURS)", offset)
 
-    if trade_enabled:
-        send_telegram(
-            f"บอท {SYMBOL} เริ่มเทรด ({'Demo' if core.is_demo(account) else 'บัญชีจริง'})", logger
-        )
+    logger.info(
+        "แจ้งเตือน Telegram: %s",
+        ", ".join(notify.active_categories()) if NOTIFIER.configured
+        else "ปิดอยู่ (ไม่ได้ตั้ง TELEGRAM_TOKEN / TELEGRAM_CHAT_ID)",
+    )
+
+    risk_text = f"{FIXED_LOT} lot คงที่" if USE_FIXED_LOT else f"{RISK_PERCENT}% ต่อไม้"
+    risk_text += f" · SL {SL_ATR_MULT:.1f}xATR · TP {TP_ATR_MULT:.1f}xATR"
+
+    # แจ้งทุกครั้งที่เริ่ม ไม่ใช่เฉพาะโหมดเทรด — โหมดเฝ้าดูก็ต้องรู้ว่ามันเริ่มแล้วจริง
+    NOTIFIER.bot_started(
+        SYMBOL,
+        f"{account.login} · {'Demo' if core.is_demo(account) else 'บัญชีจริง'} · "
+        f"{account.balance:,.2f} {account.currency}",
+        "เทรดจริง" if trade_enabled else "เฝ้าดูอย่างเดียว ไม่ส่งคำสั่ง",
+        strategy.active_filters(),
+        risk_text,
+        _management_summary(),
+        f"ตัวตัดวงจร: ขาดทุน {MAX_DAILY_LOSS_PERCENT:.1f}%/วัน · "
+        f"{MAX_TRADES_PER_DAY} ไม้/วัน · แพ้ติดกัน {MAX_CONSECUTIVE_LOSSES} ไม้",
+    )
 
     halted_reason = None
+    market_was_closed = False
 
     while True:
         if not connection_is_alive():
+            NOTIFIER.connection_lost(SYMBOL)
+
             if not reconnect(logger):
                 time.sleep(RECONNECT_DELAY)
                 continue
+
+            NOTIFIER.reconnected(SYMBOL)
 
         account = mt5.account_info()
         if account is None:
@@ -697,9 +754,15 @@ def run(trade_enabled=False):
         info = mt5.symbol_info(SYMBOL)
         if info is not None and not trade.symbol_is_tradable(info):
             logger.info("ตลาด %s ปิดอยู่ รอ %d วินาที", SYMBOL, MARKET_CLOSED_SLEEP)
+            NOTIFIER.market_closed(SYMBOL, MARKET_CLOSED_SLEEP)
+            market_was_closed = True
             core.save_state(STATE_FILE, state)
             time.sleep(MARKET_CLOSED_SLEEP)
             continue
+
+        if market_was_closed:
+            market_was_closed = False
+            NOTIFIER.market_reopened(SYMBOL)
 
         context, candle = build_context()
 
@@ -745,24 +808,31 @@ def run(trade_enabled=False):
             logger.debug("  [%s] %s: %s", "ผ่าน" if check.passed else "ไม่ผ่าน",
                          check.name, check.detail)
 
+        # แจ้งทุกแท่ง แล้วให้ notify.py เป็นคนตัดสินว่าแท่งนี้ควรส่งไหม
+        # ผ่านครบต้องรู้เสมอ ติดตัวกรองก็น่าดู ส่วน HOLD ปิดไว้เป็นค่าเริ่มต้น
+        NOTIFIER.candle_verdict(
+            decision, context, SYMBOL,
+            adx_min=strategy.ADX_MIN, watch_mode=not trade_enabled,
+        )
+
         if decision.enter:
             if not trade_enabled:
                 logger.info("โหมดเฝ้าดู — ถ้าเปิด trade ไว้จะเข้า %s ตรงนี้", decision.signal)
-                send_telegram(
-                    f"[เฝ้าดู] สัญญาณ {decision.signal} ผ่านตัวกรองครบที่ {candle_time}", logger
-                )
             else:
                 allowed, reason, summary = trading_allowed(state, logger)
                 state["day_summary"] = summary
 
                 if allowed:
+                    if halted_reason:
+                        NOTIFIER.resumed(SYMBOL, state.get("day", "ใหม่"))
+
                     halted_reason = None
                     execute(decision, state, logger)
                 elif reason != halted_reason:
                     # แจ้งครั้งเดียวต่อเหตุผล ไม่ใช่ทุกแท่ง
                     halted_reason = reason
                     logger.warning("ไม่เข้าไม้: %s", reason)
-                    send_telegram(f"บอทหยุดเข้าไม้: {reason}", logger)
+                    NOTIFIER.halted(SYMBOL, reason, summary)
 
         core.save_state(STATE_FILE, state)
         time.sleep(CHECK_EVERY_SECONDS)

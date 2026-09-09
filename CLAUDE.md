@@ -22,16 +22,17 @@ defaults for every flag `command_all` reads, so the bare invocation works with n
 subcommand.
 
 ```
-run.py          CLI: check | symbols | signal | watch | trade | backtest | test | all
+run.py          CLI: check | symbols | signal | watch | trade | backtest | notify | test | all
 runner.py       the one loop — fetch once per candle, then log + decide + optionally trade
 strategy.py     pure decision engine: context dict in, Decision out. No MT5 imports.
+notify.py       Telegram: categories, formatting, anti-spam. No MT5 imports either.
 mt5_core.py     connect, symbol setup, rates, indicators, the crossover rule, logging, state
 mt5_trade.py    broker-facing only: price/volume normalization, stop distance, filling
                 mode, risk sizing, order send/close. Imported by runner.py alone.
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          82 logic tests, no MT5 required
+tests/          110 logic tests, no MT5 required
 ```
 
 ## Running
@@ -45,8 +46,9 @@ from the Linux side.
 `import MetaTrader5` to `run.py`.
 
 ```bash
-python run.py test         # 82 logic tests, runs under WSL
+python run.py test         # 110 logic tests, runs under WSL
 python run.py review       # runs under WSL
+python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
 pytest tests/              # same tests, if pytest is installed
 ```
@@ -112,6 +114,37 @@ Over-budget behaviour differs by account type: a demo account logs a warning and
 (the point of demo is to see the bot trade), a live account refuses unless
 `ALLOW_RISK_OVER_BUDGET`. `run.py check` prints this arithmetic against the live account and
 is the fastest way to answer "why is the bot not entering anything".
+
+## Notifications
+
+`notify.py` is the only place that talks to Telegram. It mirrors `strategy.py`'s shape on
+purpose: pure formatting functions plus a registry with one switch per item, so a category
+can be turned off to measure its noise the way a filter can be turned off to measure its
+effect. It imports no MT5 and is fully covered by the offline suite.
+
+Eight categories, each with its own `SEND_*` switch, icon, loudness, and cooldown:
+`lifecycle`, `market`, `signal`, `entry`, `manage`, `exit`, `risk`, `summary`.
+`SEND_HOLD` and `SEND_NEAR_MISS` split the `signal` category further, because a verdict
+that passed every filter and a candle that produced no crossover differ in frequency by two
+orders of magnitude.
+
+- **`format_*()` is pure, `Notifier` sends.** Anything that builds a string must stay on the
+  pure side so a test can assert on it without a token.
+- **`format_message()` escapes the title only.** Body lines are HTML by design — callers pass
+  `<code>`/`<b>` — so any text coming from the broker, an exception, or a filter's detail
+  must go through `notify.escape()` at the call site. `check_lines()` already does.
+- **Anti-spam is two rules.** An identical body under the same key is dropped for
+  `DEDUP_SECONDS`; a category with a non-zero `cooldown` drops *any* message under the same
+  key for that long. Market-closed uses the second one — a weekend would otherwise send a
+  message every `MARKET_CLOSED_SLEEP`. Give paired events different keys, or the cooldown on
+  one swallows the other (`market-closed` vs `market-open`).
+- **State is in memory, not `bot_state.json`.** A restart repeating one message is fine; a
+  restart going silent because it wrongly believes it already sent is not.
+- **Failures never propagate.** `_post()` retries once, honours a 429 `retry_after`, and on
+  400 re-sends with the tags stripped rather than losing the message.
+
+`run.py notify --dry` renders one sample of every message shape offline. It calls every
+`Notifier` event method, so a shape that raises fails there instead of at 3am.
 
 ## Backtesting
 
@@ -181,6 +214,14 @@ accumulating data, not build output. `bot.log` and `bot_state.json` are gitignor
 
 Column sets have changed over time: rows before 2026-09-09 used a simple rolling mean for
 RSI/ATR (now Wilder) and lack `adx_14`, `m5_trend`, `bot_decision`, `bot_blockers`.
+
+`core.append_csv()` handles that drift. Writing the header only when the file was absent
+left `market_training_data.csv` with a 22-column header above 26-column rows, so pandas
+shifted every value in the file and `backtest_engine.py` scored the wrong columns. The
+append now compares the file's header against the row's keys and calls
+`align_csv_columns()` to rewrite the file — old rows padded with blanks, rows already
+written under the newer schema re-mapped positionally — before appending. Adding a column
+to a log row is therefore safe; renaming one still orphans the old column's data.
 
 ## Deliberately not built
 

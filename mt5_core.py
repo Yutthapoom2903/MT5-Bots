@@ -9,6 +9,7 @@
 แท่ง iloc[-1] คือแท่งที่กำลังก่อตัว ห้ามนำมาตัดสินใจ เพราะสัญญาณจะเปลี่ยนกลางแท่ง
 """
 
+import csv
 import json
 import logging
 import logging.handlers
@@ -272,6 +273,71 @@ def spread_points(symbol):
         return None
 
     return round((tick.ask - tick.bid) / info.point, 1)
+
+
+# ---------- ไฟล์ CSV ที่สะสมไปเรื่อยๆ ----------
+
+def append_csv(path, row):
+    """
+    ต่อท้ายไฟล์ CSV โดยไม่ให้ชุดคอลัมน์ที่เปลี่ยนไปทำไฟล์เก่าเพี้ยน
+
+    เดิมเขียน header เฉพาะตอนไฟล์ยังไม่มี พอเพิ่มคอลัมน์ (adx_14, m5_trend,
+    bot_decision, bot_blockers) แถวใหม่จึงมี 26 ช่องขณะที่ header ในไฟล์ยังเป็น 22
+    pandas อ่านไฟล์แบบนั้นแล้วค่าเลื่อนคอลัมน์ยกไฟล์ — backtest_engine ที่อ่านเฉพาะ
+    คอลัมน์ที่ติดป้ายเองจึงไปหยิบค่าของคอลัมน์อื่นมาให้คะแนน
+    ตอนนี้ถ้า header ในไฟล์ไม่ตรงกับแถวที่จะเขียน จะจัดไฟล์ใหม่ให้ครบทุกคอลัมน์ก่อน
+    """
+    columns = list(row)
+
+    if not os.path.exists(path):
+        pd.DataFrame([row]).to_csv(path, index=False)
+        return
+
+    if csv_header(path) != columns:
+        align_csv_columns(path, columns)
+
+    pd.DataFrame([row], columns=columns).to_csv(path, mode="a", header=False, index=False)
+
+
+def csv_header(path):
+    """ชื่อคอลัมน์แถวแรกของไฟล์ — คืน list ว่างถ้าไฟล์ว่าง"""
+    with open(path, encoding="utf-8", newline="") as handle:
+        for header in csv.reader(handle):
+            return header
+
+    return []
+
+
+def align_csv_columns(path, columns):
+    """
+    เขียนไฟล์ใหม่ให้ทุกแถวเรียงตาม columns เดียวกัน
+
+    แถวที่จำนวนช่องเท่ากับชุดคอลัมน์ใหม่ถือว่าเขียนหลังเปลี่ยน schema แล้ว
+    (แถวพวกนี้คือแถวที่เคยเลื่อน) ที่เหลือถือว่าเขียนด้วย header เก่าที่อยู่ในไฟล์
+    คอลัมน์ที่แถวเก่าไม่มีจะเว้นว่าง ไม่ใช่เดาค่าให้ เพราะข้อมูลนั้นไม่เคยถูกเก็บ
+    """
+    with open(path, encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle))
+
+    if not rows:
+        return
+
+    old_header, data = rows[0], rows[1:]
+    rebuilt = []
+
+    for values in data:
+        source = columns if len(values) == len(columns) else old_header
+        record = dict(zip(source, values))
+        rebuilt.append([record.get(name, "") for name in columns])
+
+    # เขียนไฟล์ชั่วคราวก่อนแล้ว replace ด้วยเหตุผลเดียวกับ save_state
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerows(rebuilt)
+
+    os.replace(temp_path, path)
 
 
 # ---------- state ที่อยู่รอดข้ามการ restart ----------

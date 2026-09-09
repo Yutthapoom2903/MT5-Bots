@@ -1,5 +1,5 @@
-logged_at,candle_time,symbol,open,high,low,close,ma_20,ma_50,rsi_14,atr_14,h1_trend,spread_points,candle_range,candle_body,bot_signal,your_decision,your_reason,entry_price,stop_loss,take_profit,trade_result
-2026-09-08 23:36:54,2026-09-08 19:15:00,XAUUSD,4386.29,4395.5,4383.69,4393.97,4398.91,4403.64,34.26,10.87,DOWNTREND,26.0,11.81,7.68,HOLD,,,,,,
+logged_at,candle_time,symbol,open,high,low,close,ma_20,ma_50,rsi_14,atr_14,adx_14,h1_trend,m5_trend,spread_points,candle_range,candle_body,bot_signal,bot_decision,bot_blockers,your_decision,your_reason,entry_price,stop_loss,take_profit,trade_result
+2026-09-08 23:36:54,2026-09-08 19:15:00,XAUUSD,4386.29,4395.5,4383.69,4393.97,4398.91,4403.64,34.26,10.87,,DOWNTREND,,26.0,11.81,7.68,HOLD,,,,,,,,
 2026-09-09 21:52:42,2026-09-09 17:30:00,XAUUSD,4425.94,4426.98,4418.6,4418.84,4406.32,4397.54,58.73,10.1,30.4,DOWNTREND,UPTREND,23.0,8.38,7.1,HOLD,SKIP,สัญญาณตัดกัน M15,,,,,,
 2026-09-09 22:00:12,2026-09-09 17:45:00,XAUUSD,4418.82,4423.52,4415.13,4418.67,4407.72,4398.46,58.59,9.97,30.54,DOWNTREND,UPTREND,23.0,8.39,0.15,HOLD,SKIP,สัญญาณตัดกัน M15,,,,,,
 2026-09-09 22:15:13,2026-09-09 18:00:00,XAUUSD,4418.71,4432.04,4380.24,4389.72,4407.65,4398.76,40.57,12.96,29.71,DOWNTREND,UPTREND,24.0,51.8,28.99,HOLD,SKIP,สัญญาณตัดกัน M15,,,,,,

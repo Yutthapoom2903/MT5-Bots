@@ -26,6 +26,7 @@ import MetaTrader5 as mt5
 
 import mt5_core as core
 import mt5_trade as trade
+import notify
 import strategy
 import backtest
 
@@ -844,6 +845,349 @@ def test_no_gold_at_all_raises_a_useful_error():
             assert "run.py symbols" in str(error)
         else:
             raise AssertionError("ควรโยน MT5Error เมื่อไม่เจอทองเลย")
+
+
+# ---------- การแจ้งเตือน ----------
+
+class FakeLogger:
+    """กลืน log ทิ้ง — เทสสนใจว่าอะไรถูกส่ง ไม่ใช่ว่าอะไรถูกเขียนลง log"""
+
+    def debug(self, *args, **kwargs):
+        pass
+
+    info = warning = error = debug
+
+
+class FakeClosingDeal:
+    """ดีลจาก MT5 เท่าที่ summarize_position_close ใช้จริง"""
+
+    def __init__(self, entry, profit=0.0, commission=0.0, swap=0.0, volume=0.01, price=0.0):
+        self.entry = entry
+        self.profit = profit
+        self.commission = commission
+        self.swap = swap
+        self.volume = volume
+        self.price = price
+
+
+class Recorder:
+    """Notifier ที่จับข้อความไว้แทนการยิงออกเน็ต พร้อมนาฬิกาที่ขยับเองได้"""
+
+    def __init__(self):
+        self.messages = []
+        self.now = 1000.0
+        self.notifier = notify.Notifier(
+            "token", "chat", FakeLogger(),
+            transport=self._capture, clock=lambda: self.now,
+        )
+
+    def _capture(self, message, quiet=False):
+        self.messages.append((message, quiet))
+        return True
+
+    def tick(self, seconds):
+        self.now += seconds
+
+
+def _sample_context(**overrides):
+    context = {
+        "candle_time": "2026-09-09 19:15:00", "close": 4401.62, "rsi": 48.4,
+        "adx": 24.6, "atr": 12.74, "spread_points": 34.0,
+        "h1_trend": "DOWNTREND", "m5_trend": "DOWNTREND",
+        "m15_signal": "SELL", "fast_ma": 20, "slow_ma": 50,
+    }
+    context.update(overrides)
+    return context
+
+
+def test_every_category_has_an_icon_and_a_working_switch():
+    for key, category in notify.CATEGORIES.items():
+        assert category.key == key
+        assert category.icon
+        assert category.enabled() in (True, False)
+
+
+def test_text_from_the_broker_cannot_break_the_html():
+    """หัวข้อ format_message escape ให้เอง ส่วนบรรทัดเนื้อความผู้เรียกต้องเรียก escape() เอง"""
+    message = notify.format_message("entry", "retcode <10030> & ลองใหม่", [
+        notify.escape("filling mode <IOC> ไม่รองรับ"),
+    ])
+
+    assert "&lt;10030&gt;" in message
+    assert "&amp;" in message
+    assert "&lt;IOC&gt;" in message
+    assert "<10030>" not in message
+
+
+def test_bar_clamps_values_that_fall_outside_the_range():
+    assert notify.bar(-50, 0, 100, width=10) == notify.BLOCK_EMPTY * 10
+    assert notify.bar(500, 0, 100, width=10) == notify.BLOCK_FULL * 10
+
+
+def test_bar_stays_empty_when_the_indicator_could_not_be_calculated():
+    assert notify.bar(float("nan"), 0, 100, width=4) == notify.BLOCK_EMPTY * 4
+    assert notify.bar(None, 0, 100, width=4) == notify.BLOCK_EMPTY * 4
+
+
+def test_money_always_carries_a_sign():
+    assert notify.money(12.5, "USD").startswith("+")
+    assert notify.money(-12.5, "USD").startswith("-")
+
+
+def test_r_blocks_show_green_for_profit_and_red_for_loss():
+    assert notify.r_blocks(2.0) == "🟩🟩"
+    assert notify.r_blocks(-1.0) == "🟥"
+    # ไม้ที่วิ่งไกลมากต้องไม่ทำให้ข้อความยาวไม่จำกัด
+    assert len(notify.r_blocks(99.0, width=6)) == len("🟩" * 6)
+
+
+def test_win_rate_bar_says_so_when_nothing_has_closed_yet():
+    assert notify.win_rate_bar(0, 0) == "ยังไม่มีไม้ที่ปิด"
+
+
+def test_the_same_message_is_not_sent_twice_in_a_row():
+    recorder = Recorder()
+
+    assert recorder.notifier.send("entry", "หัวข้อ", ["เนื้อความเดิม"]) is True
+    assert recorder.notifier.send("entry", "หัวข้อ", ["เนื้อความเดิม"]) is False
+    assert len(recorder.messages) == 1
+    assert recorder.notifier.skipped == 1
+
+
+def test_the_same_message_sends_again_after_the_dedup_window():
+    recorder = Recorder()
+
+    recorder.notifier.send("entry", "หัวข้อ", ["เนื้อความเดิม"])
+    recorder.tick(notify.DEDUP_SECONDS + 1)
+    recorder.notifier.send("entry", "หัวข้อ", ["เนื้อความเดิม"])
+
+    assert len(recorder.messages) == 2
+
+
+def test_cooldown_blocks_even_a_message_whose_wording_changed():
+    """ตลาดปิดค้างทั้งสุดสัปดาห์ ถ้ากันแค่ข้อความซ้ำจะยังได้เป็นร้อยข้อความ"""
+    recorder = Recorder()
+
+    recorder.notifier.send("market", "ตลาดปิด", ["รอ 5 นาที"], key="market-closed")
+    recorder.tick(60)
+    recorder.notifier.send("market", "ตลาดปิด", ["รอ 10 นาที"], key="market-closed")
+
+    assert len(recorder.messages) == 1
+
+
+def test_a_closed_category_sends_nothing():
+    recorder = Recorder()
+    notify.SEND_ENTRY = False
+
+    try:
+        assert recorder.notifier.send("entry", "เข้าไม้", ["ควรเงียบ"]) is False
+    finally:
+        notify.SEND_ENTRY = True
+
+    assert recorder.messages == []
+
+
+def test_without_a_token_nothing_reaches_the_transport():
+    sent = []
+    notifier = notify.Notifier(None, None, FakeLogger(), transport=lambda m, quiet=False: sent.append(m))
+
+    assert notifier.send("entry", "เข้าไม้", ["ไม่มี token"]) is False
+    assert sent == []
+
+
+def test_hold_candles_stay_silent_unless_asked_for():
+    recorder = Recorder()
+    context = _sample_context(m15_signal="HOLD")
+    decision = strategy.evaluate(context)
+
+    assert recorder.notifier.candle_verdict(decision, context, "XAUUSD") is False
+    assert recorder.messages == []
+
+
+def test_hold_candles_can_be_turned_on():
+    recorder = Recorder()
+    context = _sample_context(m15_signal="HOLD")
+    decision = strategy.evaluate(context)
+    notify.SEND_HOLD = True
+
+    try:
+        assert recorder.notifier.candle_verdict(decision, context, "XAUUSD") is True
+    finally:
+        notify.SEND_HOLD = False
+
+
+def test_a_near_miss_message_names_every_blocker():
+    """invariant ของโปรเจกต์: คำตัดสินต้องพกเหตุผลไปด้วยเสมอ รวมถึงตอนแจ้งเตือน"""
+    recorder = Recorder()
+    context = _sample_context(adx=11.2, spread_points=64.0)
+    decision = strategy.evaluate(context)
+    recorder.notifier.candle_verdict(decision, context, "XAUUSD", adx_min=strategy.ADX_MIN)
+
+    message = recorder.messages[0][0]
+
+    for check in decision.checks:
+        assert check.name in message
+
+    assert message.count("❌") == len(decision.blockers)
+
+
+def test_a_passing_signal_is_announced_loudly():
+    recorder = Recorder()
+    context = _sample_context()
+    decision = strategy.evaluate(context)
+
+    assert decision.enter
+    recorder.notifier.candle_verdict(decision, context, "XAUUSD", adx_min=strategy.ADX_MIN)
+
+    message, quiet = recorder.messages[0]
+    assert quiet is False
+    assert "SELL" in message
+
+
+def test_the_entry_message_carries_price_stop_and_target():
+    recorder = Recorder()
+    recorder.notifier.entry_filled("XAUUSD", "SELL", 0.01, 4401.62, 4420.73, 4363.40,
+                                   "19.10", "USD", 987654)
+
+    message = recorder.messages[0][0]
+
+    assert "4,401.62" in message
+    assert "4,420.73" in message
+    assert "4,363.40" in message
+    assert "987654" in message
+
+
+def test_a_closed_position_reports_its_r_multiple():
+    recorder = Recorder()
+    meta = {"signal": "SELL", "entry": 4401.62, "risk_money": 19.10, "currency": "USD"}
+    recorder.notifier.position_closed("XAUUSD", 987654, meta, 38.20, "USD", 4363.40)
+
+    assert "+2.00R" in recorder.messages[0][0]
+
+
+def test_a_closed_position_without_a_remembered_risk_still_reports_money():
+    recorder = Recorder()
+    recorder.notifier.position_closed("XAUUSD", 987654, {"signal": "BUY"}, -8.4, "USD")
+
+    message = recorder.messages[0][0]
+    assert "-8.40 USD" in message
+    assert "R" not in message.split("USD")[0]
+
+
+def test_stripping_tags_gives_back_readable_text():
+    message = notify.format_message("entry", "หัวข้อ", ["<b>ตัวหนา</b> กับ &lt;10030&gt;"])
+    plain = notify.strip_tags(message)
+
+    assert "<b>" not in plain
+    assert "10030" in plain
+    assert "ตัวหนา" in plain
+
+
+def test_a_very_long_message_is_cut_before_telegram_rejects_it():
+    message = notify.format_message("entry", "หัวข้อ", ["x" * 9000])
+
+    assert len(message) <= notify.MAX_MESSAGE_CHARS
+
+
+# ---------- ผลของไม้ที่ปิดไปแล้ว ----------
+
+def test_closing_profit_includes_commission_and_swap():
+    """ไม้ที่ชนะเฉียดฉิวต้องไม่รายงานว่ากำไรทั้งที่หักค่าธรรมเนียมแล้วขาดทุน"""
+    deals = [
+        FakeClosingDeal(mt5.DEAL_ENTRY_OUT, profit=1.5, commission=-0.8, swap=-1.2, price=4400.0)
+    ]
+
+    assert trade.summarize_position_close(deals)["profit"] == -0.5
+
+
+def test_the_opening_deal_is_not_counted_as_a_result():
+    deals = [
+        FakeClosingDeal(mt5.DEAL_ENTRY_IN, profit=0.0, price=4401.0),
+        FakeClosingDeal(mt5.DEAL_ENTRY_OUT, profit=12.0, price=4380.0),
+    ]
+    closed = trade.summarize_position_close(deals)
+
+    assert closed["deals"] == 1
+    assert closed["profit"] == 12.0
+
+
+def test_a_position_with_no_closing_deal_yet_reports_nothing():
+    assert trade.summarize_position_close([FakeClosingDeal(mt5.DEAL_ENTRY_IN)]) is None
+    assert trade.summarize_position_close([]) is None
+    assert trade.summarize_position_close(None) is None
+
+
+def test_a_partially_closed_position_averages_its_exit_price():
+    deals = [
+        FakeClosingDeal(mt5.DEAL_ENTRY_OUT, profit=10.0, volume=0.05, price=4380.0),
+        FakeClosingDeal(mt5.DEAL_ENTRY_OUT, profit=30.0, volume=0.05, price=4360.0),
+    ]
+    closed = trade.summarize_position_close(deals)
+
+    assert closed["volume"] == 0.10
+    assert closed["price"] == 4370.0
+    assert closed["profit"] == 40.0
+
+
+# ---------- ไฟล์ CSV ที่ชุดคอลัมน์เปลี่ยนไปตามเวลา ----------
+
+def _read_rows(path):
+    import csv
+
+    with open(path, encoding="utf-8", newline="") as handle:
+        return list(csv.reader(handle))
+
+
+def test_a_new_column_does_not_shift_the_rows_written_before_it():
+    """
+    เคยเป็นบั๊กจริง: header ค้างที่ชุดเก่า 22 คอลัมน์ แต่แถวใหม่เขียน 26 ช่อง
+    pandas จึงอ่านค่าเลื่อนยกไฟล์ และ backtest_engine ไปให้คะแนนคอลัมน์ผิดคน
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "features.csv")
+
+        core.append_csv(path, {"candle_time": "1", "close": 10.0})
+        core.append_csv(path, {"candle_time": "2", "close": 11.0, "adx_14": 25.0})
+
+        rows = _read_rows(path)
+
+        assert rows[0] == ["candle_time", "close", "adx_14"]
+        assert rows[1] == ["1", "10.0", ""]
+        assert rows[2] == ["2", "11.0", "25.0"]
+
+
+def test_rows_already_written_with_the_new_columns_are_realigned():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "features.csv")
+
+        # ไฟล์ที่พังแบบเดียวกับของจริง: header เก่า แต่แถวข้างล่างมีคอลัมน์ใหม่แล้ว
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("candle_time,close\n")
+            handle.write("1,10.0\n")
+            handle.write("2,11.0,25.0\n")
+
+        core.align_csv_columns(path, ["candle_time", "close", "adx_14"])
+        rows = _read_rows(path)
+
+        assert rows[1] == ["1", "10.0", ""]
+        assert rows[2] == ["2", "11.0", "25.0"]
+
+
+def test_realigning_an_untouched_file_changes_nothing():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "features.csv")
+        core.append_csv(path, {"candle_time": "1", "close": 10.0})
+        before = _read_rows(path)
+
+        core.append_csv(path, {"candle_time": "2", "close": 11.0})
+
+        assert _read_rows(path)[:2] == before
 
 
 # ---------- ตัวรันแบบไม่ต้องมี pytest ----------

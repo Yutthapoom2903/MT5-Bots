@@ -405,6 +405,44 @@ def summarize_deals(deals, symbol, magic):
     }
 
 
+def summarize_position_close(deals):
+    """
+    สรุปผลของ position ที่ปิดไปแล้วจากดีลของมัน — ฟังก์ชันบริสุทธิ์ จึงเทสได้
+
+    คืน None เมื่อยังไม่มีดีลขาออก (ประวัติยังไม่ลง) ผู้เรียกต้องเช็คก่อนใช้
+    กำไรที่รายงานต้องรวม commission กับ swap ด้วย ไม่งั้นไม้ที่ชนะเฉียดฉิว
+    จะขึ้นว่ากำไรทั้งที่หักค่าธรรมเนียมแล้วขาดทุน
+    ไม้หนึ่งอาจมีดีลขาออกหลายใบถ้าเคยแบ่งปิดบางส่วนไปก่อน จึงต้องรวมทุกใบ
+    """
+    closing = [
+        deal for deal in deals or []
+        if getattr(deal, "entry", None) == mt5.DEAL_ENTRY_OUT
+    ]
+
+    if not closing:
+        return None
+
+    profit = sum(
+        getattr(deal, "profit", 0.0)
+        + getattr(deal, "commission", 0.0)
+        + getattr(deal, "swap", 0.0)
+        for deal in closing
+    )
+    volume = sum(getattr(deal, "volume", 0.0) for deal in closing)
+
+    # ราคาปิดถ่วงน้ำหนักด้วยปริมาณ เพราะการแบ่งปิดทำให้มีหลายราคา
+    price = (
+        sum(deal.price * deal.volume for deal in closing) / volume if volume else 0.0
+    )
+
+    return {"profit": profit, "volume": volume, "price": price, "deals": len(closing)}
+
+
+def closing_deals(ticket):
+    """ดีลทั้งหมดของ position หนึ่งจากประวัติ — ใช้ตอนไม้หายไปจากรายการที่เปิดอยู่"""
+    return mt5.history_deals_get(position=ticket)
+
+
 def deals_today(symbol, magic, now=None):
     """สรุปผลของวันนี้จากประวัติจริงใน MT5 — ปลอดภัยต่อการ restart เพราะอ่านจากต้นทาง"""
     from datetime import datetime, timedelta

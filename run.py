@@ -14,6 +14,7 @@
     python run.py sweep        กวาดหลายชุดค่าเพื่อดูว่าผลทนต่อการเปลี่ยนค่าไหม
     python run.py report       สรุปว่าบอททำอะไรไปบ้าง จากไฟล์ที่มันเขียนไว้
     python run.py review       สรุปผลจากข้อมูลที่คุณติดป้ายกำกับไว้เอง
+    python run.py notify       ส่งตัวอย่างแจ้งเตือนครบทุกหมวดเข้า Telegram
     python run.py test         รันเทส logic (ไม่ต้องต่อ MT5)
 """
 
@@ -128,14 +129,117 @@ def command_signal(args):
     print(strategy.evaluate(context).report())
 
 
-def command_watch(args):
+def _run_loop(trade_enabled):
+    """
+    เรียกลูปหลักโดยแจ้ง Telegram เสมอว่าจบด้วยเหตุใด
+
+    บอทที่ตายเงียบคือบอทที่แย่ที่สุด โดยเฉพาะตอนถือไม้อยู่แล้วไม่มีใครขยับ SL ให้
+    """
     import runner
-    runner.run(trade_enabled=False)
+
+    try:
+        runner.run(trade_enabled=trade_enabled)
+    except KeyboardInterrupt:
+        runner.NOTIFIER.bot_stopped(runner.SYMBOL, "ผู้ใช้สั่งหยุด (Ctrl+C)")
+        raise
+    except Exception as error:
+        runner.NOTIFIER.crashed(runner.SYMBOL, f"{type(error).__name__}: {error}")
+        raise
+
+
+def command_watch(args):
+    _run_loop(trade_enabled=False)
 
 
 def command_trade(args):
-    import runner
-    runner.run(trade_enabled=True)
+    _run_loop(trade_enabled=True)
+
+
+def command_notify(args):
+    """
+    ส่งตัวอย่างของทุกหมวดเข้า Telegram — ดูหน้าตาข้อความจริงก่อนปล่อยบอทรันยาว
+
+    ไม่ต้องต่อ MT5 เพราะข้อมูลเป็นของสมมติทั้งหมด ใช้ --dry เพื่อพิมพ์ลงจอแทนการส่ง
+    """
+    import logging
+
+    from dotenv import load_dotenv
+
+    import notify
+    import strategy
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logger = logging.getLogger()
+
+    if args.dry:
+        def transport(message, quiet=False):
+            print(f"\n{'-' * 62}\n{'[เงียบ] ' if quiet else ''}{message}")
+            return True
+
+        # โหมด dry ไม่ได้ต่อเน็ต แต่ต้องหลอกให้ Notifier คิดว่าตั้งค่าครบ ไม่งั้นมันเงียบ
+        token, chat_id = "dry-run", "dry-run"
+    else:
+        transport = None
+        token, chat_id = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+
+    sender = notify.Notifier(token, chat_id, logger, transport)
+
+    if not sender.configured:
+        print("ยังไม่ได้ตั้ง TELEGRAM_TOKEN / TELEGRAM_CHAT_ID ใน .env — ลองด้วย --dry ก่อนได้")
+        return 1
+
+    sent = _sample_notifications(sender, strategy)
+
+    print(f"\nส่งไปทั้งหมด {len(sent)} ข้อความ (ข้ามเพราะซ้ำ {sender.skipped})")
+    print("หมวดที่เปิดอยู่: " + ", ".join(notify.active_categories()))
+    print("ปิด/เปิดรายหมวดได้ที่สวิตช์ SEND_* บนหัวไฟล์ notify.py")
+    return 0
+
+
+def _sample_notifications(sender, strategy):
+    """เรียกครบทุกชนิดข้อความด้วยข้อมูลสมมติ — ถ้าชนิดไหนพัง จะพังตรงนี้ก่อนออกสนามจริง"""
+    symbol = "XAUUSD"
+    context = {
+        "candle_time": "2026-09-09 19:15:00", "close": 4401.62, "rsi": 48.4,
+        "adx": 24.6, "atr": 12.74, "spread_points": 34.0,
+        "h1_trend": "DOWNTREND", "m5_trend": "DOWNTREND",
+        "m15_signal": "SELL", "fast_ma": 20, "slow_ma": 50,
+    }
+    decision = strategy.evaluate(context)
+    blocked = strategy.evaluate(dict(context, adx=11.2, spread_points=64.0))
+    summary = {"trades": 3, "wins": 2, "losses": 1, "profit": 41.20, "consecutive_losses": 0}
+    meta = {"signal": "SELL", "entry": 4401.62, "volume": 0.01,
+            "risk_money": 19.10, "currency": "USD", "opened_at": "2026-09-09 19:20:00"}
+
+    sender.bot_started(
+        symbol, "12345678 · Demo · 1,000.00 USD", "เฝ้าดูอย่างเดียว ไม่ส่งคำสั่ง",
+        strategy.active_filters(), "1.0% ต่อไม้ · SL 1.5xATR · TP 3.0xATR",
+        "เสมอทุนที่ 1.0R, ไล่ stop จาก 1.5R ห่าง 2.0xATR",
+        "ตัวตัดวงจร: ขาดทุน 3.0%/วัน · 5 ไม้/วัน · แพ้ติดกัน 3 ไม้",
+    )
+    sender.connection_lost(symbol)
+    sender.reconnected(symbol)
+    sender.market_closed(symbol, 300)
+    sender.market_reopened(symbol)
+    sender.candle_verdict(decision, context, symbol, adx_min=strategy.ADX_MIN, watch_mode=True)
+    sender.candle_verdict(blocked, dict(context, adx=11.2, spread_points=64.0), symbol,
+                          adx_min=strategy.ADX_MIN, watch_mode=True)
+    sender.entry_filled(symbol, "SELL", 0.01, 4401.62, 4420.73, 4363.40, "19.10", "USD", 987654)
+    sender.entry_failed(symbol, "SELL", "retcode 10030: Unsupported filling mode")
+    sender.stop_moved(symbol, 987654, 4420.73, 4399.71, 4401.62, 4382.51, "เสมอทุนแล้ว")
+    sender.partial_taken(symbol, 987654, 0.05, 0.10, 1.0)
+    sender.partial_too_small(symbol, 987654, 0.01, 1.0)
+    sender.closed_on_reverse(symbol, 987654, "BUY")
+    sender.position_closed(symbol, 987654, meta, 38.20, "USD", 4363.40)
+    sender.entry_over_budget(symbol, "SELL", 19.10, 10.00, "USD", 1910)
+    sender.halted(symbol, "แพ้ติดกัน 3 ไม้ หยุดพักถึงพรุ่งนี้", summary)
+    sender.resumed(symbol, "2026-09-10")
+    sender.daily_summary(symbol, "2026-09-09", summary, 1041.20, "USD")
+    sender.heartbeat(symbol, 1041.20, "USD", [1], summary, "2026-09-09 19:15:00", 47100)
+    sender.bot_stopped(symbol, "ผู้ใช้สั่งหยุด (Ctrl+C)")
+
+    return list(sender.sent)
 
 
 def command_report(args):
@@ -338,7 +442,7 @@ def command_all(args):
     print("บันทึกทุกอย่างลง bot.log — เช้ามาสรุปด้วย: python run.py report")
     print("กด Ctrl+C เพื่อหยุด\n")
 
-    runner.run(trade_enabled=args.trade)
+    _run_loop(trade_enabled=args.trade)
 
 
 def build_parser():
@@ -351,7 +455,7 @@ def build_parser():
     parser.set_defaults(
         command=None, trade=False, months=6, spread=30.0,
         top=15, quick=False, skip_backtest=False, no_compare=False,
-        csv="market_training_data.csv", keywords=None,
+        csv="market_training_data.csv", keywords=None, dry=False,
     )
     parser.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
     parser.add_argument("--skip-backtest", action="store_true",
@@ -384,6 +488,9 @@ def build_parser():
     review = subparsers.add_parser("review", help="สรุปผลจากข้อมูลที่คุณติดป้ายเอง")
     review.add_argument("csv", nargs="?", default="market_training_data.csv")
 
+    sample = subparsers.add_parser("notify", help="ส่งตัวอย่างแจ้งเตือนครบทุกหมวด")
+    sample.add_argument("--dry", action="store_true", help="พิมพ์ลงจอแทนการส่งจริง")
+
     subparsers.add_parser("test", help="รันเทส logic")
 
     every = subparsers.add_parser("all", help="ทำทุกอย่างในคำสั่งเดียว (ค่าเริ่มต้น)")
@@ -407,12 +514,13 @@ COMMANDS = {
     "sweep": command_sweep,
     "report": command_report,
     "review": command_review,
+    "notify": command_notify,
     "test": command_test,
     "all": command_all,
 }
 
 # คำสั่งที่ไม่ต้องต่อ MT5 จึงไม่ต้อง shutdown
-OFFLINE_COMMANDS = {"review", "report", "test"}
+OFFLINE_COMMANDS = {"review", "report", "test", "notify"}
 
 
 def main():

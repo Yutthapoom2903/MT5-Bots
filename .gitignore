@@ -11,3 +11,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# CSV ที่เขียนค้างตอนจัดคอลัมน์ใหม่
+*.csv.tmp

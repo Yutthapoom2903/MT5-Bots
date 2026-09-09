@@ -21,7 +21,7 @@ mt5_core.py     connect, symbol setup, rates, indicators, the crossover rule, lo
 mt5_trade.py    broker-facing only: price/volume normalization, stop distance, filling
                 mode, risk sizing, order send/close. Imported by runner.py alone.
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
-tests/          40 logic tests, no MT5 required
+tests/          54 logic tests, no MT5 required
 ```
 
 ## Running
@@ -35,7 +35,7 @@ from the Linux side.
 `import MetaTrader5` to `run.py`.
 
 ```bash
-python run.py test         # 40 logic tests, runs under WSL
+python run.py test         # 54 logic tests, runs under WSL
 python run.py backtest     # runs under WSL
 pytest tests/              # same tests, if pytest is installed
 ```
@@ -65,7 +65,16 @@ and the numbers behind it; blockers land in `bot_blockers` in the feature CSV an
 `bot.log`. A filter that silently returns a boolean is a regression.
 
 **The candle timestamp guard persists.** `bot_state.json` holds the last processed candle
-so a restart mid-candle cannot re-fire an order.
+so a restart mid-candle cannot re-fire an order. It also holds `position_risk` (1R per
+ticket, since the live SL moves after entry), `day` / `day_start_balance`, and the last
+daily summary. Entries are pruned when their ticket closes.
+
+**Stops only ever move toward profit.** `trade.better_stop()` is the only way a stop is
+updated; a candidate that would widen risk returns `None`. Never bypass it.
+
+**Two cadences in one loop.** Position management runs every cycle (30s) because price
+moves between candles; entry decisions run only when the closed-candle timestamp changes.
+Do not collapse them.
 
 ## Risk model
 
@@ -88,8 +97,27 @@ inside the broker's minimum stop distance.
   on retcode 10030. Retcodes are numeric constants in `mt5_trade.py` because their names
   vary across package versions.
 
-`run.py check` prints this arithmetic against the live account and is the fastest way to
-answer "why is the bot not entering anything".
+Over-budget behaviour differs by account type: a demo account logs a warning and proceeds
+(the point of demo is to see the bot trade), a live account refuses unless
+`ALLOW_RISK_OVER_BUDGET`. `run.py check` prints this arithmetic against the live account and
+is the fastest way to answer "why is the bot not entering anything".
+
+## Unattended operation
+
+The bot is meant to run at home without a watcher, so the loop is defensive:
+
+- `connection_is_alive()` / `reconnect()` — `terminal_info()` returning `None` means the
+  terminal closed or the link dropped; the loop reconnects instead of failing forever.
+- Circuit breaker in `trading_allowed()` — daily loss percent, trades per day, consecutive
+  losses. It reads MT5 deal history through `trade.deals_today()` every check rather than
+  counting in memory, so a mid-day restart does not reset the limits. It blocks new entries
+  only; open positions keep being managed. The halt reason is announced once, not per
+  candle.
+- `roll_over_day()` resets `day_start_balance` and sends the previous day's summary.
+- Market closed (`symbol_is_tradable()` false) backs the poll off to `MARKET_CLOSED_SLEEP`.
+
+`trade.summarize_deals()` is pure and takes a deal list so the breaker is testable; only
+`deals_today()` touches MT5.
 
 ## Data files
 

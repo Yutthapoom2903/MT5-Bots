@@ -393,6 +393,116 @@ def test_report_explains_every_check():
     assert "ADX" in report
 
 
+# ---------- ดูแลไม้ที่เปิดอยู่ ----------
+
+BUY = mt5.POSITION_TYPE_BUY
+SELL = mt5.POSITION_TYPE_SELL
+
+
+def test_breakeven_waits_until_the_trigger():
+    # เข้า 4000 เสี่ยง 16 ต้องกำไรถึง 16 (1R) ถึงจะย้าย
+    assert trade.breakeven_level(BUY, 4000, 4010, 16, 1.0, 0.1) is None
+    assert trade.breakeven_level(BUY, 4000, 4020, 16, 1.0, 0.1) is not None
+
+
+def test_breakeven_lands_slightly_above_entry_for_a_buy():
+    level = trade.breakeven_level(BUY, 4000, 4020, 16, 1.0, 0.1)
+    assert level == 4000 + 1.6
+
+
+def test_breakeven_lands_slightly_below_entry_for_a_sell():
+    level = trade.breakeven_level(SELL, 4000, 3980, 16, 1.0, 0.1)
+    assert level == 4000 - 1.6
+
+
+def test_trailing_waits_for_its_own_trigger():
+    # TRAIL_START_R 1.5 -> ต้องกำไร 24 ก่อน
+    assert trade.trailing_level(BUY, 4000, 4020, 16, 1.5, 10.0, 2.0) is None
+    assert trade.trailing_level(BUY, 4000, 4030, 16, 1.5, 10.0, 2.0) == 4030 - 20
+
+
+def test_trailing_follows_price_for_a_sell():
+    assert trade.trailing_level(SELL, 4000, 3970, 16, 1.5, 10.0, 2.0) == 3970 + 20
+
+
+def test_stop_never_moves_backwards():
+    """SL ที่ถอยหลังคือการขยายความเสี่ยง ต้องถูกปฏิเสธเสมอ"""
+    assert trade.better_stop(BUY, 3990, 3995) == 3995
+    assert trade.better_stop(BUY, 3990, 3985) is None
+    assert trade.better_stop(SELL, 4010, 4005) == 4005
+    assert trade.better_stop(SELL, 4010, 4015) is None
+
+
+def test_stop_is_taken_when_none_is_set_yet():
+    assert trade.better_stop(BUY, 0, 3995) == 3995
+    assert trade.better_stop(BUY, None, 3995) == 3995
+
+
+def test_stop_must_keep_the_broker_minimum_distance():
+    # ราคา 4000 ระยะขั้นต่ำ 0.78 -> SL ที่ 3999.9 ใกล้เกินไป
+    assert not trade.stop_is_far_enough(BUY, 4000, 3999.9, 0.78)
+    assert trade.stop_is_far_enough(BUY, 4000, 3998.0, 0.78)
+    assert not trade.stop_is_far_enough(SELL, 4000, 4000.1, 0.78)
+    assert trade.stop_is_far_enough(SELL, 4000, 4002.0, 0.78)
+
+
+def test_no_stop_move_without_a_known_initial_risk():
+    assert trade.breakeven_level(BUY, 4000, 4100, 0, 1.0, 0.1) is None
+    assert trade.trailing_level(BUY, 4000, 4100, 0, 1.5, 10.0, 2.0) is None
+
+
+# ---------- ตัวตัดวงจรรายวัน ----------
+
+class FakeDeal:
+    def __init__(self, profit, entry=None, symbol="XAUUSD", magic=123456):
+        self.profit = profit
+        self.entry = mt5.DEAL_ENTRY_OUT if entry is None else entry
+        self.symbol = symbol
+        self.magic = magic
+
+
+def test_summary_counts_only_closing_deals():
+    deals = [
+        FakeDeal(0, entry=mt5.DEAL_ENTRY_IN),   # ดีลขาเข้า ไม่นับ
+        FakeDeal(12.0),
+        FakeDeal(-8.0),
+    ]
+    summary = trade.summarize_deals(deals, "XAUUSD", 123456)
+
+    assert summary["trades"] == 2
+    assert summary["wins"] == 1
+    assert summary["losses"] == 1
+    assert summary["profit"] == 4.0
+
+
+def test_summary_ignores_other_bots_and_symbols():
+    deals = [
+        FakeDeal(100.0, magic=999),
+        FakeDeal(100.0, symbol="EURUSD"),
+        FakeDeal(-5.0),
+    ]
+    summary = trade.summarize_deals(deals, "XAUUSD", 123456)
+
+    assert summary["trades"] == 1
+    assert summary["profit"] == -5.0
+
+
+def test_consecutive_losses_counts_only_the_tail():
+    deals = [FakeDeal(-5.0), FakeDeal(10.0), FakeDeal(-5.0), FakeDeal(-5.0)]
+    assert trade.summarize_deals(deals, "XAUUSD", 123456)["consecutive_losses"] == 2
+
+
+def test_a_win_resets_the_losing_streak():
+    deals = [FakeDeal(-5.0), FakeDeal(-5.0), FakeDeal(1.0)]
+    assert trade.summarize_deals(deals, "XAUUSD", 123456)["consecutive_losses"] == 0
+
+
+def test_empty_history_is_safe():
+    summary = trade.summarize_deals(None, "XAUUSD", 123456)
+    assert summary["trades"] == 0
+    assert summary["profit"] == 0
+
+
 # ---------- ตัวรันแบบไม่ต้องมี pytest ----------
 
 def _run_all():

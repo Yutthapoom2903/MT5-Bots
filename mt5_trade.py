@@ -277,3 +277,142 @@ def close_position(position, deviation, logger):
             return result
 
     return None
+
+
+# ---------- การดูแลไม้ที่เปิดอยู่ ----------
+
+def breakeven_level(position_type, entry, current_price, initial_risk, trigger_r, buffer_r):
+    """
+    ระดับ SL ใหม่เมื่อกำไรถึงจุดที่ควรย้ายมาเสมอทุน
+
+    initial_risk คือระยะ SL ตอนเปิดไม้ (1R) ถ้ากำไรถึง trigger_r เท่าของ R
+    ให้ย้าย SL มาที่ทุนบวก buffer เล็กน้อยเผื่อ spread กับค่าคอม
+    คืน None ถ้ายังไม่ถึงเงื่อนไข
+    """
+    if initial_risk <= 0:
+        return None
+
+    if position_type == mt5.POSITION_TYPE_BUY:
+        if current_price - entry < initial_risk * trigger_r:
+            return None
+        return entry + initial_risk * buffer_r
+
+    if entry - current_price < initial_risk * trigger_r:
+        return None
+    return entry - initial_risk * buffer_r
+
+
+def trailing_level(position_type, entry, current_price, initial_risk, trigger_r, atr, multiplier):
+    """
+    ระดับ SL แบบไล่ตามราคา — เริ่มทำงานหลังกำไรถึง trigger_r เท่าของ R
+
+    ลากตามห่างจากราคาปัจจุบัน atr x multiplier คืน None ถ้ายังไม่ถึงเงื่อนไข
+    """
+    if initial_risk <= 0 or atr is None or atr <= 0:
+        return None
+
+    if position_type == mt5.POSITION_TYPE_BUY:
+        if current_price - entry < initial_risk * trigger_r:
+            return None
+        return current_price - atr * multiplier
+
+    if entry - current_price < initial_risk * trigger_r:
+        return None
+    return current_price + atr * multiplier
+
+
+def better_stop(position_type, current_sl, candidate):
+    """
+    คืน candidate เฉพาะเมื่อมันดีกว่า SL เดิม (ขยับไปทางกำไรเท่านั้น)
+
+    SL ต้องไม่ถอยหลังเด็ดขาด ไม่งั้นการไล่ stop จะกลายเป็นการขยายความเสี่ยง
+    """
+    if candidate is None:
+        return None
+
+    if not current_sl:
+        return candidate
+
+    if position_type == mt5.POSITION_TYPE_BUY:
+        return candidate if candidate > current_sl else None
+
+    return candidate if candidate < current_sl else None
+
+
+def stop_is_far_enough(position_type, current_price, candidate, minimum_distance):
+    """broker ปฏิเสธ SL ที่ใกล้ราคาปัจจุบันเกินไป ตรวจก่อนส่งจะได้ไม่โดนตีกลับ"""
+    if position_type == mt5.POSITION_TYPE_BUY:
+        return current_price - candidate >= minimum_distance
+
+    return candidate - current_price >= minimum_distance
+
+
+def modify_stops(position, new_sl, new_tp, logger):
+    """ย้าย SL/TP ของไม้ที่เปิดอยู่"""
+    info = mt5.symbol_info(position.symbol)
+
+    if info is None:
+        return None
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": position.symbol,
+        "position": position.ticket,
+        "sl": normalize_price(info, new_sl),
+        "tp": normalize_price(info, new_tp),
+        "magic": position.magic,
+    }
+
+    result = mt5.order_send(request)
+
+    if result is None or result.retcode != RETCODE_DONE:
+        logger.warning("ย้าย SL ticket %s ไม่สำเร็จ: %s", position.ticket, describe_result(result))
+
+    return result
+
+
+# ---------- สรุปผลรายวันสำหรับตัวตัดวงจร ----------
+
+def summarize_deals(deals, symbol, magic):
+    """
+    สรุปดีลที่ปิดแล้วของบอทตัวนี้
+
+    รับ list ของ deal object เพื่อให้เทสได้โดยไม่ต้องต่อ MT5
+    นับเฉพาะดีลขาออก (entry == DEAL_ENTRY_OUT) เพราะนั่นคือตอนที่กำไร/ขาดทุนเกิดจริง
+    """
+    closed = [
+        deal for deal in deals or []
+        if deal.symbol == symbol
+        and deal.magic == magic
+        and deal.entry == mt5.DEAL_ENTRY_OUT
+    ]
+
+    profit = sum(deal.profit for deal in closed)
+
+    consecutive_losses = 0
+    for deal in reversed(closed):
+        if deal.profit < 0:
+            consecutive_losses += 1
+        else:
+            break
+
+    return {
+        "trades": len(closed),
+        "profit": profit,
+        "wins": sum(1 for deal in closed if deal.profit > 0),
+        "losses": sum(1 for deal in closed if deal.profit < 0),
+        "consecutive_losses": consecutive_losses,
+    }
+
+
+def deals_today(symbol, magic, now=None):
+    """สรุปผลของวันนี้จากประวัติจริงใน MT5 — ปลอดภัยต่อการ restart เพราะอ่านจากต้นทาง"""
+    from datetime import datetime, timedelta
+
+    now = now or datetime.now()
+    start = datetime(now.year, now.month, now.day)
+
+    # เผื่อท้ายวันไว้กันปัญหาเวลาเซิร์ฟเวอร์ต่างจากเวลาเครื่อง
+    deals = mt5.history_deals_get(start, now + timedelta(days=1))
+
+    return summarize_deals(deals, symbol, magic)

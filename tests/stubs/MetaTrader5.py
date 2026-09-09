@@ -20,7 +20,11 @@ ORDER_FILLING_IOC = 1
 ORDER_FILLING_RETURN = 2
 
 TRADE_ACTION_DEAL = 1
+TRADE_ACTION_SLTP = 2
 ORDER_TIME_GTC = 0
+
+DEAL_ENTRY_IN = 0
+DEAL_ENTRY_OUT = 1
 
 POSITION_TYPE_BUY = 0
 POSITION_TYPE_SELL = 1
@@ -56,3 +60,5 @@ symbol_select = _unavailable
 copy_rates_from_pos = _unavailable
 positions_get = _unavailable
 order_send = _unavailable
+history_deals_get = _unavailable
+terminal_info = _unavailable

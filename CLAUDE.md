@@ -32,7 +32,7 @@ mt5_trade.py    broker-facing only: price/volume normalization, stop distance, f
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          124 logic tests, no MT5 required
+tests/          129 logic tests, no MT5 required
 ```
 
 ## Running
@@ -54,7 +54,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 124 logic tests, runs under WSL
+python run.py test         # 129 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -170,7 +170,15 @@ a conversation**, so the human must press Start before the first message can eve
 send — and `describe_api_error()` maps Telegram's reply to the thing to go and fix rather
 than echoing a status code. It also prints the category switches, because with `SEND_HOLD`
 off and no crossover in the data, silence is the correct behaviour and looks identical to a
-broken setup.
+broken setup. `SEND_HOLD` currently ships **on** for exactly that reason — a message every
+candle is the cheapest proof the pipe is open. Turn it off once the setup is trusted.
+
+`misplaced_secret_hint()` covers the trap that actually bit: values typed into
+`.env.example` instead of `.env`. python-dotenv reads only `.env`, so the bot goes silent
+with no error — and `.env.example` is tracked, so filling it in also queues the secret for
+the next commit. Any switch flipped in a test must be restored to what it *was*, not to a
+hardcoded default; `SwitchedTo` exists because a `finally` that wrote `False` back masked
+this very change to the default.
 
 ## Backtesting
 

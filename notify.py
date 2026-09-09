@@ -33,7 +33,7 @@ SEND_RISK = True          # เกินงบความเสี่ยง ต
 SEND_SUMMARY = True       # สรุปรายวัน heartbeat
 
 # สองอันนี้อยู่ในหมวด signal แต่แยกสวิตช์ เพราะความถี่ต่างกันคนละโลก
-SEND_HOLD = False         # ทุกแท่งที่ยังไม่มีสัญญาณ — เปิดแล้วได้ข้อความทุก 15 นาที
+SEND_HOLD = True          # ทุกแท่งที่ยังไม่มีสัญญาณ — ได้ข้อความทุก 15 นาที ปิดได้เมื่อเบื่อ
 SEND_NEAR_MISS = True     # มีสัญญาณตัดกันแต่ติดตัวกรอง — นี่คือของที่น่าดู
 
 # ---------- พฤติกรรมการส่ง ----------
@@ -621,6 +621,43 @@ def describe_api_error(status_code, description):
             return hint
 
     return f"Telegram ตอบ {status_code}: {description or 'ไม่มีรายละเอียด'}"
+
+
+def misplaced_secret_hint(env_text, example_text):
+    """
+    ดักกรณีกรอกค่าจริงลง .env.example แทน .env — กับดักที่เสียเวลาหานาน
+
+    python-dotenv อ่านเฉพาะ .env ไฟล์ตัวอย่างจึงไม่มีผลอะไรเลยและบอทเงียบสนิท
+    ที่แย่กว่านั้นคือ .env.example ติดตาม git อยู่ การกรอก token ลงไปไม่ได้แค่
+    ไม่ทำงาน แต่เท่ากับเตรียม commit ความลับขึ้น repo รอบใหม่
+    """
+    if _has_filled_secret(env_text):
+        return None
+
+    if _has_filled_secret(example_text):
+        return (
+            ".env.example มีค่ากรอกไว้ แต่ .env ไม่มี — โปรแกรมอ่านเฉพาะ .env เท่านั้น\n"
+            "     คัดลอกเป็นไฟล์จริง แล้วล้างค่าใน .env.example ให้ว่างเหมือนเดิม\n"
+            "     (.env.example ติดตาม git อยู่ ถ้า commit ไปคือ token รั่วอีกรอบ)"
+        )
+
+    return None
+
+
+def _has_filled_secret(text):
+    """มีบรรทัด TELEGRAM_* ที่กรอกค่าไว้จริงไหม — ลงท้ายด้วย = เฉยๆ ถือว่ายังว่าง"""
+    for line in (text or "").splitlines():
+        line = line.strip()
+
+        if line.startswith("#") or "=" not in line:
+            continue
+
+        key, _, value = line.partition("=")
+
+        if key.strip().startswith("TELEGRAM") and value.strip().strip("\"'"):
+            return True
+
+    return False
 
 
 def token_looks_valid(token):

@@ -977,12 +977,9 @@ def test_cooldown_blocks_even_a_message_whose_wording_changed():
 
 def test_a_closed_category_sends_nothing():
     recorder = Recorder()
-    notify.SEND_ENTRY = False
 
-    try:
+    with SwitchedTo("SEND_ENTRY", False):
         assert recorder.notifier.send("entry", "เข้าไม้", ["ควรเงียบ"]) is False
-    finally:
-        notify.SEND_ENTRY = True
 
     assert recorder.messages == []
 
@@ -995,25 +992,57 @@ def test_without_a_token_nothing_reaches_the_transport():
     assert sent == []
 
 
-def test_hold_candles_stay_silent_unless_asked_for():
+class SwitchedTo:
+    """
+    ตั้งสวิตช์ของ notify ชั่วคราวแล้วคืนค่าเดิมเสมอ
+
+    เคยเขียน finally ให้คืนเป็น False ตรงๆ ซึ่งไปทับค่าจริงของโมดูล ผลคือเทส
+    ที่รันทีหลังเห็นค่าที่เทสก่อนหน้าทิ้งไว้ ไม่ใช่ค่าเริ่มต้นจริง เทสจึงผ่าน
+    ทั้งที่ค่าเริ่มต้นเปลี่ยนไปแล้ว
+    """
+
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+    def __enter__(self):
+        self.original = getattr(notify, self.name)
+        setattr(notify, self.name, self.value)
+        return self
+
+    def __exit__(self, *error):
+        setattr(notify, self.name, self.original)
+
+
+def test_hold_candles_stay_silent_when_the_switch_is_off():
     recorder = Recorder()
     context = _sample_context(m15_signal="HOLD")
     decision = strategy.evaluate(context)
 
-    assert recorder.notifier.candle_verdict(decision, context, "XAUUSD") is False
+    with SwitchedTo("SEND_HOLD", False):
+        assert recorder.notifier.candle_verdict(decision, context, "XAUUSD") is False
+
     assert recorder.messages == []
 
 
-def test_hold_candles_can_be_turned_on():
+def test_hold_candles_are_announced_when_the_switch_is_on():
     recorder = Recorder()
     context = _sample_context(m15_signal="HOLD")
     decision = strategy.evaluate(context)
-    notify.SEND_HOLD = True
 
-    try:
+    with SwitchedTo("SEND_HOLD", True):
         assert recorder.notifier.candle_verdict(decision, context, "XAUUSD") is True
-    finally:
-        notify.SEND_HOLD = False
+
+
+def test_a_hold_message_is_quiet_so_it_does_not_buzz_every_fifteen_minutes():
+    recorder = Recorder()
+    context = _sample_context(m15_signal="HOLD")
+    decision = strategy.evaluate(context)
+
+    with SwitchedTo("SEND_HOLD", True):
+        recorder.notifier.candle_verdict(decision, context, "XAUUSD")
+
+    assert recorder.messages[0][1] is True
 
 
 def test_a_near_miss_message_names_every_blocker():
@@ -1090,6 +1119,33 @@ def test_a_very_long_message_is_cut_before_telegram_rejects_it():
 
 
 # ---------- วินิจฉัยตอนแจ้งเตือนไม่มา ----------
+
+def test_a_token_typed_into_the_example_file_is_pointed_out():
+    """python-dotenv อ่านเฉพาะ .env กรอกลง .env.example คือเงียบสนิทโดยไม่มี error"""
+    hint = notify.misplaced_secret_hint(
+        "TELEGRAM_TOKEN=\nTELEGRAM_CHAT_ID=\n",
+        "TELEGRAM_TOKEN=8123456789:AAH\nTELEGRAM_CHAT_ID=111\n",
+    )
+
+    assert hint is not None
+    assert ".env.example" in hint
+
+
+def test_nothing_is_flagged_once_the_real_file_is_filled_in():
+    assert notify.misplaced_secret_hint(
+        "TELEGRAM_TOKEN=8123456789:AAH\nTELEGRAM_CHAT_ID=111\n",
+        "TELEGRAM_TOKEN=\nTELEGRAM_CHAT_ID=\n",
+    ) is None
+
+
+def test_two_empty_files_are_not_mistaken_for_a_misplaced_secret():
+    assert notify.misplaced_secret_hint("", "") is None
+    assert notify.misplaced_secret_hint(None, None) is None
+
+
+def test_a_commented_out_example_line_does_not_count_as_filled_in():
+    assert notify.misplaced_secret_hint("", "# TELEGRAM_TOKEN=ใส่ตรงนี้\n") is None
+
 
 def test_a_token_that_is_not_in_botfather_shape_is_caught_before_the_network():
     assert notify.token_looks_valid("8123456789:AAH" + "x" * 32)

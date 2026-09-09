@@ -200,12 +200,26 @@ def command_notify(args):
     return 0
 
 
+def _read_text(path):
+    """อ่านไฟล์แบบไม่แคร์ว่ามีจริงไหม — ใช้ตอนวินิจฉัยเท่านั้น"""
+    if not path or not os.path.exists(path):
+        return ""
+
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
 def _diagnose_notifications(notify):
     """ไล่บอกทีละข้อว่าโซ่การแจ้งเตือนขาดตรงไหน แล้วจบด้วยสถานะของสวิตช์หมวด"""
     from dotenv import find_dotenv
 
     found = find_dotenv(usecwd=True)
     print(f"ไฟล์ .env: {found or 'ไม่พบในโฟลเดอร์นี้หรือโฟลเดอร์แม่'}")
+
+    hint = notify.misplaced_secret_hint(_read_text(found), _read_text(".env.example"))
+
+    if hint:
+        print(f"  [ไม่ผ่าน] ไฟล์ที่กรอกค่า: {hint}")
 
     steps = notify.diagnose(os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"))
 

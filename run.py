@@ -7,7 +7,8 @@
     python run.py signal       ดูคำตัดสินของบอทตอนนี้ครั้งเดียว พร้อมเหตุผลทุกข้อ
     python run.py watch        เฝ้าดูและบันทึกข้อมูลต่อเนื่อง ไม่ส่งคำสั่ง
     python run.py trade        เฝ้าดูและส่งคำสั่งจริง
-    python run.py backtest     สรุปผลจากข้อมูลที่ติดป้ายกำกับไว้
+    python run.py backtest     จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริง
+    python run.py review       สรุปผลจากข้อมูลที่คุณติดป้ายกำกับไว้เอง
     python run.py test         รันเทส logic (ไม่ต้องต่อ MT5)
 """
 
@@ -128,9 +129,86 @@ def command_trade(args):
     runner.run(trade_enabled=True)
 
 
-def command_backtest(args):
+def command_review(args):
     import backtest_engine
     backtest_engine.run_backtest(args.csv)
+
+
+def command_backtest(args):
+    """จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริงจาก MT5"""
+    import mt5_core as core
+    import backtest
+    import runner
+
+    core.connect()
+    core.prepare_symbol(runner.SYMBOL)
+
+    # จำนวนแท่งต่อเดือนโดยประมาณของแต่ละ timeframe
+    per_month = {"m15": 2880, "h1": 720, "m5": 8640}
+    months = args.months
+
+    print(f"กำลังดึงข้อมูลย้อนหลัง {months} เดือนของ {runner.SYMBOL} ...")
+
+    m15 = core.get_rates(runner.SYMBOL, runner.ENTRY_TIMEFRAME, per_month["m15"] * months, 200)
+    h1 = core.get_rates(runner.SYMBOL, runner.TREND_TIMEFRAME, per_month["h1"] * months, 60)
+    m5 = core.get_rates(runner.SYMBOL, runner.CONFIRM_TIMEFRAME, per_month["m5"] * months, 60)
+
+    if m15 is None:
+        raise core.MT5Error(f"ดึงข้อมูลย้อนหลังไม่สำเร็จ: {core.last_error_text()}")
+
+    print(f"ได้ M15 {len(m15)} แท่ง, H1 {len(h1) if h1 is not None else 0}, "
+          f"M5 {len(m5) if m5 is not None else 0}\n")
+
+    overrides = {
+        "sl_atr_mult": runner.SL_ATR_MULT,
+        "tp_atr_mult": runner.TP_ATR_MULT,
+        "use_breakeven": runner.USE_BREAKEVEN,
+        "breakeven_at_r": runner.BREAKEVEN_AT_R,
+        "breakeven_buffer_r": runner.BREAKEVEN_BUFFER_R,
+        "use_trailing": runner.USE_TRAILING,
+        "trail_start_r": runner.TRAIL_START_R,
+        "trail_atr_mult": runner.TRAIL_ATR_MULT,
+        "spread_points": args.spread,
+    }
+
+    if args.no_compare:
+        print(backtest.format_report(backtest.simulate(m15, h1, m5, overrides)))
+        return
+
+    with_filters, without = backtest.compare(m15, h1, m5, overrides)
+
+    print(backtest.format_report(without, "crossover เปล่าๆ ไม่มีตัวกรอง"))
+    print()
+    print(backtest.format_report(with_filters, "ใส่ตัวกรองหลาย timeframe"))
+    print()
+    _print_verdict(backtest.metrics(without), backtest.metrics(with_filters))
+
+
+def _print_verdict(plain, filtered):
+    """บอกตรงๆ ว่าตัวกรองช่วยจริงหรือแค่ทำให้เทรดน้อยลง"""
+    _print_header("ตัวกรองช่วยไหม")
+
+    if not plain.get("trades") or not filtered.get("trades"):
+        print("ข้อมูลไม่พอให้เทียบ")
+        return
+
+    print(f"จำนวนไม้: {plain['trades']} -> {filtered['trades']}")
+    print(f"คาดหวังต่อไม้: {plain['expectancy_r']:+.3f}R -> {filtered['expectancy_r']:+.3f}R")
+    print(f"กำไรรวม: {plain['total_r']:+.2f}R -> {filtered['total_r']:+.2f}R")
+    print(f"Drawdown: {plain['max_drawdown_r']:.2f}R -> {filtered['max_drawdown_r']:.2f}R")
+
+    better_per_trade = filtered["expectancy_r"] > plain["expectancy_r"]
+    better_total = filtered["total_r"] > plain["total_r"]
+
+    if better_per_trade and better_total:
+        print("\nตัวกรองช่วยทั้งคุณภาพต่อไม้และกำไรรวม")
+    elif better_per_trade:
+        print("\nตัวกรองทำให้แต่ละไม้ดีขึ้น แต่กำไรรวมลดเพราะเทรดน้อยลง")
+        print("ถ้ารับ drawdown ไหว การเทรดถี่กว่าอาจให้กำไรรวมมากกว่า")
+    else:
+        print("\nตัวกรองยังไม่ช่วย ลองปิดทีละตัวใน strategy.py แล้วรันใหม่")
+
+    print("\nอย่าเชื่อผลนี้ทั้งหมด อ่านข้อจำกัดในหัวไฟล์ backtest.py ก่อน")
 
 
 def command_test(args):
@@ -163,8 +241,13 @@ def build_parser():
     subparsers.add_parser("watch", help="เฝ้าดูและบันทึก ไม่ส่งคำสั่ง")
     subparsers.add_parser("trade", help="เฝ้าดูและส่งคำสั่งจริง")
 
-    backtest = subparsers.add_parser("backtest", help="สรุปผลจากข้อมูลที่ติดป้ายแล้ว")
-    backtest.add_argument("csv", nargs="?", default="market_training_data.csv")
+    simulate = subparsers.add_parser("backtest", help="จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริง")
+    simulate.add_argument("--months", type=int, default=6, help="ย้อนหลังกี่เดือน (ค่าเริ่มต้น 6)")
+    simulate.add_argument("--spread", type=float, default=30.0, help="spread สมมติเป็น points")
+    simulate.add_argument("--no-compare", action="store_true", help="ไม่ต้องเทียบกับ crossover เปล่า")
+
+    review = subparsers.add_parser("review", help="สรุปผลจากข้อมูลที่คุณติดป้ายเอง")
+    review.add_argument("csv", nargs="?", default="market_training_data.csv")
 
     subparsers.add_parser("test", help="รันเทส logic")
 
@@ -181,12 +264,13 @@ COMMANDS = {
     "watch": command_watch,
     "trade": command_trade,
     "backtest": command_backtest,
+    "review": command_review,
     "test": command_test,
     "all": command_all,
 }
 
 # คำสั่งที่ไม่ต้องต่อ MT5 จึงไม่ต้อง shutdown
-OFFLINE_COMMANDS = {"backtest", "test"}
+OFFLINE_COMMANDS = {"review", "test"}
 
 
 def main():

@@ -27,6 +27,7 @@ import MetaTrader5 as mt5
 import mt5_core as core
 import mt5_trade as trade
 import strategy
+import backtest
 
 
 # ---------- ตัวช่วย ----------
@@ -501,6 +502,164 @@ def test_empty_history_is_safe():
     summary = trade.summarize_deals(None, "XAUUSD", 123456)
     assert summary["trades"] == 0
     assert summary["profit"] == 0
+
+
+# ---------- เครื่องจำลองย้อนหลัง ----------
+
+def _bars(rows, atr=10.0):
+    """สร้าง DataFrame แท่งราคาจาก [(open, high, low, close), ...]"""
+    frame = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    frame["time"] = pd.date_range("2026-01-01", periods=len(frame), freq="15min")
+    frame["atr"] = atr
+    return frame
+
+
+_NO_MANAGEMENT = {**backtest.DEFAULTS, "use_breakeven": False, "use_trailing": False}
+
+
+def test_backtest_stop_loss_gives_minus_one_r():
+    bars = _bars([(4000, 4005, 3985, 3990)])
+    result, index, reason = backtest._simulate_position(
+        bars, 0, "BUY", 4000, 10.0, 4020, _NO_MANAGEMENT)
+
+    assert reason == "SL"
+    assert abs(result - (-1.0)) < 1e-9
+
+
+def test_backtest_take_profit_gives_the_planned_multiple():
+    bars = _bars([(4000, 4025, 3995, 4022)])
+    result, index, reason = backtest._simulate_position(
+        bars, 0, "BUY", 4000, 10.0, 4020, _NO_MANAGEMENT)
+
+    assert reason == "TP"
+    assert abs(result - 2.0) < 1e-9
+
+
+def test_backtest_assumes_the_stop_wins_when_one_bar_hits_both():
+    """ไม่รู้ลำดับราคาในแท่ง จึงต้องสมมติฝั่งแย่เสมอ ไม่งั้น backtest จะสวยเกินจริง"""
+    bars = _bars([(4000, 4025, 3985, 4010)])
+    result, index, reason = backtest._simulate_position(
+        bars, 0, "BUY", 4000, 10.0, 4020, _NO_MANAGEMENT)
+
+    assert reason == "SL"
+    assert result < 0
+
+
+def test_backtest_sell_side_is_mirrored():
+    bars = _bars([(4000, 4015, 3995, 4012)])
+    result, index, reason = backtest._simulate_position(
+        bars, 0, "SELL", 4000, 10.0, 3980, _NO_MANAGEMENT)
+
+    assert reason == "SL"
+    assert abs(result - (-1.0)) < 1e-9
+
+
+def test_backtest_breakeven_turns_a_reversal_into_a_small_win():
+    """ราคาไปถึง 1R แล้วย้อนกลับมาชนทุน ต้องได้กำไรนิดหน่อย ไม่ใช่ -1R"""
+    config = {**backtest.DEFAULTS, "use_trailing": False, "use_breakeven": True}
+    bars = _bars([
+        (4000, 4012, 3999, 4011),   # กำไรเกิน 1R (risk 10) -> ย้าย SL ไป 4001
+        (4011, 4012, 3980, 3985),   # ย้อนลงมาชน SL ใหม่
+    ])
+
+    result, index, reason = backtest._simulate_position(
+        bars, 0, "BUY", 4000, 10.0, 4030, config)
+
+    assert reason == "SL"
+    assert result > 0
+
+
+def test_alignment_never_reads_an_unclosed_higher_timeframe_bar():
+    """
+    lookahead bias คือสาเหตุอันดับหนึ่งที่ backtest ออกมาสวยเกินจริง
+    แท่ง M15 ที่เวลา 01:00 ปิดตอน 01:15 ตอนนั้น H1 ที่ปิดแล้วล่าสุดคือแท่ง 00:00
+    """
+    h1 = pd.DataFrame({
+        "time": pd.to_datetime(["2026-01-01 00:00", "2026-01-01 01:00", "2026-01-01 02:00"]),
+        "trend": ["UPTREND", "DOWNTREND", "UPTREND"],
+    })
+    m15_times = pd.Series(pd.to_datetime(["2026-01-01 01:00", "2026-01-01 01:45"]))
+
+    aligned = backtest._align(h1, m15_times, -pd.Timedelta(minutes=45))
+
+    assert aligned[0] == "UPTREND"      # แท่ง 00:00 ไม่ใช่ 01:00 ที่ยังไม่ปิด
+    assert aligned[1] == "DOWNTREND"    # 01:45 ปิดตอน 02:00 จึงเห็นแท่ง 01:00 ได้แล้ว
+
+
+def test_alignment_returns_unknown_before_any_bar_exists():
+    h1 = pd.DataFrame({
+        "time": pd.to_datetime(["2026-01-01 05:00"]),
+        "trend": ["UPTREND"],
+    })
+    aligned = backtest._align(h1, pd.Series(pd.to_datetime(["2026-01-01 00:00"])),
+                              -pd.Timedelta(minutes=45))
+    assert aligned == ["UNKNOWN"]
+
+
+def _trending_market(cycles=6, length=120):
+    """ราคาขึ้นลงสลับเป็นรอบ ให้ MA ตัดกันหลายครั้ง"""
+    import math
+
+    closes = []
+    for index in range(cycles * length):
+        phase = index / length * math.pi
+        closes.append(4000 + 60 * math.sin(phase) + (index % 5) * 0.4)
+
+    frame = pd.DataFrame({"close": closes})
+    frame["open"] = frame["close"].shift(1).fillna(frame["close"])
+    frame["high"] = frame[["open", "close"]].max(axis=1) + 2
+    frame["low"] = frame[["open", "close"]].min(axis=1) - 2
+    frame["time"] = pd.date_range("2026-01-01", periods=len(frame), freq="15min")
+    return frame
+
+
+def test_backtest_runs_end_to_end_and_produces_trades():
+    result = backtest.simulate(_trending_market(), config={"use_filters": False})
+    stats = backtest.metrics(result)
+
+    assert stats["trades"] > 0
+    assert stats["wins"] + stats["losses"] == stats["trades"]
+    assert 0 <= stats["win_rate"] <= 100
+
+
+def test_backtest_enters_at_the_next_bar_open_not_the_signal_bar():
+    """เข้าไม้ต้องเป็นราคาที่ยังไม่รู้ตอนตัดสินใจไม่ได้ — ไม่งั้นคือโกงตัวเอง"""
+    market = _trending_market()
+    result = backtest.simulate(market, config={"use_filters": False, "spread_points": 0})
+
+    assert result["trades"]
+    first = result["trades"][0]
+    matching = market[market["time"] == first["entry_time"]]
+
+    assert not matching.empty
+    assert abs(first["entry"] - matching.iloc[0]["open"]) < 0.01
+
+
+def test_backtest_never_holds_two_positions_at_once():
+    result = backtest.simulate(_trending_market(), config={"use_filters": False})
+    trades = result["trades"]
+
+    for earlier, later in zip(trades, trades[1:]):
+        assert later["entry_time"] >= earlier["exit_time"]
+
+
+def test_filters_block_everything_when_the_trend_is_unknown():
+    """ไม่มีข้อมูล H1 ให้ดู = ไม่รู้เทรนด์ = ไม่ควรเข้าไม้เลย"""
+    result = backtest.simulate(_trending_market(), config={"use_filters": True})
+
+    assert result["trades"] == []
+    assert result["blocked"]
+
+
+def test_metrics_handle_an_empty_run():
+    assert backtest.metrics({"trades": []})["trades"] == 0
+
+
+def test_report_is_readable_when_nothing_traded():
+    report = backtest.format_report({
+        "trades": [], "blocked": {}, "bars": 0, "from": None, "to": None, "config": {},
+    })
+    assert "ไม่มีไม้" in report
 
 
 # ---------- ตัวรันแบบไม่ต้องมี pytest ----------

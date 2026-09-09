@@ -21,7 +21,8 @@ mt5_core.py     connect, symbol setup, rates, indicators, the crossover rule, lo
 mt5_trade.py    broker-facing only: price/volume normalization, stop distance, filling
                 mode, risk sizing, order send/close. Imported by runner.py alone.
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
-tests/          54 logic tests, no MT5 required
+backtest.py     historical simulation — pure, mirrors the live rules
+tests/          67 logic tests, no MT5 required
 ```
 
 ## Running
@@ -35,8 +36,8 @@ from the Linux side.
 `import MetaTrader5` to `run.py`.
 
 ```bash
-python run.py test         # 54 logic tests, runs under WSL
-python run.py backtest     # runs under WSL
+python run.py test         # 67 logic tests, runs under WSL
+python run.py review       # runs under WSL (backtest needs MT5 for history)
 pytest tests/              # same tests, if pytest is installed
 ```
 
@@ -101,6 +102,27 @@ Over-budget behaviour differs by account type: a demo account logs a warning and
 (the point of demo is to see the bot trade), a live account refuses unless
 `ALLOW_RISK_OVER_BUDGET`. `run.py check` prints this arithmetic against the live account and
 is the fastest way to answer "why is the bot not entering anything".
+
+## Backtesting
+
+`backtest.simulate()` is pure — DataFrames in, results out — and must stay that way so it
+runs under the test stub. Two rules keep its numbers honest:
+
+- **No lookahead.** `_align()` maps each M15 bar to the last *closed* higher-timeframe bar
+  (H1 lags 45 minutes, M5 leads 10) exactly as `iloc[-2]` does live. Entries fill at the
+  *next* bar's open, never the signal bar's close.
+- **Worst-case intrabar.** When one bar touches both stop and target, the stop wins. Never
+  "improve" this — it is what stops a backtest flattering the strategy.
+
+Stop progression reuses `mt5_trade.breakeven_level` / `trailing_level` / `better_stop`, so
+the simulation cannot drift from live behaviour. If you change a stop rule, change it in
+`mt5_trade.py` and both paths follow.
+
+Results are in R (risk multiples), not currency — independent of balance and lot size.
+`compare()` runs with and without filters; that delta is the point of the tool.
+
+`run.py backtest` is the simulation (needs MT5 for history); `run.py review` scores the
+user's hand-labelled CSV (offline). Do not swap those names back.
 
 ## Unattended operation
 

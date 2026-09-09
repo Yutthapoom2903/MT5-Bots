@@ -591,6 +591,142 @@ class Notifier:
         ], key="heartbeat", loud=False, footer=symbol)
 
 
+# ---------- วินิจฉัยตอนแจ้งเตือนไม่มา ----------
+
+# (status, คำที่อยู่ในคำอธิบายของ Telegram, สิ่งที่ต้องไปแก้)
+API_HINTS = (
+    (401, "", "token ผิดหรือถูก revoke ไปแล้ว — ขอใหม่ที่ @BotFather แล้วใส่ .env"),
+    (403, "initiate conversation",
+     "บอทเริ่มบทสนทนาเองไม่ได้ — เปิดแชทบอทใน Telegram แล้วกด Start หนึ่งครั้งก่อน"),
+    (403, "blocked", "แชทนี้บล็อกบอทไว้ — ปลดบล็อกก่อน"),
+    (403, "kicked", "บอทถูกเตะออกจากกลุ่มนี้แล้ว"),
+    (400, "chat not found",
+     "TELEGRAM_CHAT_ID ไม่ตรงกับแชทไหนเลย — ดู chat id ที่ถูกต้องจากขั้น getUpdates"),
+    (400, "chat_id is empty", "TELEGRAM_CHAT_ID ว่างอยู่"),
+    (400, "can't parse entities", "HTML ในข้อความผิด — บั๊กของโค้ด ไม่ใช่ค่าคอนฟิก"),
+    (429, "", "โดนจำกัดอัตราการส่ง รอสักครู่แล้วลองใหม่"),
+)
+
+
+def describe_api_error(status_code, description):
+    """
+    แปลคำตอบที่ผิดพลาดของ Telegram เป็นสิ่งที่ต้องไปแก้ — ฟังก์ชันบริสุทธิ์ เทสได้
+
+    "Telegram ตอบ 403" ไม่ช่วยอะไร แต่ "ต้องกด Start ก่อน" คือคำตอบจริง
+    """
+    text = (description or "").lower()
+
+    for code, needle, hint in API_HINTS:
+        if status_code == code and needle in text:
+            return hint
+
+    return f"Telegram ตอบ {status_code}: {description or 'ไม่มีรายละเอียด'}"
+
+
+def token_looks_valid(token):
+    """รูปแบบ token ของ BotFather คือ <ตัวเลข>:<ตัวอักษรยาวๆ> ตรวจก่อนยิงจะได้ไม่งง"""
+    if not token:
+        return False
+
+    head, _, tail = token.strip().partition(":")
+    return head.isdigit() and len(tail) >= 30
+
+
+def call_api(token, method, payload=None):
+    """ยิง Telegram API ตรงๆ คืน (status_code, dict) — None แปลว่าต่อไม่ถึงเลย"""
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            data=payload or {}, timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as error:
+        return None, {"description": f"ต่อ api.telegram.org ไม่ได้: {error}"}
+
+    try:
+        return response.status_code, response.json()
+    except ValueError:
+        return response.status_code, {"description": response.text[:200]}
+
+
+def diagnose(token, chat_id, send_test=True):
+    """
+    ไล่ตรวจทีละข้อว่าโซ่ขาดตรงไหน คืน list ของ (ผ่านไหม, หัวข้อ, รายละเอียด)
+
+    แยกจาก Notifier เพราะตอนแจ้งเตือนเงียบ สิ่งที่ต้องการคือ "ไปแก้ตรงไหน"
+    ไม่ใช่ log บรรทัดเดียวว่าส่งไม่สำเร็จ
+    """
+    steps = []
+
+    if not token:
+        steps.append((False, "TELEGRAM_TOKEN", "ไม่พบใน .env — บอทจะเงียบสนิทโดยไม่ error"))
+        return steps
+
+    if not token_looks_valid(token):
+        steps.append((False, "รูปแบบ TELEGRAM_TOKEN",
+                      "ไม่ใช่รูปแบบ <ตัวเลข>:<ตัวอักษร> ของ BotFather"))
+        return steps
+
+    steps.append((True, "รูปแบบ TELEGRAM_TOKEN", "ถูกต้อง"))
+
+    status, body = call_api(token, "getMe")
+
+    if status != 200:
+        steps.append((False, "getMe", describe_api_error(status, body.get("description"))))
+        return steps
+
+    bot = body.get("result", {})
+    steps.append((True, "getMe", f"token ใช้ได้ — บอทชื่อ @{bot.get('username', '?')}"))
+
+    if not chat_id:
+        steps.append((False, "TELEGRAM_CHAT_ID", "ไม่พบใน .env"))
+    else:
+        steps.append((True, "TELEGRAM_CHAT_ID", f"ตั้งไว้เป็น {chat_id}"))
+
+    status, body = call_api(token, "getUpdates", {"limit": 20})
+    seen = _chat_ids_from_updates(body.get("result") if status == 200 else None)
+
+    if seen:
+        matched = str(chat_id).strip() in seen
+        steps.append((matched, "แชทที่เคยคุยกับบอท",
+                      ", ".join(f"{cid} ({name})" for cid, name in seen.items())
+                      + ("" if matched else "  ← ไม่มีอันไหนตรงกับ TELEGRAM_CHAT_ID")))
+    else:
+        steps.append((False, "แชทที่เคยคุยกับบอท",
+                      "ยังไม่มีใครทักบอทเลย หรือ getUpdates ถูก webhook ยึดไว้ — "
+                      "เปิดแชทบอทแล้วกด Start / พิมพ์อะไรก็ได้หนึ่งข้อความ แล้วรันใหม่"))
+
+    if send_test and chat_id:
+        status, body = call_api(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "✅ ทดสอบจาก run.py notify --check",
+        })
+
+        if status == 200:
+            steps.append((True, "ส่งข้อความทดสอบ", "ส่งสำเร็จ — ไปดูในแชทได้เลย"))
+        else:
+            steps.append((False, "ส่งข้อความทดสอบ",
+                          describe_api_error(status, body.get("description"))))
+
+    return steps
+
+
+def _chat_ids_from_updates(updates):
+    """ดึง chat id ที่เคยคุยกับบอทออกจากผล getUpdates — ฟังก์ชันบริสุทธิ์ เทสได้"""
+    found = {}
+
+    for update in updates or []:
+        for key in ("message", "edited_message", "channel_post", "my_chat_member"):
+            chat = (update.get(key) or {}).get("chat")
+
+            if not chat:
+                continue
+
+            name = chat.get("title") or chat.get("username") or chat.get("first_name") or "?"
+            found[str(chat.get("id"))] = name
+
+    return found
+
+
 def _retry_after(response):
     """Telegram บอกเวลารอมาใน JSON — ถ้าอ่านไม่ได้ก็เดาสั้นๆ ไว้ก่อน"""
     try:

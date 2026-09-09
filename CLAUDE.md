@@ -32,7 +32,7 @@ mt5_trade.py    broker-facing only: price/volume normalization, stop distance, f
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          116 logic tests, no MT5 required
+tests/          124 logic tests, no MT5 required
 ```
 
 ## Running
@@ -54,7 +54,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 116 logic tests, runs under WSL
+python run.py test         # 124 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -161,6 +161,16 @@ trade is a bonus; it must never take down the loop that is managing a live stop.
 
 `run.py notify --dry` renders one sample of every message shape offline. It calls every
 `Notifier` event method, so a shape that raises fails there instead of at 3am.
+
+`run.py notify --check` answers "why is nothing arriving". A misconfigured `.env` makes the
+bot silent without an error, and the failure is almost never in this repo — it is a token
+that was revoked, a `chat_id` that belongs to nothing, or the fact that **a bot cannot open
+a conversation**, so the human must press Start before the first message can ever land.
+`diagnose()` walks the chain — token shape, `getMe`, `chat_id`, `getUpdates`, a real test
+send — and `describe_api_error()` maps Telegram's reply to the thing to go and fix rather
+than echoing a status code. It also prints the category switches, because with `SEND_HOLD`
+off and no crossover in the data, silence is the correct behaviour and looks identical to a
+broken setup.
 
 ## Backtesting
 

@@ -1089,6 +1089,65 @@ def test_a_very_long_message_is_cut_before_telegram_rejects_it():
     assert len(message) <= notify.MAX_MESSAGE_CHARS
 
 
+# ---------- วินิจฉัยตอนแจ้งเตือนไม่มา ----------
+
+def test_a_token_that_is_not_in_botfather_shape_is_caught_before_the_network():
+    assert notify.token_looks_valid("8123456789:AAH" + "x" * 32)
+    assert not notify.token_looks_valid("")
+    assert not notify.token_looks_valid(None)
+    assert not notify.token_looks_valid("ใส่ token ตรงนี้")
+    assert not notify.token_looks_valid("8123456789:สั้นไป")
+
+
+def test_the_403_that_means_you_never_pressed_start_says_so():
+    """อาการที่พบบ่อยสุด: token ถูก chat_id ถูก แต่ยังไม่เคยทักบอท"""
+    hint = notify.describe_api_error(
+        403, "Forbidden: bot can't initiate conversation with a user",
+    )
+
+    assert "Start" in hint
+
+
+def test_a_revoked_token_is_reported_as_a_token_problem():
+    assert "@BotFather" in notify.describe_api_error(401, "Unauthorized")
+
+
+def test_a_wrong_chat_id_is_reported_as_a_chat_id_problem():
+    assert "TELEGRAM_CHAT_ID" in notify.describe_api_error(400, "Bad Request: chat not found")
+
+
+def test_an_unrecognised_error_still_shows_what_telegram_said():
+    hint = notify.describe_api_error(500, "Internal Server Error")
+
+    assert "500" in hint
+    assert "Internal Server Error" in hint
+
+
+def test_chat_ids_are_pulled_out_of_whatever_update_shape_arrives():
+    updates = [
+        {"message": {"chat": {"id": 111, "first_name": "Yutthapoom"}}},
+        {"channel_post": {"chat": {"id": -100222, "title": "ห้องบอท"}}},
+        {"edited_message": {"chat": {"id": 111, "first_name": "Yutthapoom"}}},
+        {"poll": {"id": "ไม่มี chat"}},
+    ]
+
+    assert notify._chat_ids_from_updates(updates) == {
+        "111": "Yutthapoom", "-100222": "ห้องบอท",
+    }
+
+
+def test_no_updates_at_all_is_not_a_crash():
+    assert notify._chat_ids_from_updates(None) == {}
+    assert notify._chat_ids_from_updates([]) == {}
+
+
+def test_diagnose_stops_before_the_network_when_there_is_no_token():
+    steps = notify.diagnose(None, "111")
+
+    assert len(steps) == 1
+    assert steps[0][0] is False
+
+
 # ---------- ผลของไม้ที่ปิดไปแล้ว ----------
 
 def test_closing_profit_includes_commission_and_swap():

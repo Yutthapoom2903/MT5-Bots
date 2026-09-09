@@ -172,6 +172,9 @@ def command_notify(args):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logger = logging.getLogger()
 
+    if args.check:
+        return _diagnose_notifications(notify)
+
     if args.dry:
         def transport(message, quiet=False):
             print(f"\n{'-' * 62}\n{'[เงียบ] ' if quiet else ''}{message}")
@@ -195,6 +198,30 @@ def command_notify(args):
     print("หมวดที่เปิดอยู่: " + ", ".join(notify.active_categories()))
     print("ปิด/เปิดรายหมวดได้ที่สวิตช์ SEND_* บนหัวไฟล์ notify.py")
     return 0
+
+
+def _diagnose_notifications(notify):
+    """ไล่บอกทีละข้อว่าโซ่การแจ้งเตือนขาดตรงไหน แล้วจบด้วยสถานะของสวิตช์หมวด"""
+    from dotenv import find_dotenv
+
+    found = find_dotenv(usecwd=True)
+    print(f"ไฟล์ .env: {found or 'ไม่พบในโฟลเดอร์นี้หรือโฟลเดอร์แม่'}")
+
+    steps = notify.diagnose(os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"))
+
+    for passed, title, detail in steps:
+        print(f"  [{'ผ่าน  ' if passed else 'ไม่ผ่าน'}] {title}: {detail}")
+
+    print()
+    print("หมวดที่เปิดอยู่: " + ", ".join(notify.active_categories()))
+    print(f"แจ้งทุกแท่งที่ไม่มีสัญญาณ (SEND_HOLD): {'เปิด' if notify.SEND_HOLD else 'ปิด'}")
+    print(f"แจ้งตอนเกือบเข้า (SEND_NEAR_MISS): {'เปิด' if notify.SEND_NEAR_MISS else 'ปิด'}")
+
+    if not notify.SEND_HOLD:
+        print("\nถ้าทุกแท่งเป็น HOLD และ SEND_HOLD ปิดอยู่ การเงียบคือพฤติกรรมที่ถูกต้อง")
+        print("อยากได้ข้อความทุกแท่งเพื่อพิสูจน์ว่าบอทยังหายใจ ตั้ง SEND_HOLD = True ใน notify.py")
+
+    return 0 if all(passed for passed, _, _ in steps) else 1
 
 
 def _sample_notifications(sender, strategy):
@@ -455,7 +482,7 @@ def build_parser():
     parser.set_defaults(
         command=None, trade=False, months=6, spread=30.0,
         top=15, quick=False, skip_backtest=False, no_compare=False,
-        csv="market_training_data.csv", keywords=None, dry=False,
+        csv="market_training_data.csv", keywords=None, dry=False, check=False,
     )
     parser.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
     parser.add_argument("--skip-backtest", action="store_true",
@@ -490,6 +517,8 @@ def build_parser():
 
     sample = subparsers.add_parser("notify", help="ส่งตัวอย่างแจ้งเตือนครบทุกหมวด")
     sample.add_argument("--dry", action="store_true", help="พิมพ์ลงจอแทนการส่งจริง")
+    sample.add_argument("--check", action="store_true",
+                        help="วินิจฉัยว่าทำไมแจ้งเตือนไม่มา แทนการส่งตัวอย่าง")
 
     subparsers.add_parser("test", help="รันเทส logic")
 

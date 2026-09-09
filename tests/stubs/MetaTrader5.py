@@ -60,5 +60,6 @@ symbol_select = _unavailable
 copy_rates_from_pos = _unavailable
 positions_get = _unavailable
 order_send = _unavailable
+symbols_get = _unavailable
 history_deals_get = _unavailable
 terminal_info = _unavailable

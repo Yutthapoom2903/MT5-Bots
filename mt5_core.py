@@ -103,6 +103,61 @@ def prepare_symbol(symbol):
     return info
 
 
+GOLD_KEYWORDS = ("XAUUSD", "XAUUS", "GOLD", "XAU")
+
+
+def resolve_symbol(preferred, keywords=GOLD_KEYWORDS):
+    """
+    หาชื่อ Symbol ที่ broker นี้ใช้จริง
+
+    broker แต่ละเจ้าตั้งชื่อทองไม่เหมือนกัน (XAUUSD, XAUUSD.m, XAUUSDm, GOLD, GOLD.spot)
+    ถ้าชื่อที่ตั้งไว้ใช้ไม่ได้ ให้ลองหาชื่อใกล้เคียงแทนที่จะล้มไปเลย
+    คืน (ชื่อที่ใช้ได้, รายชื่อที่เข้าข่ายทั้งหมด) หรือโยน MT5Error ถ้าไม่เจอเลย
+    รายการที่สองว่างเปล่าแปลว่าใช้ชื่อเดิมได้ ไม่ได้เดา
+    """
+    if mt5.symbol_select(preferred, True) and mt5.symbol_info(preferred) is not None:
+        return preferred, []
+
+    symbols = mt5.symbols_get()
+    if symbols is None:
+        raise MT5Error(f"ไม่พบ Symbol {preferred} และดึงรายชื่อไม่ได้: {last_error_text()}")
+
+    upper = preferred.upper()
+    candidates = [
+        symbol.name for symbol in symbols
+        if any(keyword in symbol.name.upper() for keyword in keywords)
+    ]
+
+    if not candidates:
+        raise MT5Error(
+            f"ไม่พบ Symbol {preferred} และไม่เจอชื่อที่ใกล้เคียงเลย "
+            f"— ลอง python run.py symbols เพื่อดูรายชื่อทั้งหมด"
+        )
+
+    def rank(name):
+        """
+        ชื่อที่ขึ้นต้นด้วยชื่อเต็มที่ขอมาก่อนเสมอ
+
+        สำคัญมาก: XAUUSD.m กับ XAUEUR.m ยาวเท่ากันและขึ้นต้น XAU เหมือนกัน
+        ถ้าเรียงตามตัวอักษรจะได้ XAUEUR.m ซึ่งเป็นทองเทียบยูโร ไม่ใช่ที่ต้องการ
+        """
+        upper_name = name.upper()
+        return (
+            not upper_name.startswith(upper),   # XAUUSD.m มาก่อน XAUEUR.m
+            upper not in upper_name,            # แล้วค่อยชื่อที่มีคำนั้นอยู่ข้างใน
+            len(name),                          # แล้วค่อยชื่อสั้นสุด มักเป็นตัวหลัก
+            name,
+        )
+
+    ordered = sorted(candidates, key=rank)
+
+    for name in ordered:
+        if mt5.symbol_select(name, True) and mt5.symbol_info(name) is not None:
+            return name, ordered
+
+    raise MT5Error(f"เจอชื่อใกล้เคียง {ordered[:5]} แต่เลือกเข้า Market Watch ไม่ได้สักตัว")
+
+
 def is_demo(account):
     """True เมื่อเป็นบัญชี Demo (trade_mode 0)"""
     return account.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO

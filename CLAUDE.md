@@ -13,6 +13,14 @@ standalone top-level scripts; add a subcommand instead. Earlier revisions had fo
 bot scripts each opening its own MT5 connection and re-implementing the crossover; they
 were consolidated for exactly that reason.
 
+**Bare `python run.py` must do the whole job end to end** — resolve the symbol, check the
+account, backtest, sweep, then watch — because that is what the user asked for and keeps
+asking for. Adding a capability means wiring it into `command_all()`, not handing the user
+another command to remember. Analysis phases go through `_try_phase()` so a failure there
+(thin history, say) still falls through to the live loop. The top-level parser carries
+defaults for every flag `command_all` reads, so the bare invocation works with no
+subcommand.
+
 ```
 run.py          CLI: check | symbols | signal | watch | trade | backtest | test | all
 runner.py       the one loop — fetch once per candle, then log + decide + optionally trade
@@ -23,7 +31,7 @@ mt5_trade.py    broker-facing only: price/volume normalization, stop distance, f
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          77 logic tests, no MT5 required
+tests/          82 logic tests, no MT5 required
 ```
 
 ## Running
@@ -37,7 +45,7 @@ from the Linux side.
 `import MetaTrader5` to `run.py`.
 
 ```bash
-python run.py test         # 77 logic tests, runs under WSL
+python run.py test         # 82 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
 pytest tests/              # same tests, if pytest is installed
@@ -194,8 +202,15 @@ effect can be measured one at a time.
 Unrecoverable MT5 failures raise `core.MT5Error`; `run.py` catches it and puts
 `mt5.shutdown()` in a `finally`.
 
-Broker symbol names vary (`XAUUSD`, `XAUUSD.m`, `GOLD`…). `SYMBOL` in `runner.py` is
-hardcoded to `"XAUUSD"`; `run.py symbols` confirms what the connected broker exposes.
+Broker symbol names vary (`XAUUSD`, `XAUUSD.m`, `GOLD`…). `SYMBOL` in `runner.py` defaults
+to `"XAUUSD"`, and `core.resolve_symbol()` falls back to a ranked search when the broker
+does not have it; `command_all` assigns the result to `runner.SYMBOL` for the session and
+prints the alternatives it rejected.
+
+That ranking is load-bearing: `XAUEUR.m` and `XAUUSD.m` are the same length and share the
+`XAU` prefix, so ordering by name alone picks gold-against-the-euro — a different market.
+Candidates starting with the full requested name win first.
+`test_gold_against_another_currency_is_not_mistaken_for_the_dollar_pair` pins it.
 
 ## Outstanding
 

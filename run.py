@@ -1,7 +1,10 @@
 """
 ประตูเดียวของโปรเจกต์ — ทุกอย่างสั่งผ่านไฟล์นี้
 
-    python run.py              ตรวจความพร้อม แล้วเฝ้าดูตลาด (ไม่ส่งคำสั่ง)
+    python run.py              ทำทุกอย่างให้จบในคำสั่งเดียว:
+                               หา Symbol -> ตรวจความพร้อม -> จำลองย้อนหลัง
+                               -> กวาดค่า -> เฝ้าดูตลาดสด (ไม่ส่งคำสั่ง)
+    python run.py --trade      เหมือนข้างบน แต่ส่งคำสั่งจริงในขั้นสุดท้าย
     python run.py check        ตรวจการเชื่อมต่อ บัญชี และคำนวณความเสี่ยงให้ดู
     python run.py symbols      หาชื่อ Symbol จริงที่ broker ใช้
     python run.py signal       ดูคำตัดสินของบอทตอนนี้ครั้งเดียว พร้อมเหตุผลทุกข้อ
@@ -256,12 +259,85 @@ def command_test(args):
     return subprocess.call([sys.executable, os.path.join(REPO_ROOT, "tests", "test_logic.py")])
 
 
-def command_all(args):
-    """ค่าเริ่มต้น: ตรวจความพร้อมก่อน แล้วเข้าลูปเฝ้าดู"""
-    command_check(args)
-    print("\nเริ่มเฝ้าดูตลาด กด Ctrl+C เพื่อหยุด\n")
+def _phase(number, total, title):
+    print(f"\n{'=' * 62}")
+    print(f"[{number}/{total}] {title}")
+    print("=" * 62)
 
+
+def _try_phase(number, total, title, function, args):
+    """
+    รันขั้นตอนหนึ่งโดยไม่ให้ความล้มเหลวหยุดทั้งชุด
+
+    ขั้นตอนวิเคราะห์ (จำลองย้อนหลัง/กวาดค่า) ล้มได้ถ้าข้อมูลย้อนหลังไม่พอ
+    ซึ่งไม่ควรทำให้การเฝ้าดูตลาดสดไม่ได้เริ่ม
+    """
+    import mt5_core as core
+
+    _phase(number, total, title)
+
+    try:
+        function(args)
+        return True
+    except core.MT5Error as error:
+        print(f"ข้ามขั้นนี้: {error}")
+    except Exception as error:
+        print(f"ข้ามขั้นนี้เพราะเกิดข้อผิดพลาด: {type(error).__name__}: {error}")
+
+    return False
+
+
+def _auto_symbol(args):
+    """หาชื่อ Symbol ที่ broker ใช้จริงแล้วตั้งให้ทั้งโปรเจกต์ใช้ตัวเดียวกัน"""
+    import mt5_core as core
     import runner
+
+    core.connect()
+    resolved, candidates = core.resolve_symbol(runner.SYMBOL)
+
+    if not candidates:
+        print(f"ใช้ Symbol: {resolved}")
+        return resolved
+
+    print(f"broker นี้ไม่มี {runner.SYMBOL} — เลือกใช้ {resolved}")
+
+    others = [name for name in candidates if name != resolved]
+    if others:
+        print(f"ตัวเลือกอื่นที่เจอ: {', '.join(others[:6])}")
+
+    print(f"ถ้าไม่ถูก แก้ SYMBOL ใน runner.py เป็นชื่อที่ต้องการ แล้วรันใหม่")
+    runner.SYMBOL = resolved
+    return resolved
+
+
+def command_all(args):
+    """คำสั่งเดียวจบ — หา Symbol ตรวจความพร้อม วิเคราะห์ย้อนหลัง แล้วเฝ้าดูสด"""
+    import runner
+
+    total = 3 if args.skip_backtest else 5
+
+    _phase(1, total, "หา Symbol ที่ broker ใช้")
+    _auto_symbol(args)
+
+    _try_phase(2, total, "ตรวจความพร้อมและความเสี่ยง", command_check, args)
+
+    step = 3
+    if not args.skip_backtest:
+        _try_phase(3, total, "จำลองย้อนหลัง — กลยุทธ์นี้เคยทำเงินได้ไหม",
+                   command_backtest, args)
+        _try_phase(4, total, "กวาดค่า — ผลทนต่อการเปลี่ยนค่าหรือแค่ฟลุค",
+                   command_sweep, args)
+        step = 5
+
+    _phase(step, total, "เทรดสด" if args.trade else "เฝ้าดูตลาดสด (ไม่ส่งคำสั่ง)")
+
+    if not args.trade:
+        print("โหมดเฝ้าดู ไม่มีการส่งคำสั่งซื้อขาย")
+        print("อยากให้เทรดจริงใช้: python run.py --trade")
+
+    print("บันทึกทุกอย่างลง bot.log — เช้ามาสรุปด้วย: python run.py report")
+    print("กด Ctrl+C เพื่อหยุด\n")
+
     runner.run(trade_enabled=args.trade)
 
 
@@ -271,6 +347,16 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    # พิมพ์ run.py เปล่าๆ ต้องทำงานได้ทันที จึงต้องมี default ของทุก flag ที่ all ใช้
+    parser.set_defaults(
+        command=None, trade=False, months=6, spread=30.0,
+        top=15, quick=False, skip_backtest=False, no_compare=False,
+        csv="market_training_data.csv", keywords=None,
+    )
+    parser.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
+    parser.add_argument("--skip-backtest", action="store_true",
+                        help="ข้ามการจำลองย้อนหลังและการกวาดค่า เข้าเฝ้าดูเลย")
+
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("check", help="ตรวจการเชื่อมต่อ บัญชี และความเสี่ยง")
@@ -300,8 +386,13 @@ def build_parser():
 
     subparsers.add_parser("test", help="รันเทส logic")
 
-    every = subparsers.add_parser("all", help="ตรวจความพร้อมแล้วเฝ้าดู (ค่าเริ่มต้น)")
-    every.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงด้วย")
+    every = subparsers.add_parser("all", help="ทำทุกอย่างในคำสั่งเดียว (ค่าเริ่มต้น)")
+    every.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
+    every.add_argument("--skip-backtest", action="store_true", help="ข้ามการวิเคราะห์ย้อนหลัง")
+    every.add_argument("--months", type=int, default=6)
+    every.add_argument("--spread", type=float, default=30.0)
+    every.add_argument("--top", type=int, default=10)
+    every.add_argument("--quick", action="store_true")
 
     return parser
 
@@ -329,8 +420,6 @@ def main():
     args = parser.parse_args()
 
     command = args.command or "all"
-    if command == "all" and not hasattr(args, "trade"):
-        args.trade = False
 
     if command in OFFLINE_COMMANDS:
         return COMMANDS[command](args) or 0

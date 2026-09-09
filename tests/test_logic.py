@@ -778,6 +778,74 @@ def test_report_groups_repeated_log_problems():
     assert "x4" in text
 
 
+# ---------- หา Symbol ของ broker ----------
+
+class FakeBroker:
+    """แทน mt5.symbols_get / symbol_select / symbol_info ชั่วคราวเพื่อเทสการเลือกชื่อ"""
+
+    def __init__(self, names):
+        self.names = list(names)
+
+    def __enter__(self):
+        self.saved = (mt5.symbols_get, mt5.symbol_select, mt5.symbol_info)
+
+        class Named:
+            def __init__(self, name):
+                self.name = name
+
+        mt5.symbols_get = lambda: tuple(Named(name) for name in self.names)
+        mt5.symbol_select = lambda name, enable=True: name in self.names
+        mt5.symbol_info = lambda name: Named(name) if name in self.names else None
+        return self
+
+    def __exit__(self, *exc):
+        mt5.symbols_get, mt5.symbol_select, mt5.symbol_info = self.saved
+
+
+def test_exact_symbol_is_used_without_guessing():
+    with FakeBroker(["XAUUSD", "EURUSD"]):
+        resolved, candidates = core.resolve_symbol("XAUUSD")
+
+    assert resolved == "XAUUSD"
+    assert candidates == []
+
+
+def test_suffixed_symbol_is_found():
+    with FakeBroker(["EURUSD", "XAUUSD.m"]):
+        resolved, _ = core.resolve_symbol("XAUUSD")
+
+    assert resolved == "XAUUSD.m"
+
+
+def test_gold_against_another_currency_is_not_mistaken_for_the_dollar_pair():
+    """
+    XAUEUR.m ยาวเท่ากับ XAUUSD.m และขึ้นต้น XAU เหมือนกัน
+    ถ้าเรียงตามตัวอักษรจะได้ XAUEUR.m ซึ่งเป็นคนละตลาด
+    """
+    with FakeBroker(["XAUEUR.m", "XAUUSD.m", "GOLD.spot"]):
+        resolved, candidates = core.resolve_symbol("XAUUSD")
+
+    assert resolved == "XAUUSD.m"
+    assert "XAUEUR.m" in candidates
+
+
+def test_gold_named_differently_still_resolves():
+    with FakeBroker(["EURUSD", "GOLD"]):
+        resolved, _ = core.resolve_symbol("XAUUSD")
+
+    assert resolved == "GOLD"
+
+
+def test_no_gold_at_all_raises_a_useful_error():
+    with FakeBroker(["EURUSD", "GBPUSD"]):
+        try:
+            core.resolve_symbol("XAUUSD")
+        except core.MT5Error as error:
+            assert "run.py symbols" in str(error)
+        else:
+            raise AssertionError("ควรโยน MT5Error เมื่อไม่เจอทองเลย")
+
+
 # ---------- ตัวรันแบบไม่ต้องมี pytest ----------
 
 def _run_all():

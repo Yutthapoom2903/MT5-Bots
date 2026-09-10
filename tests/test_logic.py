@@ -1954,6 +1954,131 @@ def test_realigning_an_untouched_file_changes_nothing():
         assert _read_rows(path)[:2] == before
 
 
+# ---------- path ของ terminal ----------
+
+class CapturedInitialize:
+    """ดัก kwargs ที่ connect() ส่งให้ mt5.initialize() แล้วคืนของเดิมเสมอ"""
+
+    def __init__(self, ok=False, error=(-10003, "IPC initialize failed")):
+        self.ok = ok
+        self.error = error
+        self.calls = []
+
+    def __enter__(self):
+        self.original_initialize = core.mt5.initialize
+        self.original_last_error = core.mt5.last_error
+        core.mt5.initialize = self._record
+        core.mt5.last_error = lambda: self.error
+        return self
+
+    def _record(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.ok
+
+    def __exit__(self, *error):
+        core.mt5.initialize = self.original_initialize
+        core.mt5.last_error = self.original_last_error
+
+
+class EnvVar:
+    """ตั้ง environment variable ชั่วคราวแล้วคืนค่าเดิม รวมถึงกรณีเดิมไม่มีตัวแปรนี้"""
+
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+    def __enter__(self):
+        self.original = os.environ.get(self.name)
+        if self.value is None:
+            os.environ.pop(self.name, None)
+        else:
+            os.environ[self.name] = self.value
+        return self
+
+    def __exit__(self, *error):
+        if self.original is None:
+            os.environ.pop(self.name, None)
+        else:
+            os.environ[self.name] = self.original
+
+
+def _connect_kwargs(**kwargs):
+    """เรียก connect() ที่รู้อยู่แล้วว่าจะล้ม แล้วคืน kwargs ที่มันส่งให้ initialize()"""
+    with CapturedInitialize() as captured:
+        try:
+            core.connect(**kwargs)
+        except core.MT5Error:
+            pass
+    return captured.calls[0]
+
+
+def test_connect_passes_no_path_when_none_is_configured():
+    """ไม่ได้ตั้ง path ต้องไม่ส่ง path ไปเลย ให้แพ็กเกจหา terminal เอง"""
+    with EnvVar("MT5_TERMINAL_PATH", None):
+        assert "path" not in _connect_kwargs()
+
+
+def test_connect_sends_the_terminal_path_from_the_environment():
+    """สั่งผ่าน SSH แพ็กเกจหา terminal เองไม่เจอ ต้องส่ง path จาก .env ไปให้"""
+    exe = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+    with EnvVar("MT5_TERMINAL_PATH", exe):
+        assert _connect_kwargs()["path"] == exe
+
+
+def test_the_module_constant_wins_over_the_environment():
+    """ตั้งค่าในโมดูลไว้แล้วต้องมาก่อน .env จะได้ override ตอนเทสหรือตอนดีบักได้"""
+    with EnvVar("MT5_TERMINAL_PATH", r"C:\env\terminal64.exe"):
+        original = core.TERMINAL_PATH
+        core.TERMINAL_PATH = r"C:\module\terminal64.exe"
+        try:
+            assert _connect_kwargs()["path"] == r"C:\module\terminal64.exe"
+        finally:
+            core.TERMINAL_PATH = original
+
+
+def test_an_explicit_path_argument_wins_over_both():
+    """ผู้เรียกระบุ path มาเองต้องได้ตัวนั้น ไม่ถูกค่าที่ตั้งไว้ที่อื่นทับ"""
+    with EnvVar("MT5_TERMINAL_PATH", r"C:\env\terminal64.exe"):
+        assert _connect_kwargs(path=r"C:\call\terminal64.exe")["path"] == r"C:\call\terminal64.exe"
+
+
+def test_the_not_found_error_says_how_to_set_the_path():
+    """
+    -10003 ตอนไม่ได้ตั้ง path คือกรณีที่เจอตอนสั่งผ่าน SSH ทั้งที่ terminal เปิดอยู่
+    ข้อความต้องบอกทางแก้ ไม่ใช่สะท้อนรหัส error กลับมาเฉยๆ
+    """
+    with EnvVar("MT5_TERMINAL_PATH", None), CapturedInitialize():
+        try:
+            core.connect()
+        except core.MT5Error as error:
+            assert "MT5_TERMINAL_PATH" in str(error)
+        else:
+            assert False, "connect() ต้องโยน MT5Error เมื่อ initialize ล้ม"
+
+
+def test_a_path_that_does_not_work_is_named_in_the_error():
+    """ตั้ง path ไว้แล้วยังล้ม ต้องบอกว่า path ไหนที่ลองไป จะได้รู้ว่าพิมพ์ผิดตรงไหน"""
+    exe = r"D:\wrong\terminal64.exe"
+    with EnvVar("MT5_TERMINAL_PATH", exe), CapturedInitialize():
+        try:
+            core.connect()
+        except core.MT5Error as error:
+            assert exe in str(error)
+        else:
+            assert False, "connect() ต้องโยน MT5Error เมื่อ initialize ล้ม"
+
+
+def test_other_connection_errors_do_not_get_the_path_hint():
+    """error อื่นไม่เกี่ยวกับการหา terminal ไม่ต้องพ่วงคำแนะนำเรื่อง path"""
+    with EnvVar("MT5_TERMINAL_PATH", None), CapturedInitialize(error=(-6, "Terminal: Authorization failed")):
+        try:
+            core.connect()
+        except core.MT5Error as error:
+            assert "MT5_TERMINAL_PATH" not in str(error)
+        else:
+            assert False, "connect() ต้องโยน MT5Error เมื่อ initialize ล้ม"
+
+
 # ---------- ตัวรันแบบไม่ต้องมี pytest ----------
 
 def _run_all():

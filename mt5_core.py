@@ -79,10 +79,29 @@ def last_error_text():
 
 # ---------- การเชื่อมต่อ ----------
 
+# path ของ terminal64.exe เว้นว่างไว้ให้แพ็กเกจหาเอง ซึ่งพอสำหรับเครื่องที่สั่ง
+# จากหน้าจอตัวเอง แต่ session ที่ไม่มีหน้าจอ (SSH, scheduled task) หาไม่เจอ
+# แล้วล้มด้วย -10003 "MetaTrader 5 x64 not found" ทั้งที่ terminal เปิดค้างอยู่
+# ตั้งผ่าน MT5_TERMINAL_PATH ใน .env เพราะ path ต่างกันไปในแต่ละเครื่อง
+TERMINAL_PATH = ""
+
+# รหัส error ของ MT5 ตอนหา terminal ไม่เจอ — ชื่อคงที่ไม่มีในทุกเวอร์ชันของแพ็กเกจ
+IPC_INITIALIZE_FAILED = -10003
+
+
+def terminal_path():
+    """path ที่จะส่งให้ mt5.initialize() — ค่าในโมดูลมาก่อน แล้วค่อยดู .env"""
+    return TERMINAL_PATH or os.getenv("MT5_TERMINAL_PATH", "")
+
+
 def connect(**kwargs):
     """เชื่อมต่อ MT5 แล้วคืน account_info — โยน MT5Error ถ้าไม่สำเร็จ"""
+    path = kwargs.pop("path", "") or terminal_path()
+    if path:
+        kwargs["path"] = path
+
     if not mt5.initialize(**kwargs):
-        raise MT5Error(f"เชื่อมต่อ MT5 ไม่สำเร็จ: {last_error_text()}")
+        raise MT5Error(f"เชื่อมต่อ MT5 ไม่สำเร็จ: {last_error_text()}{_path_hint(path)}")
 
     account = mt5.account_info()
     if account is None:
@@ -90,6 +109,19 @@ def connect(**kwargs):
         raise MT5Error(f"ไม่พบข้อมูลบัญชี: {last_error_text()}")
 
     return account
+
+
+def _path_hint(path):
+    """บอกทางแก้ตอนหา terminal ไม่เจอ ไม่ใช่แค่สะท้อนรหัส error กลับมา"""
+    if mt5.last_error()[0] != IPC_INITIALIZE_FAILED:
+        return ""
+    if path:
+        return f"\n  หา terminal ตาม path ที่ตั้งไว้ไม่เจอ: {path}"
+    return (
+        "\n  ถ้า terminal เปิดค้างอยู่แล้วยังขึ้นแบบนี้ แปลว่าแพ็กเกจหา path เองไม่เจอ"
+        "\n  (เจอบ่อยตอนสั่งผ่าน SSH หรือ scheduled task) ให้ใส่ path ลงใน .env:"
+        "\n  MT5_TERMINAL_PATH=C:\\Program Files\\MetaTrader 5\\terminal64.exe"
+    )
 
 
 def prepare_symbol(symbol):

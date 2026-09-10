@@ -20,7 +20,7 @@ TRADE_LOG = "trade_log.csv"
 BOT_LOG = "bot.log"
 
 CANDLE_MINUTES = 15    # บอทเขียนหนึ่งแถวต่อหนึ่งแท่ง M15 ที่ปิดแล้ว
-LONG_GAP_HOURS = 24    # ยาวกว่านี้ถือว่าตลาดปิด ไม่ใช่บอทดับ
+SESSION_BREAK_HOURS = 3.0   # ห่างเกินนี้ถือว่าคนละรอบที่รัน ไม่ใช่บอทดับกลางรอบ
 
 
 def _read(path):
@@ -111,25 +111,47 @@ def _candle_times(frame):
     return times.sort_values().reset_index(drop=True)
 
 
-def find_gaps(times, minutes=CANDLE_MINUTES):
-    """ช่วงที่ไม่มีแท่ง คืน (ก่อนหน้า, ถัดไป, จำนวนแท่งที่หาย) เรียงจากใหญ่ไปเล็ก
+def split_sessions(times, break_hours=SESSION_BREAK_HOURS, minutes=CANDLE_MINUTES):
+    """แบ่งแท่งเป็น "รอบที่รัน" — บอทไม่ได้รันตลอด 24 ชม. แต่รันเป็นรอบ เย็นถึงเช้า
 
-    ระยะห่างเกินหนึ่งแท่งแปลว่าช่วงนั้นไม่ได้บันทึก — บอทดับ เน็ตหลุด หรือตลาดปิด
-    ไฟล์นี้แยกสามอย่างนั้นจากกันไม่ได้ จึงรายงานตามที่เห็นแล้วให้คนตัดสิน
+    ห่างเกิน break_hours = คนละรอบ (ปิดเครื่อง ไม่อยู่บ้าน สุดสัปดาห์) ไม่ใช่ความผิดของบอท
+    ห่างน้อยกว่านั้นแต่เกินหนึ่งแท่ง = ขาดกลางรอบ อันนี้แหละที่ควรตามหาสาเหตุ
+
+    คืน list ของ (เริ่ม, จบ, จำนวนแท่งที่มี, จำนวนแท่งที่ขาดกลางรอบ)
     """
+    if not len(times):
+        return []
+
+    limit = pd.Timedelta(hours=break_hours)
     step = pd.Timedelta(minutes=minutes)
-    gaps = []
+
+    sessions = []
+    start = times.iloc[0]
+    held = 1
+    dropped = 0
 
     for index in range(1, len(times)):
-        span = times[index] - times[index - 1]
+        span = times.iloc[index] - times.iloc[index - 1]
+
+        if span > limit:
+            sessions.append((start, times.iloc[index - 1], held, dropped))
+            start, held, dropped = times.iloc[index], 1, 0
+            continue
+
+        held += 1
         if span > step:
-            gaps.append((times[index - 1], times[index], int(span / step) - 1))
+            dropped += int(span / step) - 1
 
-    return sorted(gaps, key=lambda gap: -gap[2])
+    sessions.append((start, times.iloc[-1], held, dropped))
+    return sessions
 
 
-def summarise_coverage(lines, show=5):
-    """บอทเก็บแท่งครบไหม — คำถามแรกหลังปล่อยรันข้ามคืน"""
+def summarise_coverage(lines, show=8):
+    """รันไปกี่รอบ แต่ละรอบขาดกลางคันไหม — คำถามแรกหลังปล่อยรันข้ามคืน
+
+    ไม่คิดเลขเป็น "uptime จาก 24 ชม." เพราะบอทไม่ได้ตั้งใจรันตลอดเวลาอยู่แล้ว
+    ตัวเลขที่ใช้ได้จริงคือ "ในรอบที่รัน เก็บครบไหม"
+    """
     frame = _read(FEATURE_LOG)
 
     if frame is None or "candle_time" not in frame:
@@ -140,31 +162,51 @@ def summarise_coverage(lines, show=5):
     if len(times) < 2:
         return
 
-    long_gap = pd.Timedelta(hours=LONG_GAP_HOURS) / pd.Timedelta(minutes=CANDLE_MINUTES)
-    gaps = find_gaps(times)
-    closed = [gap for gap in gaps if gap[2] >= long_gap]
-    missed = [gap for gap in gaps if gap[2] < long_gap]
+    sessions = split_sessions(times)
+    dropped = sum(session[3] for session in sessions)
+    held = sum(session[2] for session in sessions)
 
-    lines.append(_section("ความต่อเนื่อง"))
+    lines.append(_section("รอบที่รัน"))
+    lines.append(f"รันไป {len(sessions)} รอบ เก็บได้ {held} แท่ง")
 
-    dropped = sum(gap[2] for gap in missed)
-    expected = len(times) + dropped
-    lines.append(f"เก็บได้ {len(times)} จาก {expected} แท่งที่ควรมี ({len(times) / expected:.0%})")
+    for start, end, count, missing in sessions[-show:]:
+        hours = (end - start) / pd.Timedelta(hours=1)
+        note = f"  ขาดกลางรอบ {missing} แท่ง" if missing else ""
+        lines.append(f"  {start} -> {end}  {count} แท่ง ({hours:.1f} ชม.){note}")
 
-    if not gaps:
-        lines.append("ไม่มีช่วงที่ขาดเลย บอทรันต่อเนื่องตลอด")
+    if len(sessions) > show:
+        lines.append(f"  (ก่อนหน้านั้นอีก {len(sessions) - show} รอบ)")
+
+    if dropped:
+        lines.append(
+            f"ขาดกลางรอบรวม {dropped} แท่ง จาก {held + dropped} ที่ควรมีในรอบที่รัน "
+            f"({held / (held + dropped):.0%}) — เฉพาะพวกนี้ที่ควรตามหาสาเหตุ"
+        )
+    else:
+        lines.append("ไม่มีแท่งขาดกลางรอบเลย ทุกรอบที่รันเก็บครบ")
+
+    lines.append("ช่วงระหว่างรอบไม่นับ — ปิดเครื่องหรือไม่อยู่บ้านไม่ใช่ความผิดของบอท")
+
+
+def summarise_hours(lines):
+    """ข้อมูลครอบคลุมชั่วโมงไหนบ้าง — รันเฉพาะกลางคืนแปลว่าสถิติเป็นของกลางคืน"""
+    frame = _read(FEATURE_LOG)
+
+    if frame is None or "candle_time" not in frame:
         return
 
-    if missed:
-        hours = dropped * CANDLE_MINUTES / 60
-        lines.append(f"ช่วงที่ขาด {len(missed)} ครั้ง รวม {dropped} แท่ง (~{hours:.1f} ชม.):")
-        for start, end, count in missed[:show]:
-            lines.append(f"  {start} -> {end}  ขาด {count} แท่ง")
-        if len(missed) > show:
-            lines.append(f"  (อีก {len(missed) - show} ช่วง)")
+    times = _candle_times(frame)
 
-    for start, end, count in closed:
-        lines.append(f"ช่วงยาว {start} -> {end} ({count} แท่ง) — น่าจะสุดสัปดาห์หรือวันหยุด ไม่นับเป็นบอทดับ")
+    if len(times) < 2:
+        return
+
+    counts = times.dt.hour.value_counts()
+    covered = sorted(counts.index)
+
+    lines.append(_section("ชั่วโมงที่ครอบคลุม"))
+    lines.append(f"เก็บได้ {len(covered)} จาก 24 ชั่วโมง (เวลาเซิร์ฟเวอร์ broker): "
+                 + ", ".join(f"{hour:02d}" for hour in covered))
+    lines.append("สถิติทุกอย่างในรายงานนี้เป็นของชั่วโมงพวกนี้เท่านั้น ไม่ใช่ของตลาดทั้งวัน")
 
 
 def _number(value):
@@ -320,12 +362,12 @@ def next_steps(lines):
     if "candle_time" in features:
         times = _candle_times(features)
         if len(times) > 1:
-            long_gap = pd.Timedelta(hours=LONG_GAP_HOURS) / pd.Timedelta(minutes=CANDLE_MINUTES)
-            dropped = sum(gap[2] for gap in find_gaps(times) if gap[2] < long_gap)
+            sessions = split_sessions(times)
+            dropped = sum(session[3] for session in sessions)
             if dropped and len(times) / (len(times) + dropped) < 0.9:
                 lines.append(
-                    f"ขาดไป {dropped} แท่งระหว่างที่ตลาดเปิด — ดูว่าบอทดับ เน็ตหลุด "
-                    "หรือ MT5 ปิดตัวเอง ก่อนจะเชื่อสถิติข้างบน"
+                    f"ขาดกลางรอบไป {dropped} แท่ง — ดูว่าเน็ตหลุด เครื่อง sleep "
+                    "หรือ MT5 ปิดตัวเอง ระหว่างที่ยังตั้งใจรันอยู่"
                 )
 
     if len(features) < 96:
@@ -346,6 +388,7 @@ def build_report():
 
     summarise_candles(lines)
     summarise_coverage(lines)
+    summarise_hours(lines)
     summarise_by_day(lines)
     summarise_filter_margins(lines)
     summarise_decisions(lines)

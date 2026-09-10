@@ -809,8 +809,8 @@ def _candles(times, **columns):
             for index, stamp in enumerate(times)]
 
 
-def test_report_notices_the_hours_the_bot_was_not_running():
-    # แท่ง M15 ควรห่างกัน 15 นาที ข้ามจาก 10:00 ไป 11:00 คือขาดไป 3 แท่ง
+def test_a_dropout_inside_a_running_session_is_counted_against_the_bot():
+    # แท่ง M15 ควรห่างกัน 15 นาที ข้ามจาก 10:00 ไป 11:00 คือขาดกลางรอบ 3 แท่ง
     directory = _feature_file(_candles(
         ["2026-09-09 09:30:00", "2026-09-09 09:45:00", "2026-09-09 10:00:00",
          "2026-09-09 11:00:00"],
@@ -819,22 +819,63 @@ def test_report_notices_the_hours_the_bot_was_not_running():
 
     text = _report_in(directory, lambda report, lines: report.summarise_coverage(lines))
 
-    assert "เก็บได้ 4 จาก 7" in text
-    assert "ขาด 3 แท่ง" in text
+    assert "รันไป 1 รอบ" in text
+    assert "ขาดกลางรอบ 3 แท่ง" in text
 
 
-def test_a_weekend_sized_gap_is_not_blamed_on_the_bot():
-    # ตลาดปิดสุดสัปดาห์ทิ้งช่องยาวเสมอ ถ้านับรวมเป็นบอทดับ ตัวเลข uptime จะไร้ความหมาย
+def test_the_hours_the_bot_was_switched_off_are_not_counted_as_downtime():
+    # บอทรันได้แค่ตอนอยู่บ้าน คืนละรอบ ช่วงกลางวันที่ไม่ได้รันไม่ใช่ความผิดของบอท
     directory = _feature_file(_candles(
-        ["2026-09-11 21:30:00", "2026-09-11 21:45:00",
-         "2026-09-13 22:00:00", "2026-09-13 22:15:00"],
+        ["2026-09-09 19:00:00", "2026-09-09 19:15:00",
+         "2026-09-10 19:00:00", "2026-09-10 19:15:00"],
         adx_14=[21.0, 22.0, 23.0, 24.0],
     ))
 
     text = _report_in(directory, lambda report, lines: report.summarise_coverage(lines))
 
-    assert "ไม่นับเป็นบอทดับ" in text
-    assert "เก็บได้ 4 จาก 4" in text
+    assert "รันไป 2 รอบ" in text
+    assert "ไม่มีแท่งขาดกลางรอบเลย" in text
+
+
+def test_two_evenings_apart_are_two_sessions_not_one_long_outage():
+    times = pd.to_datetime(pd.Series([
+        "2026-09-09 19:00:00", "2026-09-09 19:15:00",
+        "2026-09-10 19:00:00", "2026-09-10 19:15:00",
+    ]))
+
+    import report
+    sessions = report.split_sessions(times)
+
+    assert len(sessions) == 2
+    assert [session[2] for session in sessions] == [2, 2]     # แท่งที่เก็บได้
+    assert [session[3] for session in sessions] == [0, 0]     # ไม่มีขาดกลางรอบ
+
+
+def test_a_short_dropout_stays_inside_the_same_session():
+    # เน็ตหลุดชั่วโมงเดียวไม่ใช่การปิดเครื่อง ต้องยังนับเป็นรอบเดียวกันและโดนนับว่าขาด
+    times = pd.to_datetime(pd.Series([
+        "2026-09-09 19:00:00", "2026-09-09 19:15:00",
+        "2026-09-09 20:30:00", "2026-09-09 20:45:00",
+    ]))
+
+    import report
+    sessions = report.split_sessions(times)
+
+    assert len(sessions) == 1
+    assert sessions[0][3] == 4      # 19:15 -> 20:30 หายไป 4 แท่ง
+
+
+def test_the_report_says_which_hours_the_data_actually_covers():
+    # รันเฉพาะกลางคืนแปลว่าสถิติเป็นของกลางคืน ถ้าไม่บอกจะถูกอ่านเป็นของทั้งวัน
+    directory = _feature_file(_candles(
+        ["2026-09-09 19:00:00", "2026-09-09 19:15:00", "2026-09-09 20:00:00"],
+        adx_14=[21.0, 22.0, 23.0],
+    ))
+
+    text = _report_in(directory, lambda report, lines: report.summarise_hours(lines))
+
+    assert "2 จาก 24" in text
+    assert "19, 20" in text
 
 
 def test_report_says_how_many_candles_cleared_the_adx_threshold():

@@ -202,6 +202,15 @@ def analyse(frame, horizon=HORIZON, sl_mult=SL_ATR_MULT, min_sample=MIN_SAMPLE):
         lines.append("ยังไม่มีแท่งไหนติดป้ายได้ — เก็บข้อมูลต่อเนื่องอีกสักสองชั่วโมงแล้วรันใหม่")
         return lines
 
+    hours = pd.to_datetime(labelled["candle_time"], errors="coerce").dt.hour.dropna()
+    if len(hours):
+        # เรียงเป็นรายชั่วโมง ไม่ใช่ min-max เพราะรอบที่คร่อมเที่ยงคืนจะกลายเป็น 01-23
+        listed = ", ".join(f"{hour:02d}" for hour in sorted(hours.unique()))
+        lines.append(
+            f"ครอบคลุม {hours.nunique()} จาก 24 ชม. (เวลา broker): {listed}"
+            " — ข้อสรุปเป็นของช่วงนี้ ไม่ใช่ของทั้งวัน"
+        )
+
     lines.append("")
     lines.append("ตัววัดทุกข้อข้างล่างคือ 'เทรนด์ H1 ไปต่อกี่ R' บวกคือไปต่อ ลบคือสวนกลับ")
     lines.append("")

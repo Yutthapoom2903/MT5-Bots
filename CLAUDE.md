@@ -35,7 +35,7 @@ outcomes.py     labels each logged candle with what the market did next, then me
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          143 logic tests, no MT5 required
+tests/          146 logic tests, no MT5 required
 ```
 
 ## Running
@@ -57,7 +57,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 143 logic tests, runs under WSL
+python run.py test         # 146 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -234,10 +234,17 @@ The bot is meant to run at home without a watcher, so the loop is defensive:
   thousand identical warnings collapse to one row with a count.
 - Market closed (`symbol_is_tradable()` false) backs the poll off to `MARKET_CLOSED_SLEEP`.
 
-`report.py` answers the daily questions in this order: **did it stay up**
-(`summarise_coverage()` counts the M15 candles missing from `candle_time` — a gap longer
-than `LONG_GAP_HOURS` is filed as market-closed rather than downtime, or a weekend makes
-uptime read 30%), **what changed day to day** (`summarise_by_day()`, which stays hidden
+**The bot runs in nightly sessions, not around the clock** — it is started on getting home
+and stopped on waking, so most of every day has no data by design. `split_sessions()` is
+built on that: a gap longer than `SESSION_BREAK_HOURS` starts a new session and is never
+counted against the bot, while a shorter gap is a dropout inside a run and is. Measuring
+uptime against 24 hours instead reported 29% for a night that actually captured 83% of the
+candles it was running for, which is the kind of number that gets a section ignored.
+
+`report.py` answers the daily questions in this order: **did it stay up while it was meant
+to** (`summarise_coverage()`), **which hours does the data even cover** (`summarise_hours()`
+— one session a day is roughly 11 hours of 24, so every statistic below it describes that
+window and not the market), **what changed day to day** (`summarise_by_day()`, which stays hidden
 until there are two days to compare), and **how far each candle sat from the thresholds**
 (`summarise_filter_margins()` reads `ADX_MIN` / `MAX_SPREAD_POINTS` / the RSI bounds
 straight out of `strategy.py`, so the numbers cannot drift from the live filters). That

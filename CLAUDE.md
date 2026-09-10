@@ -349,11 +349,17 @@ Candidates starting with the full requested name win first.
 ## Outstanding
 
 - Never verified against a live MT5 terminal. Broker behaviour — retcodes, stop levels,
-  filling modes — is unproven. Demo first.
-- The Telegram token that used to sit in `.env` in the first two commits is **gone from
-  git history** as of 2026-09-10: `git filter-branch --index-filter` dropped the file from
-  every commit and `main` was force-pushed, so all SHAs below `2700dec` changed and the old
-  `a30efaf` no longer exists. Any older clone of this repo still carries it, and GitHub may
-  keep the pre-rewrite commits reachable by SHA for a while, so **rotating the token at
-  @BotFather is what actually retires it** — the rewrite only stops it spreading further.
-  Confirm the rotation happened before treating this as closed.
+  filling modes — is unproven, and `python run.py` alone will never prove it: watch mode
+  writes `signal_log.csv` and `market_training_data.csv` on every closed candle but never
+  sends an order, so `trade_log.csv` stays empty. Only `run.py --trade` on a demo account
+  exercises that path. `report.py` says so while the file is missing.
+
+## Closed
+
+- **The leaked Telegram token is retired.** It sat in `.env` in the first two commits.
+  On 2026-09-10 `git filter-branch --index-filter` dropped the file from every commit and
+  `main` was force-pushed (all SHAs below `2700dec` changed; the old `a30efaf` is gone),
+  and the user then revoked the token at @BotFather the same day. The revocation is the
+  part that actually retired it — old clones still carry the string and GitHub may keep
+  pre-rewrite commits reachable by SHA, but the string no longer opens anything. Nothing
+  further is owed here; do not reopen it.

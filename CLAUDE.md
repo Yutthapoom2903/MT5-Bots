@@ -35,7 +35,7 @@ outcomes.py     labels each logged candle with what the market did next, then me
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          151 logic tests, no MT5 required
+tests/          155 logic tests, no MT5 required
 ```
 
 ## Running
@@ -57,7 +57,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 151 logic tests, runs under WSL
+python run.py test         # 155 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)

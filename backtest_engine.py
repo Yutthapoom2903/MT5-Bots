@@ -14,6 +14,16 @@ CSV_FILE = "market_training_data.csv"
 REQUIRED_COLUMNS = ("your_decision", "trade_result")
 
 
+def normalize_labels(series):
+    """ค่าที่คนกรอกมือ — ตัดช่องว่างและทำเป็นตัวใหญ่ก่อนเทียบ
+
+    กรอกใน Excel จริงจะได้ "buy", " SELL", "Sell " ปนกันเสมอ ถ้าเทียบสตริงตรงๆ
+    แถวพวกนั้นหายเงียบ แล้ว win rate ที่พิมพ์ออกมาคำนวณจากตัวอย่างที่ไม่ครบ
+    ซึ่งอันตรายกว่าไม่พิมพ์อะไรเลย เพราะมันดูเหมือนคำตอบ
+    """
+    return series.astype(str).str.strip().str.upper()
+
+
 def summarize(frame, title):
     """พิมพ์สรุปของชุดข้อมูลหนึ่งชุด — ข้ามไปถ้าไม่มีไม้เลย"""
     total = len(frame)
@@ -38,6 +48,9 @@ def run_backtest(csv_file=CSV_FILE):
     if missing:
         print(f"ไฟล์ขาดคอลัมน์: {', '.join(missing)}")
         return
+
+    for column in REQUIRED_COLUMNS:
+        df[column] = normalize_labels(df[column])
 
     decided = df[df["your_decision"].isin(["BUY", "SELL"])]
     scored = decided[decided["trade_result"].isin(["WIN", "LOSS"])]

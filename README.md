@@ -109,7 +109,7 @@ session ไหน ถ้า broker เป็น GMT+3 ชั่วโมง 17�
 | `python run.py outcomes` | **วัดว่าตัวกรองแยกอะไรได้จริงไหม** | ไม่ |
 | `python run.py review` | สรุปผลจากข้อมูลที่คุณติดป้ายกำกับเอง | ไม่ |
 | `python run.py notify` | ส่งตัวอย่างแจ้งเตือนครบทุกหมวด | ไม่ |
-| `python run.py test` | รันเทส logic 151 ข้อ | ไม่ |
+| `python run.py test` | รันเทส logic 155 ข้อ | ไม่ |
 
 `--trade` ต้องแก้ `ALLOW_LIVE_ACCOUNT = True` ใน `runner.py` เองก่อน ถึงจะใช้กับบัญชีจริงได้
 
@@ -223,8 +223,9 @@ Demo เสี่ยงเกินงบแล้วเทรดต่อพร
 | `bot_state.json` | แท่งล่าสุดที่ประมวลผล กัน restart ยิงซ้ำ | ไม่ |
 
 `market_training_data.csv` มีคอลัมน์ท้ายว่างไว้ให้กรอกเอง — `your_decision` (BUY/SELL),
-`your_reason`, `trade_result` (WIN/LOSS) แล้วรัน `run.py review` จะเทียบให้ว่า
-การตัดสินใจ**ของคุณ**ได้ผลแค่ไหน เทียบกับ `bot_decision` ในแถวเดียวกัน
+`your_reason`, `trade_result` (WIN/LOSS) แล้วรัน `run.py review` จะให้คะแนน
+การตัดสินใจ**ของคุณ** แยกตาม BUY/SELL และตามเทรนด์ H1 (พิมพ์เล็กพิมพ์ใหญ่ไม่สำคัญ)
+คอลัมน์ `bot_decision` กับ `bot_blockers` อยู่แถวเดียวกันไว้ให้เทียบด้วยตาว่าบอทคิดยังไง
 
 ---
 

@@ -9,6 +9,7 @@
 และการคำนวณค่าที่ต้องผ่านการตรวจของ broker (ปัดราคา ปัด lot ระยะ stop ขั้นต่ำ)
 """
 
+import io
 import os
 import sys
 
@@ -1111,6 +1112,64 @@ def test_every_logged_candle_records_the_brokers_gmt_offset():
         runner.core.append_csv = original
 
     assert written["broker_gmt_offset"] == 3
+
+
+
+# ---------- ให้คะแนนป้ายที่คนกรอกเอง ----------
+
+def _review(rows):
+    """รัน backtest_engine กับ CSV ชั่วคราวแล้วคืนสิ่งที่มันพิมพ์"""
+    import contextlib
+    import tempfile
+    import backtest_engine
+
+    path = os.path.join(tempfile.mkdtemp(), "hand.csv")
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        backtest_engine.run_backtest(path)
+
+    return buffer.getvalue()
+
+
+def test_labels_typed_by_hand_count_whatever_the_casing_and_spacing():
+    """กรอกใน Excel ได้ "buy" " SELL" "Sell " ปนกันเสมอ ทุกแบบต้องนับ
+
+    ของเดิมเทียบสตริงตรงๆ สี่แถวนี้เหลือหนึ่ง แล้วรายงาน win rate 100%
+    ทั้งที่ของจริงคือ 50% — ผิดแบบที่ดูเหมือนคำตอบ
+    """
+    text = _review({
+        "your_decision": ["BUY", "buy", " SELL", "Sell "],
+        "trade_result": ["WIN", "win", "LOSS", " Loss "],
+        "h1_trend": ["UPTREND"] * 4,
+    })
+
+    assert "แถวที่กรอกผลแล้ว: 4" in text
+    assert "Win rate  50.00%" in text
+
+
+def test_a_row_decided_but_not_yet_filled_in_is_not_scored():
+    text = _review({
+        "your_decision": ["BUY", "SELL"],
+        "trade_result": ["WIN", ""],
+    })
+
+    assert "แถวที่ตัดสินใจเข้าไม้: 2" in text
+    assert "แถวที่กรอกผลแล้ว: 1" in text
+
+
+def test_nothing_filled_in_says_so_instead_of_printing_a_win_rate():
+    text = _review({"your_decision": ["", ""], "trade_result": ["", ""]})
+
+    assert "ยังคำนวณ win rate ไม่ได้" in text
+    assert "Win rate" not in text
+
+
+def test_a_file_without_the_hand_filled_columns_says_which_are_missing():
+    text = _review({"close": [4400.0, 4401.0]})
+
+    assert "ไฟล์ขาดคอลัมน์" in text
 
 
 

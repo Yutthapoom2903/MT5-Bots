@@ -83,10 +83,20 @@ def command_check(args):
         actual_percent = minimum_loss / account.balance * 100
         print(
             f"\nทุนไม่พอกับความเสี่ยงที่ตั้งไว้: ไม้เล็กสุดคิดเป็น {actual_percent:.2f}% ของพอร์ต\n"
-            f"ถ้าต้องการเสี่ยง {runner.RISK_PERCENT}% จริงๆ ต้องมีทุนราว {needed:,.0f} {account.currency}\n"
-            f"ตอนนี้บอทจะข้ามทุกสัญญาณ จนกว่าจะเพิ่มทุน ลด SL_ATR_MULT "
-            f"หรือเปิด ALLOW_RISK_OVER_BUDGET ใน runner.py"
+            f"ถ้าต้องการเสี่ยง {runner.RISK_PERCENT}% จริงๆ ต้องมีทุนราว {needed:,.0f} {account.currency}"
         )
+        # ต้องตอบให้ตรงกับ runner.execute() ไม่งั้นบรรทัดนี้กลายเป็นคำเตือนลวง
+        if runner.over_budget_is_allowed(account):
+            reason = "เป็นบัญชี Demo" if core.is_demo(account) else "เปิด ALLOW_RISK_OVER_BUDGET ไว้"
+            print(
+                f"บอทจะยังเข้าไม้ที่ {info.volume_min} lot เพราะ{reason} — "
+                f"เสี่ยงจริงต่อไม้ {minimum_loss:.2f} {account.currency} ไม่ใช่ {budget:.2f}"
+            )
+        else:
+            print(
+                "ตอนนี้บอทจะข้ามทุกสัญญาณ จนกว่าจะเพิ่มทุน ลด SL_ATR_MULT "
+                "หรือเปิด ALLOW_RISK_OVER_BUDGET ใน runner.py"
+            )
     else:
         lots = trade.calculate_lot(info, account, sl_distance, runner.RISK_PERCENT)
         print(f"\nทุนพอ — ขนาดไม้ที่จะใช้ตอนนี้: {lots} lot")

@@ -45,7 +45,7 @@ backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 menu.py         numbered menu over the same subcommands. Pure except run().
 report.py       offline digest of the CSVs and bot.log
-tests/          173 logic tests, no MT5 required
+tests/          176 logic tests, no MT5 required
 ```
 
 ## Running
@@ -67,7 +67,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 173 logic tests, runs under WSL
+python run.py test         # 176 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -245,6 +245,12 @@ The bot is meant to run at home without a watcher, so the loop is defensive:
 - `roll_over_day()` resets `day_start_balance` and sends the previous day's summary.
 - `heartbeat()` posts equity, open positions and the last candle every
   `HEARTBEAT_EVERY_HOURS`, timestamped in state so a restart does not spam.
+- The console handler uses `core.ConsoleFormatter` — short timestamp, a coloured level mark,
+  and the message itself painted only at WARNING and above; `runner.verdict_line()` colours
+  the verdict green/red/yellow/dim. Colour is ANSI written by hand (no colorama/rich, same
+  reason there is no TUI) and turns itself off when `NO_COLOR` is set or stdout is not a
+  terminal. **The file handler keeps the old plain format** — `report.py` groups `bot.log`
+  lines by shape, so an escape code in the file splits identical lines into different rows.
 - `bot.log` records DEBUG (every cycle, every filter check with its numbers, position state)
   while the console stays at INFO. It rotates at 5MB x 5 backups. `run.py report` is the
   intended way to read all of it back — it groups repeated log lines by shape, so a

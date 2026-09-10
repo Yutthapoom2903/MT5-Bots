@@ -137,7 +137,7 @@ session ไหน ถ้า broker เป็น GMT+3 ชั่วโมง 17�
 | `python run.py outcomes` | **วัดว่าตัวกรองแยกอะไรได้จริงไหม** | ไม่ |
 | `python run.py review` | สรุปผลจากข้อมูลที่คุณติดป้ายกำกับเอง | ไม่ |
 | `python run.py notify` | ส่งตัวอย่างแจ้งเตือนครบทุกหมวด | ไม่ |
-| `python run.py test` | รันเทส logic 173 ข้อ | ไม่ |
+| `python run.py test` | รันเทส logic 176 ข้อ | ไม่ |
 
 `--trade` ต้องแก้ `ALLOW_LIVE_ACCOUNT = True` ใน `runner.py` เองก่อน ถึงจะใช้กับบัญชีจริงได้
 

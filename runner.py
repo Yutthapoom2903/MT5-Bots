@@ -251,6 +251,36 @@ def handle_existing_positions(signal, logger):
     return True
 
 
+# สีของคำตัดสินบนจอ: เขียวเข้าซื้อ แดงเข้าขาย เหลืองคือมีสัญญาณแต่ตัวกรองบล็อก
+# จางคือไม่มีอะไรเกิดขึ้น ซึ่งเป็นกรณีส่วนใหญ่ของคืนหนึ่ง
+VERDICT_STYLE = {"BUY": core.GREEN, "SELL": core.RED}
+
+
+def verdict_line(decision):
+    """คำตัดสินหนึ่งบรรทัดที่ย้อมสีตามผล — ข้อความเหมือนเดิมทุกตัวอักษร เพิ่มแค่สี"""
+    summary = decision.summary()
+
+    if decision.enter:
+        return core.paint(summary, core.BOLD, VERDICT_STYLE.get(decision.signal, ""))
+
+    if decision.signal == "HOLD":
+        return core.paint(summary, core.DIM)
+
+    return core.paint(summary, core.YELLOW)
+
+
+def over_budget_is_allowed(account):
+    """
+    ไม้ขั้นต่ำเสี่ยงเกินงบแล้วยังเดินต่อได้ไหม
+
+    บน Demo ปล่อยผ่านโดยเตือน เพราะจุดประสงค์ของ Demo คือได้เห็นบอททำงานจริง
+    บัญชีจริงบล็อกไว้ก่อนเสมอ เว้นแต่สั่งอนุญาตเอง
+    เงื่อนไขอยู่ที่เดียวเพราะ run.py check บอกผู้ใช้ล่วงหน้าว่าจะเกิดอะไรขึ้น
+    ถ้าสองที่ตอบไม่ตรงกัน check จะโกหก
+    """
+    return core.is_demo(account) or ALLOW_RISK_OVER_BUDGET
+
+
 def execute(decision, state, logger):
     """ส่งคำสั่งตามคำตัดสิน — ตรวจเรื่องเงินและ broker ครบก่อนยิง"""
     signal = decision.signal
@@ -281,9 +311,7 @@ def execute(decision, state, logger):
             budget = trade.risk_budget(account, RISK_PERCENT)
             actual_percent = minimum_loss / account.balance * 100
 
-            # บน Demo ปล่อยผ่านโดยเตือน เพราะจุดประสงค์คือได้เห็นบอททำงานจริง
-            # บัญชีจริงบล็อกไว้ก่อนเสมอ เว้นแต่สั่งอนุญาตเอง
-            if core.is_demo(account) or ALLOW_RISK_OVER_BUDGET:
+            if over_budget_is_allowed(account):
                 logger.warning(
                     "ไม้ขั้นต่ำ %.2f lot เสี่ยง %.2f %s = %.2f%% ของพอร์ต เกินงบที่ตั้งไว้ %.2f "
                     "(%.2f%%) — เดินต่อเพราะ%s",
@@ -831,7 +859,7 @@ def run(trade_enabled=False):
             candle_time, context["close"], context["h1_trend"], context["m5_trend"],
             context["rsi"], context["adx"], context["atr"], context["spread_points"],
         )
-        logger.info("คำตัดสิน: %s", decision.summary())
+        logger.info("คำตัดสิน: %s", verdict_line(decision))
 
         # เหตุผลเต็มลงไฟล์เสมอ จะได้ย้อนดูได้ว่าตัวกรองไหนบล็อกและด้วยตัวเลขอะไร
         for check in decision.checks:

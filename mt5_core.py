@@ -36,6 +36,108 @@ class MT5Error(RuntimeError):
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 5
 
+# ---------- สีบนหน้าจอ ----------
+#
+# บอทพิมพ์ทุกรอบตลอดคืน จอเลยเป็นกำแพงตัวหนังสือ สีทำให้ WARNING/ERROR เด้งออกมา
+# ได้โดยไม่ต้องอ่านทุกบรรทัด ใช้ ANSI ล้วน ไม่เพิ่ม dependency (colorama/rich ลงได้
+# เครื่องเดียวจากสองเครื่อง เหมือนเหตุผลที่ไม่เอา TUI)
+#
+# ห้ามให้รหัสสีลงไฟล์ — bot.log อ่านย้อนหลังด้วย report.py ซึ่งจับกลุ่มบรรทัด
+# ตามรูปแบบ รหัสสีแทรกอยู่จะทำให้บรรทัดที่เหมือนกันกลายเป็นคนละแบบ
+
+RESET = "\033[0m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+
+# หน้าตาของแต่ละระดับบนจอ: (สี, สัญลักษณ์)
+LEVEL_STYLE = {
+    "DEBUG": (DIM, "·"),
+    "INFO": (CYAN, "▸"),
+    "WARNING": (YELLOW, "▲"),
+    "ERROR": (RED, "✖"),
+    "CRITICAL": (BOLD + RED, "✖"),
+}
+
+
+def color_enabled(stream=None):
+    """
+    จอนี้รับสีได้ไหม
+
+    ปิดเมื่อ NO_COLOR ถูกตั้ง (ธรรมเนียมของ no-color.org) หรือปลายทางไม่ใช่ terminal
+    เช่นตอน redirect ลงไฟล์หรือส่งต่อผ่าน pipe ซึ่งรหัสสีจะกลายเป็นขยะ
+    """
+    if os.getenv("NO_COLOR") is not None:
+        return False
+
+    stream = stream or sys.stdout
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def paint(text, *styles):
+    """ย้อมข้อความถ้าจอรับสีได้ ไม่ได้ก็คืนข้อความเดิม เรียกได้เสมอโดยไม่ต้องเช็คก่อน"""
+    if not styles or not color_enabled():
+        return text
+    return f"{''.join(styles)}{text}{RESET}"
+
+
+def _enable_windows_ansi():
+    """
+    เปิดโหมด ANSI ของ console บน Windows
+
+    cmd.exe รุ่นเก่าพิมพ์รหัสสีออกมาเป็นตัวอักษรดิบถ้าไม่เปิดธงนี้ก่อน
+    ล้มเงียบได้ เพราะไม่มีสีคือเสียความสวย ไม่ใช่เสียการทำงาน
+    """
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        STD_OUTPUT_HANDLE = -11
+
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass
+
+
+class ConsoleFormatter(logging.Formatter):
+    """
+    รูปแบบสำหรับจอเท่านั้น — เวลาแบบสั้นทำให้ข้อความเริ่มเร็วขึ้น ระดับเป็นสัญลักษณ์สี
+
+    ไฟล์ยังใช้ Formatter มาตรฐานที่มีวันที่เต็มและชื่อระดับเป็นตัวอักษร เพราะอ่านย้อนหลัง
+    ต้องรู้วันและต้อง grep ได้
+    """
+
+    def __init__(self, use_color=True):
+        super().__init__(datefmt="%H:%M:%S")
+        self.use_color = use_color
+
+    def format(self, record):
+        style, mark = LEVEL_STYLE.get(record.levelname, ("", "·"))
+        stamp = self.formatTime(record, self.datefmt)
+        message = record.getMessage()
+
+        if record.exc_info:
+            message = f"{message}\n{self.formatException(record.exc_info)}"
+
+        if not self.use_color:
+            return f"{stamp} {mark} {message}"
+
+        if record.levelno >= logging.WARNING:
+            message = f"{style}{message}{RESET}"
+
+        return f"{DIM}{stamp}{RESET} {style}{mark}{RESET} {message}"
+
+
 
 def setup_logging(log_file=None, level=logging.INFO, console_level=logging.INFO):
     """
@@ -50,8 +152,11 @@ def setup_logging(log_file=None, level=logging.INFO, console_level=logging.INFO)
     except (AttributeError, OSError):
         pass
 
+    _enable_windows_ansi()
+
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(console_level)
+    console.setFormatter(ConsoleFormatter(use_color=color_enabled(sys.stdout)))
     handlers = [console]
 
     if log_file:
@@ -59,12 +164,14 @@ def setup_logging(log_file=None, level=logging.INFO, console_level=logging.INFO)
             log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8",
         )
         rotating.setLevel(level)
+        # ไฟล์ไม่ผ่าน ConsoleFormatter เด็ดขาด รหัสสีลงไฟล์แล้ว report.py จับกลุ่มผิด
+        rotating.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+        ))
         handlers.append(rotating)
 
     logging.basicConfig(
         level=min(level, console_level),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
         handlers=handlers,
         force=True,
     )

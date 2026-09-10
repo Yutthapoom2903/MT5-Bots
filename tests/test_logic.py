@@ -10,6 +10,7 @@
 """
 
 import io
+import logging
 import os
 import sys
 
@@ -31,6 +32,7 @@ import notify
 import strategy
 import backtest
 import outcomes
+import runner
 
 
 # ---------- ตัวช่วย ----------
@@ -1952,6 +1954,153 @@ def test_realigning_an_untouched_file_changes_nothing():
         core.append_csv(path, {"candle_time": "2", "close": 11.0})
 
         assert _read_rows(path)[:2] == before
+
+
+# ---------- หน้าตาของ log บนจอ ----------
+
+class NotATerminal:
+    """stream ที่ไม่ใช่ terminal เช่นตอน redirect ลงไฟล์"""
+
+    def isatty(self):
+        return False
+
+
+class IsATerminal:
+    def isatty(self):
+        return True
+
+
+class ForcedColour:
+    """
+    บังคับให้ paint() ย้อมสี แล้วคืนของเดิมเสมอ
+
+    เทสมักรันในที่ที่ stdout ไม่ใช่ terminal (CI, pipe) ซึ่ง color_enabled() ตอบ False
+    ถูกต้องแล้ว แต่ทำให้เทสเรื่องสีไม่ได้ทดสอบอะไรเลยถ้าไม่บังคับ
+    """
+
+    def __enter__(self):
+        self.original = core.color_enabled
+        core.color_enabled = lambda stream=None: True
+        return self
+
+    def __exit__(self, *error):
+        core.color_enabled = self.original
+
+
+def _record(level, message):
+    return logging.LogRecord("bot", level, __file__, 1, message, None, None)
+
+
+def test_a_redirected_stream_gets_no_colour():
+    """`python run.py watch > log.txt` ต้องไม่ได้ไฟล์ที่เต็มไปด้วยรหัส escape"""
+    with EnvVar("NO_COLOR", None):
+        assert core.color_enabled(NotATerminal()) is False
+
+
+def test_no_color_turns_colour_off_even_on_a_terminal():
+    """NO_COLOR เป็นธรรมเนียมกลาง คนที่ตั้งไว้ตั้งใจปิดทั้งเครื่อง"""
+    with EnvVar("NO_COLOR", "1"):
+        assert core.color_enabled(IsATerminal()) is False
+
+
+def test_a_terminal_gets_colour():
+    with EnvVar("NO_COLOR", None):
+        assert core.color_enabled(IsATerminal()) is True
+
+
+def test_painting_without_colour_returns_the_text_unchanged():
+    """ปิดสีแล้วข้อความต้องเท่าเดิมทุกตัวอักษร ไม่ใช่แค่ดูคล้ายเดิม"""
+    with EnvVar("NO_COLOR", "1"):
+        assert core.paint("เข้าไม้", core.GREEN) == "เข้าไม้"
+
+
+def test_the_console_line_carries_no_escape_codes_when_colour_is_off():
+    """
+    เครื่องที่ไม่รับสีต้องได้บรรทัดสะอาด ไม่ใช่บรรทัดที่มี \033[ ปนอยู่
+
+    เคสนี้คือ SSH ผ่าน client เก่า หรือตอน pipe ต่อไปเครื่องมืออื่น
+    """
+    line = core.ConsoleFormatter(use_color=False).format(_record(logging.INFO, "ทดสอบ"))
+    assert "\033[" not in line
+    assert line.endswith("ทดสอบ")
+
+
+def test_a_warning_is_painted_so_it_stands_out_in_a_night_of_output():
+    line = core.ConsoleFormatter(use_color=True).format(_record(logging.WARNING, "spread กว้าง"))
+    assert core.YELLOW in line
+    assert line.count(core.RESET) >= 2   # ทั้งสัญลักษณ์และข้อความต้องปิดสีของตัวเอง
+
+
+def test_the_file_format_is_left_alone():
+    """
+    ไฟล์ต้องได้รูปแบบเดิมที่มีวันที่เต็มและชื่อระดับ ไม่ใช่รูปแบบของจอ
+
+    report.py จับกลุ่มบรรทัดใน bot.log ตามรูปแบบนี้ รหัสสีหรือเวลาแบบสั้นลงไฟล์
+    เมื่อไหร่ การจับกลุ่มก็พังทันที
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "bot.log")
+        logger = core.setup_logging(log_file=path, level=logging.DEBUG)
+        logger.warning("ข้อความทดสอบ")
+
+        for handler in logger.handlers:
+            handler.flush()
+
+        written = open(path, encoding="utf-8").read()
+
+    assert "\033[" not in written
+    assert "[WARNING]" in written
+    assert "ข้อความทดสอบ" in written
+
+
+def test_a_verdict_that_enters_is_painted_by_direction():
+    """เขียวคือซื้อ แดงคือขาย — สองอย่างนี้ต้องแยกออกจากกันด้วยตาในหนึ่งวินาที"""
+    with ForcedColour():
+        buy = runner.verdict_line(strategy.Decision("BUY", True, [], []))
+        sell = runner.verdict_line(strategy.Decision("SELL", True, [], []))
+
+    assert core.GREEN in buy
+    assert core.RED in sell
+
+
+def test_a_verdict_keeps_its_words_when_colour_is_off():
+    """สีเป็นของแถม ข้อความต้องเหมือน decision.summary() เป๊ะเมื่อปิดสี"""
+    decision = strategy.Decision("BUY", True, [], [])
+    with EnvVar("NO_COLOR", "1"):
+        assert runner.verdict_line(decision) == decision.summary()
+
+
+# ---------- ไม้ขั้นต่ำที่เสี่ยงเกินงบ ----------
+
+class FakeRealAccount(FakeAccount):
+    trade_mode = mt5.ACCOUNT_TRADE_MODE_REAL
+
+
+def test_a_demo_account_keeps_trading_when_the_smallest_lot_is_over_budget():
+    """Demo มีไว้ให้เห็นบอททำงานจริง ทุนน้อยจนไม้ขั้นต่ำเกินงบก็ยังต้องเดินต่อ"""
+    assert runner.over_budget_is_allowed(FakeAccount()) is True
+
+
+def test_a_live_account_is_blocked_when_the_smallest_lot_is_over_budget():
+    """บัญชีจริงต้องถูกบล็อกไว้ก่อน เพราะเกินงบแปลว่าเสี่ยงมากกว่าที่ตั้งใจ"""
+    original = runner.ALLOW_RISK_OVER_BUDGET
+    runner.ALLOW_RISK_OVER_BUDGET = False
+    try:
+        assert runner.over_budget_is_allowed(FakeRealAccount()) is False
+    finally:
+        runner.ALLOW_RISK_OVER_BUDGET = original
+
+
+def test_a_live_account_may_be_allowed_over_budget_on_purpose():
+    """เปิดสวิตช์เองแล้วบัญชีจริงต้องผ่าน ไม่งั้นสวิตช์นั้นไม่มีความหมาย"""
+    original = runner.ALLOW_RISK_OVER_BUDGET
+    runner.ALLOW_RISK_OVER_BUDGET = True
+    try:
+        assert runner.over_budget_is_allowed(FakeRealAccount()) is True
+    finally:
+        runner.ALLOW_RISK_OVER_BUDGET = original
 
 
 # ---------- path ของ terminal ----------

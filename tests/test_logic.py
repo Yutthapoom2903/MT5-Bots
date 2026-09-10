@@ -779,6 +779,105 @@ def test_report_groups_repeated_log_problems():
     assert "x4" in text
 
 
+def _feature_file(rows):
+    """เขียน market_training_data.csv ชั่วคราวแล้วคืน path ของโฟลเดอร์"""
+    import tempfile
+
+    directory = tempfile.mkdtemp()
+    frame = pd.DataFrame(rows)
+    frame.to_csv(os.path.join(directory, "market_training_data.csv"), index=False)
+    return directory
+
+
+def _report_in(directory, function):
+    import report
+
+    lines = []
+    original = os.getcwd()
+    try:
+        os.chdir(directory)
+        function(report, lines)
+    finally:
+        os.chdir(original)
+
+    return "\n".join(lines)
+
+
+def _candles(times, **columns):
+    return [dict(candle_time=stamp, **{key: value[index] for key, value in columns.items()})
+            for index, stamp in enumerate(times)]
+
+
+def test_report_notices_the_hours_the_bot_was_not_running():
+    # แท่ง M15 ควรห่างกัน 15 นาที ข้ามจาก 10:00 ไป 11:00 คือขาดไป 3 แท่ง
+    directory = _feature_file(_candles(
+        ["2026-09-09 09:30:00", "2026-09-09 09:45:00", "2026-09-09 10:00:00",
+         "2026-09-09 11:00:00"],
+        adx_14=[21.0, 22.0, 23.0, 24.0],
+    ))
+
+    text = _report_in(directory, lambda report, lines: report.summarise_coverage(lines))
+
+    assert "เก็บได้ 4 จาก 7" in text
+    assert "ขาด 3 แท่ง" in text
+
+
+def test_a_weekend_sized_gap_is_not_blamed_on_the_bot():
+    # ตลาดปิดสุดสัปดาห์ทิ้งช่องยาวเสมอ ถ้านับรวมเป็นบอทดับ ตัวเลข uptime จะไร้ความหมาย
+    directory = _feature_file(_candles(
+        ["2026-09-11 21:30:00", "2026-09-11 21:45:00",
+         "2026-09-13 22:00:00", "2026-09-13 22:15:00"],
+        adx_14=[21.0, 22.0, 23.0, 24.0],
+    ))
+
+    text = _report_in(directory, lambda report, lines: report.summarise_coverage(lines))
+
+    assert "ไม่นับเป็นบอทดับ" in text
+    assert "เก็บได้ 4 จาก 4" in text
+
+
+def test_report_says_how_many_candles_cleared_the_adx_threshold():
+    # รายงานเดิมบอกแค่ต่ำสุด/เฉลี่ย/สูงสุด คนอ่านต้องเทียบกับ ADX_MIN เอง
+    directory = _feature_file(_candles(
+        ["2026-09-09 09:30:00", "2026-09-09 09:45:00", "2026-09-09 10:00:00",
+         "2026-09-09 10:15:00"],
+        adx_14=[14.0, 18.0, 25.0, 30.0],
+        spread_points=[20.0, 20.0, 20.0, 20.0],
+        rsi_14=[50.0, 50.0, 50.0, 50.0],
+    ))
+
+    text = _report_in(directory, lambda report, lines: report.summarise_filter_margins(lines))
+
+    assert f"ADX >= {strategy.ADX_MIN:g}" in text
+    assert "ผ่าน 2/4" in text
+
+
+def test_the_daily_table_waits_until_there_is_more_than_one_day():
+    same_day = _feature_file(_candles(
+        ["2026-09-09 09:30:00", "2026-09-09 09:45:00"], adx_14=[21.0, 22.0],
+    ))
+    two_days = _feature_file(_candles(
+        ["2026-09-09 09:30:00", "2026-09-10 09:45:00"], adx_14=[21.0, 22.0],
+    ))
+
+    run = lambda report, lines: report.summarise_by_day(lines)
+
+    assert _report_in(same_day, run) == ""
+    assert "2026-09-10" in _report_in(two_days, run)
+
+
+def test_a_day_with_no_adx_prints_a_dash_not_nan():
+    # แถวก่อน 2026-09-09 ไม่มีคอลัมน์ adx_14 — ตารางต้องไม่โชว์คำว่า nan
+    directory = _feature_file(_candles(
+        ["2026-09-09 09:30:00", "2026-09-10 09:45:00"], adx_14=[float("nan"), 22.0],
+    ))
+
+    text = _report_in(directory, lambda report, lines: report.summarise_by_day(lines))
+
+    assert "nan" not in text
+    assert "-" in text
+
+
 # ---------- หา Symbol ของ broker ----------
 
 class FakeBroker:

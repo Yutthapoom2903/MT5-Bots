@@ -12,10 +12,15 @@ import re
 
 import pandas as pd
 
+import strategy
+
 SIGNAL_LOG = "signal_log.csv"
 FEATURE_LOG = "market_training_data.csv"
 TRADE_LOG = "trade_log.csv"
 BOT_LOG = "bot.log"
+
+CANDLE_MINUTES = 15    # บอทเขียนหนึ่งแถวต่อหนึ่งแท่ง M15 ที่ปิดแล้ว
+LONG_GAP_HOURS = 24    # ยาวกว่านี้ถือว่าตลาดปิด ไม่ใช่บอทดับ
 
 
 def _read(path):
@@ -100,6 +105,147 @@ def summarise_decisions(lines):
             lines.append(f"  {name}: {count} ครั้ง")
 
 
+def _candle_times(frame):
+    """candle_time ที่แปลงเป็นเวลาแล้ว เรียงเก่าไปใหม่ แถวที่แปลงไม่ได้ถูกทิ้ง"""
+    times = pd.to_datetime(frame["candle_time"], errors="coerce").dropna()
+    return times.sort_values().reset_index(drop=True)
+
+
+def find_gaps(times, minutes=CANDLE_MINUTES):
+    """ช่วงที่ไม่มีแท่ง คืน (ก่อนหน้า, ถัดไป, จำนวนแท่งที่หาย) เรียงจากใหญ่ไปเล็ก
+
+    ระยะห่างเกินหนึ่งแท่งแปลว่าช่วงนั้นไม่ได้บันทึก — บอทดับ เน็ตหลุด หรือตลาดปิด
+    ไฟล์นี้แยกสามอย่างนั้นจากกันไม่ได้ จึงรายงานตามที่เห็นแล้วให้คนตัดสิน
+    """
+    step = pd.Timedelta(minutes=minutes)
+    gaps = []
+
+    for index in range(1, len(times)):
+        span = times[index] - times[index - 1]
+        if span > step:
+            gaps.append((times[index - 1], times[index], int(span / step) - 1))
+
+    return sorted(gaps, key=lambda gap: -gap[2])
+
+
+def summarise_coverage(lines, show=5):
+    """บอทเก็บแท่งครบไหม — คำถามแรกหลังปล่อยรันข้ามคืน"""
+    frame = _read(FEATURE_LOG)
+
+    if frame is None or "candle_time" not in frame:
+        return
+
+    times = _candle_times(frame)
+
+    if len(times) < 2:
+        return
+
+    long_gap = pd.Timedelta(hours=LONG_GAP_HOURS) / pd.Timedelta(minutes=CANDLE_MINUTES)
+    gaps = find_gaps(times)
+    closed = [gap for gap in gaps if gap[2] >= long_gap]
+    missed = [gap for gap in gaps if gap[2] < long_gap]
+
+    lines.append(_section("ความต่อเนื่อง"))
+
+    dropped = sum(gap[2] for gap in missed)
+    expected = len(times) + dropped
+    lines.append(f"เก็บได้ {len(times)} จาก {expected} แท่งที่ควรมี ({len(times) / expected:.0%})")
+
+    if not gaps:
+        lines.append("ไม่มีช่วงที่ขาดเลย บอทรันต่อเนื่องตลอด")
+        return
+
+    if missed:
+        hours = dropped * CANDLE_MINUTES / 60
+        lines.append(f"ช่วงที่ขาด {len(missed)} ครั้ง รวม {dropped} แท่ง (~{hours:.1f} ชม.):")
+        for start, end, count in missed[:show]:
+            lines.append(f"  {start} -> {end}  ขาด {count} แท่ง")
+        if len(missed) > show:
+            lines.append(f"  (อีก {len(missed) - show} ช่วง)")
+
+    for start, end, count in closed:
+        lines.append(f"ช่วงยาว {start} -> {end} ({count} แท่ง) — น่าจะสุดสัปดาห์หรือวันหยุด ไม่นับเป็นบอทดับ")
+
+
+def _number(value):
+    """ตัวเลขหนึ่งตำแหน่ง หรือขีดถ้าไม่มีค่า (แถวเก่าไม่มี adx_14)"""
+    return f"{value:.1f}" if pd.notna(value) else "-"
+
+
+def summarise_by_day(lines):
+    """แยกรายวัน — ค่าเฉลี่ยรวมหลายวันกลบวันที่ตลาดวิ่งจริง"""
+    frame = _read(FEATURE_LOG)
+
+    if frame is None or "candle_time" not in frame:
+        return
+
+    times = pd.to_datetime(frame["candle_time"], errors="coerce")
+    frame = frame[times.notna()].copy()
+    frame["_day"] = times.dropna().dt.date
+
+    days = sorted(frame["_day"].unique())
+
+    if len(days) < 2:
+        return    # วันเดียวก็ดูจากสรุปรวมข้างบนพอ
+
+    lines.append(_section("รายวัน"))
+    lines.append(f"{'วัน':<12}{'แท่ง':>6}{'สัญญาณ':>9}{'เข้า':>7}{'ADX':>8}{'spread':>9}")
+
+    for day in days:
+        rows = frame[frame["_day"] == day]
+        signals = rows["bot_signal"].isin(["BUY", "SELL"]).sum() if "bot_signal" in rows else 0
+        entered = (rows["bot_decision"] == "ENTER").sum() if "bot_decision" in rows else 0
+        adx = pd.to_numeric(rows.get("adx_14"), errors="coerce").mean()
+        spread = pd.to_numeric(rows.get("spread_points"), errors="coerce").mean()
+
+        lines.append(
+            f"{str(day):<12}{len(rows):>6}{signals:>9}{entered:>7}"
+            f"{_number(adx):>8}{_number(spread):>9}"
+        )
+
+
+def summarise_filter_margins(lines):
+    """แต่ละแท่งห่างจากเกณฑ์ของตัวกรองแค่ไหน
+
+    ของเดิมบอกแค่ต่ำสุด/เฉลี่ย/สูงสุด คนอ่านต้องจำเกณฑ์ใน strategy.py เองแล้วคิดในหัว
+    ว่าผ่านกี่แท่ง ตรงนี้คิดให้ — เป็นการบรรยายข้อมูลเฉยๆ ไม่ใช่ข้อเสนอให้ไปลดเกณฑ์
+    """
+    frame = _read(FEATURE_LOG)
+
+    if frame is None:
+        return
+
+    lines.append(_section("ระยะห่างจากเกณฑ์ตัวกรอง"))
+
+    adx = pd.to_numeric(frame.get("adx_14"), errors="coerce").dropna()
+    if len(adx):
+        passed = (adx >= strategy.ADX_MIN).sum()
+        lines.append(
+            f"ADX >= {strategy.ADX_MIN:g} (ADX_MIN): ผ่าน {passed}/{len(adx)} "
+            f"({passed / len(adx):.0%}) ค่ากลาง {adx.median():.1f}"
+        )
+
+    spread = pd.to_numeric(frame.get("spread_points"), errors="coerce").dropna()
+    if len(spread):
+        passed = (spread <= strategy.MAX_SPREAD_POINTS).sum()
+        headroom = 1 - spread.max() / strategy.MAX_SPREAD_POINTS
+        lines.append(
+            f"spread <= {strategy.MAX_SPREAD_POINTS:g} (MAX_SPREAD_POINTS): ผ่าน {passed}/{len(spread)} "
+            f"({passed / len(spread):.0%}) ค่ากลาง {spread.median():.1f} "
+            f"กว้างสุด {spread.max():.1f} เหลือที่ว่าง {headroom:.0%}"
+        )
+
+    rsi = pd.to_numeric(frame.get("rsi_14"), errors="coerce").dropna()
+    if len(rsi):
+        inside = ((rsi < strategy.RSI_MAX_FOR_BUY) & (rsi > strategy.RSI_MIN_FOR_SELL)).sum()
+        lines.append(
+            f"RSI อยู่ระหว่าง {strategy.RSI_MIN_FOR_SELL:g}-{strategy.RSI_MAX_FOR_BUY:g}: "
+            f"{inside}/{len(rsi)} แท่ง (นอกช่วงคือแท่งที่ราคายืดจนไม่ไล่ตาม)"
+        )
+
+    lines.append("ตัวเลขนี้บอกว่าตลาดเป็นยังไง ไม่ได้แปลว่าเกณฑ์ตั้งผิด — ดูหลายวันก่อนค่อยขยับ")
+
+
 def summarise_trades(lines):
     """คำสั่งที่ส่งไปจริง"""
     frame = _read(TRADE_LOG)
@@ -171,6 +317,17 @@ def next_steps(lines):
         lines.append("บอทยังไม่บันทึกแท่งไหนเลย — ตรวจว่ารันค้างไว้จริงและตลาดเปิดอยู่")
         return
 
+    if "candle_time" in features:
+        times = _candle_times(features)
+        if len(times) > 1:
+            long_gap = pd.Timedelta(hours=LONG_GAP_HOURS) / pd.Timedelta(minutes=CANDLE_MINUTES)
+            dropped = sum(gap[2] for gap in find_gaps(times) if gap[2] < long_gap)
+            if dropped and len(times) / (len(times) + dropped) < 0.9:
+                lines.append(
+                    f"ขาดไป {dropped} แท่งระหว่างที่ตลาดเปิด — ดูว่าบอทดับ เน็ตหลุด "
+                    "หรือ MT5 ปิดตัวเอง ก่อนจะเชื่อสถิติข้างบน"
+                )
+
     if len(features) < 96:
         lines.append(f"มีข้อมูลแค่ {len(features)} แท่ง (ไม่ถึงหนึ่งวัน) ปล่อยเก็บต่ออีกหน่อย")
 
@@ -188,6 +345,9 @@ def build_report():
     lines = ["=== สรุปการทำงานของบอท ==="]
 
     summarise_candles(lines)
+    summarise_coverage(lines)
+    summarise_by_day(lines)
+    summarise_filter_margins(lines)
     summarise_decisions(lines)
     summarise_trades(lines)
     summarise_log(lines)

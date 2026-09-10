@@ -32,7 +32,7 @@ mt5_trade.py    broker-facing only: price/volume normalization, stop distance, f
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          129 logic tests, no MT5 required
+tests/          134 logic tests, no MT5 required
 ```
 
 ## Running
@@ -54,7 +54,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 129 logic tests, runs under WSL
+python run.py test         # 134 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -230,6 +230,16 @@ The bot is meant to run at home without a watcher, so the loop is defensive:
   intended way to read all of it back — it groups repeated log lines by shape, so a
   thousand identical warnings collapse to one row with a count.
 - Market closed (`symbol_is_tradable()` false) backs the poll off to `MARKET_CLOSED_SLEEP`.
+
+`report.py` answers the daily questions in this order: **did it stay up**
+(`summarise_coverage()` counts the M15 candles missing from `candle_time` — a gap longer
+than `LONG_GAP_HOURS` is filed as market-closed rather than downtime, or a weekend makes
+uptime read 30%), **what changed day to day** (`summarise_by_day()`, which stays hidden
+until there are two days to compare), and **how far each candle sat from the thresholds**
+(`summarise_filter_margins()` reads `ADX_MIN` / `MAX_SPREAD_POINTS` / the RSI bounds
+straight out of `strategy.py`, so the numbers cannot drift from the live filters). That
+last one is descriptive on purpose — a pass rate is what the market did, not an argument
+for moving a threshold; the sweep is where thresholds get judged.
 
 `trade.summarize_deals()` is pure and takes a deal list so the breaker is testable; only
 `deals_today()` touches MT5.

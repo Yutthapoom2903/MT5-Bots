@@ -35,7 +35,7 @@ outcomes.py     labels each logged candle with what the market did next, then me
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          146 logic tests, no MT5 required
+tests/          151 logic tests, no MT5 required
 ```
 
 ## Running
@@ -57,7 +57,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 146 logic tests, runs under WSL
+python run.py test         # 151 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -267,7 +267,17 @@ accumulating data, not build output. `bot.log` and `bot_state.json` are gitignor
   hand-labelled columns — it scores the human, not the bot.
 
 Column sets have changed over time: rows before 2026-09-09 used a simple rolling mean for
-RSI/ATR (now Wilder) and lack `adx_14`, `m5_trend`, `bot_decision`, `bot_blockers`.
+RSI/ATR (now Wilder) and lack `adx_14`, `m5_trend`, `bot_decision`, `bot_blockers`. Rows
+before 2026-09-10 lack `broker_gmt_offset`.
+
+`candle_time` is **broker server time**, which is usually GMT+2/+3 and shifts with DST —
+and brokers are documented to handle those transitions inconsistently. Every row therefore
+carries `broker_gmt_offset` from `core.broker_gmt_offset()`. Without it, hour 17 before a
+DST change and hour 17 after it are different hours with no way to tell them apart, and
+`summarise_hours()` would blend them silently; it now prints the offset and calls out a
+file that contains more than one. Anything reading a column that old rows may not have
+must go through `report._numeric()` / the guard in `outcomes.numbers()` — `frame.get()`
+alone returns `None`, and `pd.to_numeric(None)` is a bare float with no `.dropna()`.
 
 `core.append_csv()` handles that drift. Writing the header only when the file was absent
 left `market_training_data.csv` with a 22-column header above 26-column rows, so pandas

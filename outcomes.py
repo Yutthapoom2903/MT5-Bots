@@ -72,7 +72,11 @@ def add_forward_outcomes(frame, horizon=HORIZON, sl_mult=SL_ATR_MULT):
         return out.drop(columns="_time")
 
     def numbers(name):
-        return pd.to_numeric(out.get(name), errors="coerce").to_numpy(dtype=float)
+        """คอลัมน์ตัวเลข — เต็มไปด้วย NaN ถ้าไฟล์ยังไม่มีคอลัมน์นั้น (ชุดคอลัมน์เปลี่ยนมาหลายรอบ)"""
+        if name not in out:
+            return np.full(len(out), np.nan)
+
+        return pd.to_numeric(out[name], errors="coerce").to_numpy(dtype=float)
 
     close, high, low = numbers("close"), numbers("high"), numbers("low")
     risk = numbers("atr_14") * sl_mult

@@ -39,6 +39,18 @@ def _section(title):
     return f"\n--- {title} ---"
 
 
+def _numeric(frame, column):
+    """คอลัมน์ตัวเลข — Series ว่างถ้าไฟล์ยังไม่มีคอลัมน์นั้น
+
+    ชุดคอลัมน์เปลี่ยนมาหลายรอบ (adx_14, broker_gmt_offset เพิ่มทีหลัง) การ get()
+    เฉยๆ คืน None แล้ว pd.to_numeric(None) ให้ float ตัวเดียวซึ่งไม่มี .dropna()
+    """
+    if column not in frame:
+        return pd.Series(dtype=float)
+
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
 def _counts(series):
     return ", ".join(f"{name} {count}" for name, count in series.value_counts().items())
 
@@ -200,13 +212,24 @@ def summarise_hours(lines):
     if len(times) < 2:
         return
 
-    counts = times.dt.hour.value_counts()
-    covered = sorted(counts.index)
+    covered = sorted(times.dt.hour.unique())
 
     lines.append(_section("ชั่วโมงที่ครอบคลุม"))
     lines.append(f"เก็บได้ {len(covered)} จาก 24 ชั่วโมง (เวลาเซิร์ฟเวอร์ broker): "
                  + ", ".join(f"{hour:02d}" for hour in covered))
     lines.append("สถิติทุกอย่างในรายงานนี้เป็นของชั่วโมงพวกนี้เท่านั้น ไม่ใช่ของตลาดทั้งวัน")
+
+    offsets = _numeric(frame, "broker_gmt_offset").dropna().unique()
+
+    if len(offsets) == 1:
+        lines.append(f"เวลาเซิร์ฟเวอร์ = GMT{int(offsets[0]):+d} ตลอดทั้งไฟล์")
+    elif len(offsets) > 1:
+        # DST ของ broker ขยับปีละสองครั้ง ชั่วโมงเดียวกันในไฟล์จึงไม่ใช่เวลาเดียวกัน
+        listed = ", ".join(f"GMT{int(value):+d}" for value in sorted(offsets))
+        lines.append(f"**เวลาเซิร์ฟเวอร์เปลี่ยนระหว่างเก็บ: {listed}** — ชั่วโมงในไฟล์นี้")
+        lines.append("ไม่ใช่เวลาเดียวกันทุกแถว แยกวิเคราะห์ทีละ offset ก่อนสรุปอะไรที่อิงชั่วโมง")
+    else:
+        lines.append("แถวเหล่านี้ยังไม่มี broker_gmt_offset — แถวที่เก็บหลังจากนี้จะมี")
 
 
 def _number(value):
@@ -237,8 +260,8 @@ def summarise_by_day(lines):
         rows = frame[frame["_day"] == day]
         signals = rows["bot_signal"].isin(["BUY", "SELL"]).sum() if "bot_signal" in rows else 0
         entered = (rows["bot_decision"] == "ENTER").sum() if "bot_decision" in rows else 0
-        adx = pd.to_numeric(rows.get("adx_14"), errors="coerce").mean()
-        spread = pd.to_numeric(rows.get("spread_points"), errors="coerce").mean()
+        adx = _numeric(rows, "adx_14").mean()
+        spread = _numeric(rows, "spread_points").mean()
 
         lines.append(
             f"{str(day):<12}{len(rows):>6}{signals:>9}{entered:>7}"
@@ -259,7 +282,7 @@ def summarise_filter_margins(lines):
 
     lines.append(_section("ระยะห่างจากเกณฑ์ตัวกรอง"))
 
-    adx = pd.to_numeric(frame.get("adx_14"), errors="coerce").dropna()
+    adx = _numeric(frame, "adx_14").dropna()
     if len(adx):
         passed = (adx >= strategy.ADX_MIN).sum()
         lines.append(
@@ -267,7 +290,7 @@ def summarise_filter_margins(lines):
             f"({passed / len(adx):.0%}) ค่ากลาง {adx.median():.1f}"
         )
 
-    spread = pd.to_numeric(frame.get("spread_points"), errors="coerce").dropna()
+    spread = _numeric(frame, "spread_points").dropna()
     if len(spread):
         passed = (spread <= strategy.MAX_SPREAD_POINTS).sum()
         headroom = 1 - spread.max() / strategy.MAX_SPREAD_POINTS
@@ -277,7 +300,7 @@ def summarise_filter_margins(lines):
             f"กว้างสุด {spread.max():.1f} เหลือที่ว่าง {headroom:.0%}"
         )
 
-    rsi = pd.to_numeric(frame.get("rsi_14"), errors="coerce").dropna()
+    rsi = _numeric(frame, "rsi_14").dropna()
     if len(rsi):
         inside = ((rsi < strategy.RSI_MAX_FOR_BUY) & (rsi > strategy.RSI_MIN_FOR_SELL)).sum()
         lines.append(
@@ -376,6 +399,11 @@ def next_steps(lines):
     if "bot_decision" in features and (features["bot_decision"] == "ENTER").sum() == 0:
         lines.append("ยังไม่มีสัญญาณผ่านตัวกรองเลย ดูรายการตัวกรองข้างบนว่าตัวไหนบล็อกบ่อยสุด")
         lines.append("ถ้าเป็น ADX หรือเทรนด์ H1 แปลว่าตลาดช่วงนี้ไม่มีเทรนด์ ถือว่าบอททำงานถูก")
+
+    if trades is None:
+        lines.append("ยังไม่เคยส่งคำสั่งจริงสักครั้ง — retcode, filling mode และระยะ stop ขั้นต่ำ")
+        lines.append("ของ broker ยังไม่เคยถูกพิสูจน์ รัน `python run.py --trade` บนบัญชี Demo")
+        lines.append("(ALLOW_LIVE_ACCOUNT = False กันบัญชีจริงไว้อยู่แล้ว)")
 
     if trades is not None and "status" in trades and (trades["status"] != "OK").any():
         lines.append("มีคำสั่งที่ broker ปฏิเสธ — เอาข้อความ retcode ข้างบนไปหาสาเหตุ")

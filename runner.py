@@ -142,6 +142,10 @@ def build_context():
         "h1_trend": core.ma_trend(h1),
         "m5_trend": core.ma_trend(m5),
         "spread_points": core.spread_points(SYMBOL),
+
+        # เวลาในแท่งเป็นเวลาเซิร์ฟเวอร์ broker ซึ่งขยับตาม DST ปีละสองครั้ง
+        # ไม่บันทึกไว้ตอนเก็บ แถวเก่ากับแถวใหม่จะอยู่คนละกรอบเวลาโดยไม่มีใครรู้
+        "gmt_offset": core.broker_gmt_offset(SYMBOL),
     }
 
     return context, candle
@@ -167,6 +171,7 @@ def log_features(context, candle, decision):
         "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "candle_time": context["candle_time"],
         "symbol": SYMBOL,
+        "broker_gmt_offset": context["gmt_offset"],
 
         "open": round(float(candle["open"]), 2),
         "high": round(float(candle["high"]), 2),

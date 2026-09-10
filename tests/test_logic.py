@@ -1031,6 +1031,89 @@ def test_the_outcome_report_says_so_when_nothing_can_be_labelled_yet():
     assert "ยังไม่มีแท่งไหนติดป้ายได้" in text
 
 
+def test_a_broker_that_shifted_for_dst_mid_file_is_called_out():
+    # DST ของ broker ขยับปีละสองครั้ง ชั่วโมง 17 ก่อนและหลังขยับไม่ใช่เวลาเดียวกัน
+    directory = _feature_file(_candles(
+        ["2026-09-09 19:00:00", "2026-09-09 19:15:00"],
+        adx_14=[21.0, 22.0], broker_gmt_offset=[3, 2],
+    ))
+
+    text = _report_in(directory, lambda report, lines: report.summarise_hours(lines))
+
+    assert "เวลาเซิร์ฟเวอร์เปลี่ยนระหว่างเก็บ" in text
+    assert "GMT+2" in text and "GMT+3" in text
+
+
+def test_one_steady_offset_is_reported_without_alarm():
+    directory = _feature_file(_candles(
+        ["2026-09-09 19:00:00", "2026-09-09 19:15:00"],
+        adx_14=[21.0, 22.0], broker_gmt_offset=[3, 3],
+    ))
+
+    text = _report_in(directory, lambda report, lines: report.summarise_hours(lines))
+
+    assert "GMT+3 ตลอดทั้งไฟล์" in text
+    assert "เปลี่ยนระหว่างเก็บ" not in text
+
+
+def test_a_column_the_old_rows_never_had_does_not_crash_the_report():
+    # ชุดคอลัมน์เปลี่ยนมาหลายรอบ รายงานต้องอ่านไฟล์เก่าได้โดยไม่ระเบิด
+    directory = _feature_file(_candles(
+        ["2026-09-09 19:00:00", "2026-09-09 19:15:00", "2026-09-10 19:00:00"],
+    ))
+
+    import report
+
+    original = os.getcwd()
+    try:
+        os.chdir(directory)
+        text = report.build_report()
+    finally:
+        os.chdir(original)
+
+    assert "สรุปการทำงานของบอท" in text
+
+
+def test_the_report_says_the_order_path_has_never_been_proven():
+    directory = _feature_file(_candles(
+        ["2026-09-09 19:00:00", "2026-09-09 19:15:00"], adx_14=[21.0, 22.0],
+    ))
+
+    text = _report_in(directory, lambda report, lines: report.next_steps(lines))
+
+    assert "ยังไม่เคยส่งคำสั่งจริง" in text
+    assert "Demo" in text
+
+
+def test_every_logged_candle_records_the_brokers_gmt_offset():
+    """เวลาในแท่งเป็นเวลาเซิร์ฟเวอร์ ถ้าไม่เก็บ offset ไว้ด้วย ชั่วโมงในไฟล์ตีความไม่ได้"""
+    import runner
+
+    written = {}
+    original = runner.core.append_csv
+    runner.core.append_csv = lambda path, row: written.update(row)
+
+    context = {
+        "candle_time": "2026-09-09 19:00:00", "close": 4400.0,
+        "ma_fast": 4399.0, "ma_slow": 4398.0, "rsi": 50.0, "atr": 8.0, "adx": 22.0,
+        "h1_trend": "UPTREND", "m5_trend": "UPTREND", "spread_points": 30.0,
+        "m15_signal": "HOLD", "gmt_offset": 3,
+    }
+    candle = {"open": 4399.0, "high": 4402.0, "low": 4397.0, "close": 4400.0}
+
+    class NoBlockers:
+        enter = False
+        blockers = []
+
+    try:
+        runner.log_features(context, candle, NoBlockers())
+    finally:
+        runner.core.append_csv = original
+
+    assert written["broker_gmt_offset"] == 3
+
+
+
 # ---------- หา Symbol ของ broker ----------
 
 class FakeBroker:

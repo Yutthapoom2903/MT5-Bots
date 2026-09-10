@@ -16,6 +16,7 @@
 """
 
 import html
+import json
 import time
 from collections import namedtuple
 from datetime import datetime
@@ -39,6 +40,10 @@ SEND_NEAR_MISS = True     # มีสัญญาณตัดกันแต่�
 # ---------- พฤติกรรมการส่ง ----------
 # บอทรันข้ามคืนข้างเตียง ชั่วโมงพวกนี้ยังส่งครบแต่ไม่ปลุก
 QUIET_HOURS = tuple(range(0, 7))   # เที่ยงคืน–ก่อนเจ็ดโมง
+
+# ปุ่มใต้ข้อความสรุป — กดสั่งบอทจากมือถือได้โดยไม่ต้อง SSH เข้าเครื่อง
+SEND_BUTTONS = True
+CONTROL_POLL_LIMIT = 20   # ดึงคำสั่งกี่รายการต่อรอบ
 
 # HOLD มาทุก 15 นาทีตลอดคืน = ~44 ข้อความต่อรอบ รวมเป็นสรุปทุกกี่แท่งแทน
 # 4 แท่ง M15 = ชั่วโมงละครั้ง ตั้งเป็น 1 คือกลับไปส่งทุกแท่งแบบเดิม
@@ -214,6 +219,72 @@ def threshold_dot(value, limit, higher_is_better=True):
 
     passed = value >= limit if higher_is_better else value <= limit
     return DOT_GOOD if passed else DOT_BAD
+
+
+# คำสั่งที่รับจากปุ่ม — จงใจไม่มี "ปิดไม้ทั้งหมด" เพราะปุ่มเดียวที่กดพลาดในกระเป๋า
+# แล้วปิดไม้จริงเป็นราคาที่แพงเกินไปสำหรับความสะดวก หยุดเข้าไม้ใหม่ให้ผลที่ต้องการ
+# โดยไม่ทำอะไรกับไม้ที่ถืออยู่ ซึ่งยังถูกดูแล SL ตามปกติ
+CONTROL_ACTIONS = {
+    "status": "ขอสรุปตอนนี้",
+    "pause": "หยุดเข้าไม้ใหม่",
+    "resume": "กลับมาเข้าไม้",
+}
+
+
+def keyboard(*rows):
+    """reply_markup ของ Telegram — โครงสร้างล้วน ไม่ยิงเน็ต"""
+    return {"inline_keyboard": [
+        [{"text": text, "callback_data": data} for text, data in row] for row in rows
+    ]}
+
+
+def control_keyboard(paused=False):
+    """ปุ่มใต้ข้อความสรุป — ปุ่มหยุด/กลับมาสลับกันตามสถานะจริง ไม่ใช่โชว์ทั้งคู่"""
+    if not SEND_BUTTONS:
+        return None
+
+    toggle = ("▶️ กลับมาเข้าไม้", "resume") if paused else ("⏸ หยุดเข้าไม้ใหม่", "pause")
+    return keyboard([("📅 สรุปตอนนี้", "status"), toggle])
+
+
+def parse_updates(updates, chat_id=None):
+    """
+    แปลงคำตอบของ getUpdates เป็นรายการคำสั่ง คืน (คำสั่ง, update_id ล่าสุด)
+
+    รับทั้งปุ่มที่กดและข้อความที่พิมพ์เอง (/status /pause /resume)
+    ทิ้งของที่มาจากแชทอื่นเสมอ — ใครก็ตามที่เจอชื่อบอทสั่งให้หยุดเทรดได้ไม่ได้
+    บริสุทธิ์ทั้งหมด เทสได้โดยไม่ต้องต่อเน็ต
+    """
+    commands = []
+    highest = None
+
+    for update in updates or []:
+        update_id = update.get("update_id")
+        if update_id is not None:
+            highest = update_id if highest is None else max(highest, update_id)
+
+        query = update.get("callback_query")
+
+        if query:
+            action = query.get("data")
+            origin = ((query.get("message") or {}).get("chat") or {}).get("id")
+            callback_id = query.get("id")
+        else:
+            message = update.get("message") or {}
+            text = str(message.get("text", "")).strip().lstrip("/").split("@")[0]
+            action = text if text in CONTROL_ACTIONS else None
+            origin = (message.get("chat") or {}).get("id")
+            callback_id = None
+
+        if action not in CONTROL_ACTIONS:
+            continue
+
+        if chat_id is not None and str(origin) != str(chat_id):
+            continue
+
+        commands.append({"action": action, "callback_id": callback_id})
+
+    return commands, highest
 
 
 def money(amount, currency=""):
@@ -436,12 +507,14 @@ class Notifier:
         self._last_at = {}
         self._last_body = {}
         self._hold_window = []  # แท่ง HOLD ที่รอรวมเป็นสรุปเดียว
+        self._update_offset = None   # update_id ถัดไปที่จะอ่านจาก getUpdates
 
     @property
     def configured(self):
         return bool(self.token and self.chat_id)
 
-    def send(self, category_key, title, lines, key=None, loud=None, footer=None, force=False):
+    def send(self, category_key, title, lines, key=None, loud=None, footer=None, force=False,
+             buttons=None):
         """
         คืน True เมื่อส่งออกไปจริง — False เมื่อหมวดปิด ซ้ำ ติดคูลดาวน์ หรือส่งไม่สำเร็จ
 
@@ -472,7 +545,8 @@ class Notifier:
             return False
 
         loud = category.loud if loud is None else loud
-        return bool(self.transport(message, quiet=not loud or self._in_quiet_hours()))
+        return bool(self.transport(message, quiet=not loud or self._in_quiet_hours(),
+                                   buttons=buttons))
 
     def _is_repeat(self, stamp, message, now, cooldown):
         last_at = self._last_at.get(stamp)
@@ -494,7 +568,7 @@ class Notifier:
         if len(self.sent) > REMEMBER_LAST:
             del self.sent[:-REMEMBER_LAST]
 
-    def _post(self, message, quiet=False):
+    def _post(self, message, quiet=False, buttons=None):
         """
         ส่งจริง — ล้มเหลวได้โดยไม่ทำให้บอทหยุด แต่ต้องเห็นใน log เสมอ
 
@@ -509,6 +583,9 @@ class Notifier:
             "disable_web_page_preview": True,
             "disable_notification": quiet,
         }
+
+        if buttons:
+            payload["reply_markup"] = json.dumps(buttons)
 
         for attempt in (1, 2):
             try:
@@ -766,8 +843,57 @@ class Notifier:
             f"<code>ทุนปิดวัน {balance:,.2f} {escape(currency)}</code>",
         ], key=f"day-{day}", loud=True, footer=symbol)
 
+    # ---------- คำสั่งที่กดกลับมา ----------
+
+    def take_commands(self):
+        """
+        ดึงปุ่มที่ถูกกดตั้งแต่รอบก่อน — ล้มเหลวคืนลิสต์ว่าง ไม่มีทางทำให้ลูปตาย
+
+        offset เก็บในหน่วยความจำเหมือนสถานะอื่นของคลาสนี้ restart แล้วอ่านซ้ำ
+        หนึ่งรอบไม่เป็นไร คำสั่งทุกตัวเป็นการตั้งสถานะ ไม่ใช่การส่งคำสั่งซื้อขาย
+        """
+        if not self.configured or not SEND_BUTTONS:
+            return []
+
+        payload = {"timeout": 0, "limit": CONTROL_POLL_LIMIT,
+                   "allowed_updates": json.dumps(["message", "callback_query"])}
+
+        if self._update_offset is not None:
+            payload["offset"] = self._update_offset
+
+        status, body = call_api(self.token, "getUpdates", payload)
+
+        if status != 200 or not body.get("ok"):
+            self.logger.debug("อ่านคำสั่งจาก Telegram ไม่ได้: %s", body.get("description"))
+            return []
+
+        commands, highest = parse_updates(body.get("result"), self.chat_id)
+
+        if highest is not None:
+            self._update_offset = highest + 1
+
+        return commands
+
+    def acknowledge(self, callback_id, text):
+        """ตอบปุ่มที่กด ไม่งั้น Telegram หมุนติ้วอยู่ห้าวินาทีเหมือนบอทค้าง"""
+        if not callback_id or not self.configured:
+            return False
+
+        status, _ = call_api(self.token, "answerCallbackQuery",
+                             {"callback_query_id": callback_id, "text": text})
+        return status == 200
+
+    def entries_paused(self, symbol, paused):
+        """ยืนยันว่าคำสั่งที่กดมีผลแล้ว — กดแล้วเงียบคือกดแล้วไม่รู้ว่าโดนไหม"""
+        title = "หยุดเข้าไม้ใหม่แล้ว" if paused else "กลับมาเข้าไม้ได้แล้ว"
+        detail = ("ไม้ที่เปิดอยู่ยังถูกดูแล SL ตามปกติ หยุดแค่การเข้าไม้ใหม่"
+                  if paused else "รอบถัดไปที่สัญญาณผ่านตัวกรองจะเข้าไม้ตามปกติ")
+
+        self.send("risk", title, [detail], key="paused", force=True,
+                  buttons=control_keyboard(paused), footer=symbol)
+
     def heartbeat(self, symbol, equity, currency, positions, summary, last_candle,
-                  uptime_seconds, stats=None):
+                  uptime_seconds, stats=None, paused=False):
         lines = [
             f"<code>Equity   {equity:10,.2f} {escape(currency)}</code>",
             f"<code>ถืออยู่   {len(positions)} ไม้</code>",
@@ -796,8 +922,11 @@ class Notifier:
         if night:
             lines += ["", *night]
 
-        self.send("summary", "ยังทำงานอยู่", lines,
-                  key="heartbeat", loud=False, footer=symbol)
+        if paused:
+            lines.insert(0, "<b>⏸ หยุดเข้าไม้ใหม่อยู่</b>")
+
+        self.send("summary", "ยังทำงานอยู่", lines, key="heartbeat", loud=False,
+                  footer=symbol, buttons=control_keyboard(paused), force=True)
 
 
 # ---------- วินิจฉัยตอนแจ้งเตือนไม่มา ----------

@@ -1418,14 +1418,16 @@ class Recorder:
 
     def __init__(self):
         self.messages = []
+        self.buttons = []
         self.now = 1000.0
         self.notifier = notify.Notifier(
             "token", "chat", FakeLogger(),
             transport=self._capture, clock=lambda: self.now,
         )
 
-    def _capture(self, message, quiet=False):
+    def _capture(self, message, quiet=False, buttons=None):
         self.messages.append((message, quiet))
+        self.buttons.append(buttons)
         return True
 
     def tick(self, seconds):
@@ -1826,6 +1828,181 @@ def test_the_night_summary_names_the_filter_that_blocked_most_often():
 def test_the_night_summary_is_skipped_when_there_is_nothing_to_say():
     assert notify.night_lines(None) == []
     assert notify.night_lines({}) == []
+
+
+# ---------- ปุ่มสั่งงานจาก Telegram ----------
+
+def _callback(data, chat_id="chat", update_id=1):
+    return {"update_id": update_id,
+            "callback_query": {"id": "cb1", "data": data,
+                               "message": {"chat": {"id": chat_id}}}}
+
+
+def test_a_button_from_another_chat_is_ignored():
+    """
+    ใครก็ตามที่เจอชื่อบอทกดหยุดการเทรดไม่ได้
+
+    บอทตอบทุกคนที่ทักได้ตามค่าเริ่มต้นของ Telegram คำสั่งจึงต้องกรองด้วย chat_id
+    ที่ตั้งไว้เสมอ ไม่ใช่เชื่อทุก update ที่เข้ามา
+    """
+    commands, _ = notify.parse_updates([_callback("pause", chat_id="คนอื่น")], chat_id="chat")
+
+    assert commands == []
+
+
+def test_a_button_from_the_configured_chat_is_obeyed():
+    commands, highest = notify.parse_updates([_callback("pause")], chat_id="chat")
+
+    assert commands == [{"action": "pause", "callback_id": "cb1"}]
+    assert highest == 1
+
+
+def test_a_typed_command_works_like_the_button():
+    """มือถือบางเครื่องกดปุ่มเก่าไม่ได้ พิมพ์ /resume ต้องได้ผลเหมือนกัน"""
+    update = {"update_id": 7, "message": {"text": "/resume", "chat": {"id": "chat"}}}
+    commands, highest = notify.parse_updates([update], chat_id="chat")
+
+    assert commands[0]["action"] == "resume"
+    assert commands[0]["callback_id"] is None
+    assert highest == 7
+
+
+def test_unknown_button_data_is_dropped():
+    commands, _ = notify.parse_updates([_callback("ปิดไม้ทั้งหมด")], chat_id="chat")
+
+    assert commands == []
+
+
+def test_the_offset_follows_the_highest_update_even_when_nothing_matched():
+    """
+    update ที่ไม่ใช่คำสั่งก็ต้องดันเลขไปข้างหน้า
+
+    ไม่งั้นข้อความเดิมถูกอ่านซ้ำทุกรอบตลอดคืน
+    """
+    chatter = {"update_id": 42, "message": {"text": "สวัสดี", "chat": {"id": "chat"}}}
+    commands, highest = notify.parse_updates([chatter], chat_id="chat")
+
+    assert commands == []
+    assert highest == 42
+
+
+def test_the_keyboard_offers_the_opposite_of_the_current_state():
+    """หยุดอยู่ต้องเห็นปุ่มกลับมา ไม่ใช่เห็นทั้งสองปุ่มแล้วเดาเอง"""
+    running = notify.control_keyboard(paused=False)["inline_keyboard"][0]
+    paused = notify.control_keyboard(paused=True)["inline_keyboard"][0]
+
+    assert [button["callback_data"] for button in running] == ["status", "pause"]
+    assert [button["callback_data"] for button in paused] == ["status", "resume"]
+
+
+def test_no_keyboard_when_the_switch_is_off():
+    with SwitchedTo("SEND_BUTTONS", False):
+        assert notify.control_keyboard() is None
+
+
+def test_a_paused_bot_says_so_in_its_heartbeat():
+    recorder = Recorder()
+    recorder.notifier.heartbeat("XAUUSD", 1000.0, "USD", [], {}, "-", 60, paused=True)
+
+    assert "หยุดเข้าไม้ใหม่อยู่" in recorder.messages[0][0]
+    assert recorder.buttons[0]["inline_keyboard"][0][1]["callback_data"] == "resume"
+
+
+class FakeNotifier:
+    """Notifier ปลอมที่คืนคำสั่งตามสั่งและจดว่าถูกเรียกอะไรบ้าง"""
+
+    def __init__(self, commands):
+        self.commands = commands
+        self.acknowledged = []
+        self.paused_calls = []
+        self.heartbeats = 0
+
+    def take_commands(self):
+        commands, self.commands = self.commands, []
+        return commands
+
+    def acknowledge(self, callback_id, text):
+        self.acknowledged.append(text)
+        return True
+
+    def entries_paused(self, symbol, paused):
+        self.paused_calls.append(paused)
+
+    def heartbeat(self, *args, **kwargs):
+        self.heartbeats += 1
+
+
+class SwappedRunner:
+    """
+    สลับของที่ runner ใช้ตอนรับคำสั่ง แล้วคืนของเดิมเสมอ
+
+    heartbeat ตัวจริงอ่าน position จาก MT5 ซึ่งเทสออฟไลน์เรียกไม่ได้ — ที่ต้องพิสูจน์
+    ตรงนี้คือปุ่มสรุปสั่งให้มันทำงาน ไม่ใช่ตัว heartbeat เอง
+    """
+
+    def __init__(self, notifier, state_file, heartbeat):
+        self.notifier = notifier
+        self.state_file = state_file
+        self.heartbeat = heartbeat
+
+    def __enter__(self):
+        self.original = (runner.NOTIFIER, runner.STATE_FILE, runner.heartbeat)
+        runner.NOTIFIER = self.notifier
+        runner.STATE_FILE = self.state_file
+        runner.heartbeat = self.heartbeat
+        return self
+
+    def __exit__(self, *error):
+        runner.NOTIFIER, runner.STATE_FILE, runner.heartbeat = self.original
+
+
+def _handle(commands, state):
+    import tempfile
+
+    notifier = FakeNotifier(commands)
+
+    def heartbeat(*args, **kwargs):
+        notifier.heartbeats += 1
+
+    with tempfile.TemporaryDirectory() as folder:
+        with SwappedRunner(notifier, os.path.join(folder, "bot_state.json"), heartbeat):
+            runner.handle_commands(state, FakeAccount(), FakeLogger())
+
+    return notifier
+
+
+def test_pressing_pause_stops_new_entries_and_says_so():
+    state = {}
+    notifier = _handle([{"action": "pause", "callback_id": "cb1"}], state)
+
+    assert state["entries_paused"] is True
+    assert notifier.paused_calls == [True]
+    assert notifier.acknowledged   # กดแล้วต้องตอบ ไม่งั้น Telegram หมุนค้าง
+
+
+def test_pressing_pause_twice_does_not_announce_twice():
+    """สถานะไม่เปลี่ยนก็ไม่ต้องส่งข้อความซ้ำ แค่ตอบปุ่มว่ารับทราบ"""
+    state = {"entries_paused": True}
+    notifier = _handle([{"action": "pause", "callback_id": "cb1"}], state)
+
+    assert notifier.paused_calls == []
+    assert notifier.acknowledged == ["หยุดอยู่แล้ว"]
+
+
+def test_pressing_resume_lets_entries_through_again():
+    state = {"entries_paused": True}
+    notifier = _handle([{"action": "resume", "callback_id": "cb1"}], state)
+
+    assert state["entries_paused"] is False
+    assert notifier.paused_calls == [False]
+
+
+def test_pressing_status_sends_a_summary_right_away():
+    state = {}
+    notifier = _handle([{"action": "status", "callback_id": "cb1"}], state)
+
+    assert notifier.heartbeats == 1
+    assert "entries_paused" not in state   # ปุ่มสรุปต้องไม่ไปแตะสถานะการเทรด
 
 
 # ---------- วินิจฉัยตอนแจ้งเตือนไม่มา ----------

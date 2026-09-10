@@ -189,8 +189,12 @@ def command_notify(args):
         return _diagnose_notifications(notify)
 
     if args.dry:
-        def transport(message, quiet=False):
+        def transport(message, quiet=False, buttons=None):
             print(f"\n{'-' * 62}\n{'[เงียบ] ' if quiet else ''}{message}")
+
+            for row in (buttons or {}).get("inline_keyboard", []):
+                print("  [ " + " ]  [ ".join(button["text"] for button in row) + " ]")
+
             return True
 
         # โหมด dry ไม่ได้ต่อเน็ต แต่ต้องหลอกให้ Notifier คิดว่าตั้งค่าครบ ไม่งั้นมันเงียบ
@@ -316,6 +320,8 @@ def _sample_notifications(sender, strategy):
                "blockers": {"ความแรงเทรนด์ ADX": 2, "Spread": 1},
                "closes": [4390.2, 4394.8, 4401.6, 4398.3, 4392.1, 4386.7, 4382.5]},
     )
+    sender.entries_paused(symbol, True)
+    sender.entries_paused(symbol, False)
     sender.bot_stopped(symbol, "ผู้ใช้สั่งหยุด (Ctrl+C)")
 
     return list(sender.sent)

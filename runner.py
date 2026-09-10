@@ -682,19 +682,19 @@ def trading_allowed(state, logger):
     return True, "", summary
 
 
-def heartbeat(state, account, logger):
+def heartbeat(state, account, logger, force=False):
     """
     แจ้งเป็นระยะว่ายังทำงานอยู่ — บอทที่ตายเงียบคือบอทที่แย่ที่สุด
 
     เก็บเวลาส่งล่าสุดไว้ใน state จึงไม่สแปมซ้ำหลัง restart
     """
-    if not HEARTBEAT_EVERY_HOURS:
+    if not force and not HEARTBEAT_EVERY_HOURS:
         return
 
     now = datetime.now()
     last = state.get("last_heartbeat")
 
-    if last:
+    if last and not force:
         try:
             if now - datetime.fromisoformat(last) < timedelta(hours=HEARTBEAT_EVERY_HOURS):
                 return
@@ -711,8 +711,39 @@ def heartbeat(state, account, logger):
         SYMBOL, account.equity, account.currency,
         [position_view(position, state) for position in positions], summary,
         state.get("last_candle_time", "-"), time.time() - STARTED_AT,
-        stats=SESSION_STATS,
+        stats=SESSION_STATS, paused=bool(state.get("entries_paused")),
     )
+
+
+def handle_commands(state, account, logger):
+    """
+    ทำตามปุ่มที่กดมาจาก Telegram
+
+    หยุด/กลับมาเก็บลงไฟล์สถานะ เพราะ "หยุดเข้าไม้" ที่หายไปหลัง restart คือคำสั่ง
+    ที่ไม่ได้ทำตาม ส่วนคำสั่งทั้งหมดเป็นการตั้งสถานะ ไม่มีอันไหนส่งคำสั่งซื้อขาย
+    """
+    for command in NOTIFIER.take_commands():
+        action = command["action"]
+        logger.info("รับคำสั่งจาก Telegram: %s", notify.CONTROL_ACTIONS.get(action, action))
+
+        if action == "status":
+            NOTIFIER.acknowledge(command["callback_id"], "กำลังส่งสรุป")
+            heartbeat(state, account, logger, force=True)
+            continue
+
+        paused = action == "pause"
+
+        if bool(state.get("entries_paused")) == paused:
+            NOTIFIER.acknowledge(command["callback_id"],
+                                 "หยุดอยู่แล้ว" if paused else "ยังเข้าไม้ได้อยู่แล้ว")
+            continue
+
+        state["entries_paused"] = paused
+        core.save_state(STATE_FILE, state)
+
+        NOTIFIER.acknowledge(command["callback_id"],
+                             "หยุดเข้าไม้ใหม่แล้ว" if paused else "กลับมาเข้าไม้แล้ว")
+        NOTIFIER.entries_paused(SYMBOL, paused)
 
 
 def _signal_of(position):
@@ -859,6 +890,7 @@ def run(trade_enabled=False):
             continue
 
         roll_over_day(state, account, logger)
+        handle_commands(state, account, logger)
         heartbeat(state, account, logger)
 
         info = mt5.symbol_info(SYMBOL)
@@ -931,6 +963,9 @@ def run(trade_enabled=False):
         if decision.enter:
             if not trade_enabled:
                 logger.info("โหมดเฝ้าดู — ถ้าเปิด trade ไว้จะเข้า %s ตรงนี้", decision.signal)
+            elif state.get("entries_paused"):
+                # สั่งหยุดไว้จาก Telegram — ไม้ที่ถืออยู่ยังถูกดูแลตามปกติข้างบน
+                logger.info("สั่งหยุดเข้าไม้ไว้ — ข้ามสัญญาณ %s", decision.signal)
             else:
                 allowed, reason, summary = trading_allowed(state, logger)
                 state["day_summary"] = summary

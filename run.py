@@ -6,6 +6,7 @@
                                ที่เก็บเอง -> จำลองย้อนหลัง -> กวาดค่า
                                -> เฝ้าดูตลาดสด (ไม่ส่งคำสั่ง)
     python run.py --trade      เหมือนข้างบน แต่ส่งคำสั่งจริงในขั้นสุดท้าย
+    python run.py menu         เมนูตัวเลข เลือกเอา ไม่ต้องจำคำสั่ง
     python run.py check        ตรวจการเชื่อมต่อ บัญชี และคำนวณความเสี่ยงให้ดู
     python run.py symbols      หาชื่อ Symbol จริงที่ broker ใช้
     python run.py signal       ดูคำตัดสินของบอทตอนนี้ครั้งเดียว พร้อมเหตุผลทุกข้อ
@@ -291,6 +292,15 @@ def command_report(args):
     print(report.build_report())
 
 
+def command_menu(args):
+    """เมนูตัวเลข — ทางเข้าสำหรับคนที่ไม่อยากจำว่ามีคำสั่งอะไรบ้าง
+
+    ไม่ได้ไปแทน `python run.py` เปล่าๆ ซึ่งยังต้องทำงานครบทุกขั้นเหมือนเดิม
+    """
+    import menu
+    return menu.run(COMMANDS, args)
+
+
 def command_outcomes(args):
     """ติดป้าย 'หลังจากแท่งนั้นเกิดอะไรขึ้น' ให้ข้อมูลที่บอทเก็บเอง แล้ววัดตัวกรองด้วยป้ายนั้น
 
@@ -527,6 +537,8 @@ def build_parser():
 
     subparsers = parser.add_subparsers(dest="command")
 
+    subparsers.add_parser("menu", help="เมนูตัวเลข เลือกเอา ไม่ต้องจำคำสั่ง")
+
     subparsers.add_parser("check", help="ตรวจการเชื่อมต่อ บัญชี และความเสี่ยง")
 
     symbols = subparsers.add_parser("symbols", help="หาชื่อ Symbol ที่ broker ใช้")
@@ -577,6 +589,7 @@ def build_parser():
 
 
 COMMANDS = {
+    "menu": command_menu,
     "check": command_check,
     "symbols": command_symbols,
     "signal": command_signal,
@@ -593,7 +606,8 @@ COMMANDS = {
 }
 
 # คำสั่งที่ไม่ต้องต่อ MT5 จึงไม่ต้อง shutdown
-OFFLINE_COMMANDS = {"review", "report", "outcomes", "test", "notify"}
+# menu ต่อ MT5 เองเมื่อผู้ใช้เลือกข้อที่ต้องใช้ ไม่ให้ main() ต่อไว้ล่วงหน้า
+OFFLINE_COMMANDS = {"review", "report", "outcomes", "test", "notify", "menu"}
 
 
 def main():

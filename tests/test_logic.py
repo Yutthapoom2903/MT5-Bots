@@ -1173,6 +1173,153 @@ def test_a_file_without_the_hand_filled_columns_says_which_are_missing():
 
 
 
+# ---------- เมนู ----------
+
+class FakeMenu:
+    """กดเมนูแทนคน — คืนคำตอบทีละบรรทัดแล้วเก็บทุกอย่างที่เมนูพิมพ์ออกมา"""
+
+    def __init__(self, answers, mt5_available=True):
+        self.answers = list(answers)
+        self.printed = []
+        self.ran = []
+        self.mt5_available = mt5_available
+
+    def prompt(self, _text=""):
+        if not self.answers:
+            raise EOFError
+        return self.answers.pop(0)
+
+    def out(self, text=""):
+        self.printed.append(str(text))
+
+    def commands(self, names):
+        return {name: (lambda args, name=name: self.ran.append((name, args)))
+                for name in names}
+
+    @property
+    def text(self):
+        return "\n".join(self.printed)
+
+
+def _menu_run(fake, overrides=None):
+    import argparse
+    import menu
+
+    original = menu._mt5_available
+    menu._mt5_available = lambda: fake.mt5_available
+
+    args = argparse.Namespace(trade=False, check=False, dry=True, **(overrides or {}))
+    names = {item.command for item in menu.items()}
+
+    try:
+        menu.run(fake.commands(names), args, prompt=fake.prompt, out=fake.out)
+    finally:
+        menu._mt5_available = original
+
+
+def test_every_menu_entry_points_at_a_command_that_exists():
+    # เมนูเก็บชื่อคำสั่งเป็นสตริง พิมพ์ผิดจะรู้ตอนกดเท่านั้น ถ้าไม่มีเทสตัวนี้
+    import menu
+    import run
+
+    for item in menu.items():
+        assert item.command in run.COMMANDS, item.command
+
+
+def test_the_menu_never_offers_itself():
+    import menu
+    assert "menu" not in {item.command for item in menu.items()}
+
+
+def test_entries_needing_mt5_are_marked_when_the_package_is_missing():
+    import menu
+
+    locked = menu.render(mt5_available=False)
+    open_ = menu.render(mt5_available=True)
+
+    assert "(ต้องมี MT5)" in locked
+    assert "(ต้องมี MT5)" not in open_
+
+
+def test_quit_is_accepted_in_the_obvious_spellings():
+    import menu
+
+    for word in ("q", "Q", " quit ", "exit", "0"):
+        assert menu.choose(word) == "quit", word
+
+
+def test_an_unknown_choice_is_rejected_rather_than_guessed():
+    import menu
+
+    assert menu.choose("99") is None
+    assert menu.choose("") is None
+    assert menu.choose(None) is None
+
+
+def test_the_demo_entry_trades_and_the_watch_entry_does_not():
+    import menu
+
+    picks = {item.key: item for item in menu.items()}
+
+    assert picks["1"].command == "all" and picks["1"].overrides["trade"] is True
+    assert picks["2"].command == "all" and picks["2"].overrides["trade"] is False
+
+
+def test_the_status_says_the_order_path_is_unproven_while_no_trade_log_exists():
+    import menu
+
+    assert "ยังไม่เคยส่งคำสั่งจริง" in " ".join(
+        menu.status_lines(mt5_available=True, candles=39, has_trades=False))
+    assert "ยังไม่เคยส่งคำสั่งจริง" not in " ".join(
+        menu.status_lines(mt5_available=True, candles=39, has_trades=True))
+
+
+def test_picking_an_entry_runs_its_command_with_the_override_applied():
+    fake = FakeMenu(["1"])
+    _menu_run(fake)
+
+    assert [name for name, _ in fake.ran] == ["all"]
+    assert fake.ran[0][1].trade is True
+
+
+def test_an_entry_needing_mt5_is_refused_on_a_machine_without_it():
+    fake = FakeMenu(["1", "q"], mt5_available=False)
+    _menu_run(fake)
+
+    assert fake.ran == []
+    assert "ต้องรันบนเครื่องที่มี MetaTrader5" in fake.text
+
+
+def test_an_offline_command_returns_to_the_menu_instead_of_exiting():
+    fake = FakeMenu(["4", "", "q"], mt5_available=False)
+    _menu_run(fake)
+
+    assert [name for name, _ in fake.ran] == ["report"]
+    assert fake.text.count("MT5-Bots") == 2      # แสดงเมนูอีกรอบหลังทำงานเสร็จ
+
+
+def test_a_command_that_raises_does_not_take_the_menu_down_with_it():
+    import argparse
+    import menu
+
+    original = menu._mt5_available
+    menu._mt5_available = lambda: False
+    fake = FakeMenu(["4", "", "q"], mt5_available=False)
+
+    def explode(_args):
+        raise ValueError("พัง")
+
+    try:
+        menu.run({"report": explode}, argparse.Namespace(),
+                 prompt=fake.prompt, out=fake.out)
+    finally:
+        menu._mt5_available = original
+
+    assert "คำสั่งล้มเหลว" in fake.text
+    assert "ออกแล้ว" in fake.text
+
+
+
 # ---------- หา Symbol ของ broker ----------
 
 class FakeBroker:

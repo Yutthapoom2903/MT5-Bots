@@ -13,6 +13,15 @@ standalone top-level scripts; add a subcommand instead. Earlier revisions had fo
 bot scripts each opening its own MT5 connection and re-implementing the crossover; they
 were consolidated for exactly that reason.
 
+`run.py menu` is a second door onto the same subcommands for when the command names are
+the thing in the way — it dispatches through `run.COMMANDS`, so a capability wired into
+`command_all()` and the parser needs one line in `menu.items()` and nothing else.
+`test_every_menu_entry_points_at_a_command_that_exists` catches a stale name. It is not
+a replacement for the bare invocation and must never become one. Everything in `menu.py`
+except `run()` is pure — `items()`, `render()`, `choose()`, `status_lines()` take values
+and return values, so the tests press keys without a terminal. No new dependency: a
+curses or textual TUI would install on one of the two machines and not the other.
+
 **Bare `python run.py` must do the whole job end to end** — resolve the symbol, check the
 account, backtest, sweep, then watch — because that is what the user asked for and keeps
 asking for. Adding a capability means wiring it into `command_all()`, not handing the user
@@ -22,8 +31,8 @@ defaults for every flag `command_all` reads, so the bare invocation works with n
 subcommand.
 
 ```
-run.py          CLI: check | symbols | signal | watch | trade | backtest | sweep
-                     report | review | outcomes | notify | test | all
+run.py          CLI: menu | check | symbols | signal | watch | trade | backtest
+                     sweep | report | review | outcomes | notify | test | all
 runner.py       the one loop — fetch once per candle, then log + decide + optionally trade
 strategy.py     pure decision engine: context dict in, Decision out. No MT5 imports.
 notify.py       Telegram: categories, formatting, anti-spam. No MT5 imports either.
@@ -34,8 +43,9 @@ outcomes.py     labels each logged candle with what the market did next, then me
                 the filters against those labels. Pure, no MT5.
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
+menu.py         numbered menu over the same subcommands. Pure except run().
 report.py       offline digest of the CSVs and bot.log
-tests/          155 logic tests, no MT5 required
+tests/          166 logic tests, no MT5 required
 ```
 
 ## Running
@@ -57,7 +67,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 155 logic tests, runs under WSL
+python run.py test         # 166 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)

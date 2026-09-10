@@ -2,8 +2,9 @@
 ประตูเดียวของโปรเจกต์ — ทุกอย่างสั่งผ่านไฟล์นี้
 
     python run.py              ทำทุกอย่างให้จบในคำสั่งเดียว:
-                               หา Symbol -> ตรวจความพร้อม -> จำลองย้อนหลัง
-                               -> กวาดค่า -> เฝ้าดูตลาดสด (ไม่ส่งคำสั่ง)
+                               หา Symbol -> ตรวจความพร้อม -> วัดตัวกรองจากข้อมูล
+                               ที่เก็บเอง -> จำลองย้อนหลัง -> กวาดค่า
+                               -> เฝ้าดูตลาดสด (ไม่ส่งคำสั่ง)
     python run.py --trade      เหมือนข้างบน แต่ส่งคำสั่งจริงในขั้นสุดท้าย
     python run.py check        ตรวจการเชื่อมต่อ บัญชี และคำนวณความเสี่ยงให้ดู
     python run.py symbols      หาชื่อ Symbol จริงที่ broker ใช้
@@ -14,6 +15,7 @@
     python run.py sweep        กวาดหลายชุดค่าเพื่อดูว่าผลทนต่อการเปลี่ยนค่าไหม
     python run.py report       สรุปว่าบอททำอะไรไปบ้าง จากไฟล์ที่มันเขียนไว้
     python run.py review       สรุปผลจากข้อมูลที่คุณติดป้ายกำกับไว้เอง
+    python run.py outcomes     ตัวกรองแยกแท่งที่เทรนด์ไปต่อได้จริงไหม จากข้อมูลที่เก็บเอง
     python run.py notify       ส่งตัวอย่างแจ้งเตือนครบทุกหมวดเข้า Telegram
     python run.py test         รันเทส logic (ไม่ต้องต่อ MT5)
 """
@@ -289,6 +291,22 @@ def command_report(args):
     print(report.build_report())
 
 
+def command_outcomes(args):
+    """ติดป้าย 'หลังจากแท่งนั้นเกิดอะไรขึ้น' ให้ข้อมูลที่บอทเก็บเอง แล้ววัดตัวกรองด้วยป้ายนั้น
+
+    ออฟไลน์ล้วน อ่าน market_training_data.csv อย่างเดียว จึงรันบน WSL ได้
+    """
+    import pandas as pd
+    import outcomes
+
+    if not os.path.exists(args.csv):
+        print(f"ยังไม่มีไฟล์ข้อมูล: {args.csv}")
+        return
+
+    frame = pd.read_csv(args.csv)
+    print("\n".join(outcomes.analyse(frame, horizon=args.horizon)))
+
+
 def command_sweep(args):
     """กวาดหลายชุดค่า ดูว่าผลลัพธ์ทนต่อการเปลี่ยนค่าหรือแค่ฟลุค"""
     import backtest
@@ -459,20 +477,24 @@ def command_all(args):
     """คำสั่งเดียวจบ — หา Symbol ตรวจความพร้อม วิเคราะห์ย้อนหลัง แล้วเฝ้าดูสด"""
     import runner
 
-    total = 3 if args.skip_backtest else 5
+    total = 4 if args.skip_backtest else 6
 
     _phase(1, total, "หา Symbol ที่ broker ใช้")
     _auto_symbol(args)
 
     _try_phase(2, total, "ตรวจความพร้อมและความเสี่ยง", command_check, args)
 
-    step = 3
+    # ออฟไลน์และเร็ว อ่านเฉพาะที่บอทเก็บมาเอง จึงรันก่อนแตะข้อมูลย้อนหลังของ broker
+    _try_phase(3, total, "ตัวกรองแยกอะไรได้จริงไหม จากข้อมูลที่เก็บมาเอง",
+               command_outcomes, args)
+
+    step = 4
     if not args.skip_backtest:
-        _try_phase(3, total, "จำลองย้อนหลัง — กลยุทธ์นี้เคยทำเงินได้ไหม",
+        _try_phase(4, total, "จำลองย้อนหลัง — กลยุทธ์นี้เคยทำเงินได้ไหม",
                    command_backtest, args)
-        _try_phase(4, total, "กวาดค่า — ผลทนต่อการเปลี่ยนค่าหรือแค่ฟลุค",
+        _try_phase(5, total, "กวาดค่า — ผลทนต่อการเปลี่ยนค่าหรือแค่ฟลุค",
                    command_sweep, args)
-        step = 5
+        step = 6
 
     _phase(step, total, "เทรดสด" if args.trade else "เฝ้าดูตลาดสด (ไม่ส่งคำสั่ง)")
 
@@ -497,6 +519,7 @@ def build_parser():
         command=None, trade=False, months=6, spread=30.0,
         top=15, quick=False, skip_backtest=False, no_compare=False,
         csv="market_training_data.csv", keywords=None, dry=False, check=False,
+        horizon=8,
     )
     parser.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
     parser.add_argument("--skip-backtest", action="store_true",
@@ -525,6 +548,12 @@ def build_parser():
     sweep.add_argument("--quick", action="store_true", help="กวาดเฉพาะ SL/TP ไม่รวม ADX")
 
     subparsers.add_parser("report", help="สรุปว่าบอททำอะไรไปบ้าง")
+
+    forward = subparsers.add_parser("outcomes",
+                                    help="ตัวกรองแยกแท่งที่เทรนด์ไปต่อได้จริงไหม")
+    forward.add_argument("--csv", default="market_training_data.csv", help="ไฟล์ข้อมูล")
+    forward.add_argument("--horizon", type=int, default=8,
+                         help="จำนวนแท่ง M15 ที่มองไปข้างหน้า (ค่าเริ่มต้น 8 = 2 ชม.)")
 
     review = subparsers.add_parser("review", help="สรุปผลจากข้อมูลที่คุณติดป้ายเอง")
     review.add_argument("csv", nargs="?", default="market_training_data.csv")
@@ -557,13 +586,14 @@ COMMANDS = {
     "sweep": command_sweep,
     "report": command_report,
     "review": command_review,
+    "outcomes": command_outcomes,
     "notify": command_notify,
     "test": command_test,
     "all": command_all,
 }
 
 # คำสั่งที่ไม่ต้องต่อ MT5 จึงไม่ต้อง shutdown
-OFFLINE_COMMANDS = {"review", "report", "test", "notify"}
+OFFLINE_COMMANDS = {"review", "report", "outcomes", "test", "notify"}
 
 
 def main():

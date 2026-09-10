@@ -29,6 +29,7 @@ import mt5_trade as trade
 import notify
 import strategy
 import backtest
+import outcomes
 
 
 # ---------- ตัวช่วย ----------
@@ -876,6 +877,117 @@ def test_a_day_with_no_adx_prints_a_dash_not_nan():
 
     assert "nan" not in text
     assert "-" in text
+
+
+# ---------- ป้ายผลลัพธ์ล่วงหน้า ----------
+
+def _forward_frame(times=None, **columns):
+    """แท่ง M15 ติดกัน 5 แท่ง ATR 2.0 (risk 3.0 R ที่ SL 1.5xATR) ให้เลขออกมากลมๆ"""
+    base = {
+        "close": [100.0, 103.0, 106.0, 109.0, 112.0],
+        "high": [101.0, 104.0, 109.0, 110.0, 113.0],
+        "low": [99.0, 100.0, 105.0, 108.0, 111.0],
+        "atr_14": [2.0] * 5,
+        "h1_trend": ["UPTREND"] * 5,
+    }
+    base.update(columns)
+    base["candle_time"] = times or [
+        "2026-09-09 09:00:00", "2026-09-09 09:15:00", "2026-09-09 09:30:00",
+        "2026-09-09 09:45:00", "2026-09-09 10:00:00",
+    ]
+    return pd.DataFrame(base)
+
+
+def test_the_forward_label_is_measured_in_risk_multiples():
+    labelled = outcomes.add_forward_outcomes(_forward_frame(), horizon=2, sl_mult=1.5)
+    row = labelled.iloc[0]
+
+    # สองแท่งถัดไป: high สูงสุด 109, low ต่ำสุด 100, ปิดที่ 106 — หารด้วย risk 3.0
+    assert abs(row["fwd_up_r"] - 3.0) < 1e-9
+    assert abs(row["fwd_down_r"] - 0.0) < 1e-9
+    assert abs(row["fwd_net_r"] - 2.0) < 1e-9
+
+
+def test_a_falling_market_in_a_downtrend_counts_as_the_trend_continuing():
+    # fwd_trend_r เซ็นตามเทรนด์ H1 ถ้าเซ็นผิด ตัวกรองเทรนด์จะดูเหมือนทำร้ายผลตลอด
+    frame = _forward_frame(
+        close=[112.0, 109.0, 106.0, 103.0, 100.0],
+        high=[113.0, 110.0, 107.0, 104.0, 101.0],
+        low=[111.0, 108.0, 105.0, 102.0, 99.0],
+        h1_trend=["DOWNTREND"] * 5,
+    )
+
+    labelled = outcomes.add_forward_outcomes(frame, horizon=2, sl_mult=1.5)
+
+    assert labelled.iloc[0]["fwd_net_r"] < 0      # ราคาลง
+    assert labelled.iloc[0]["fwd_trend_r"] > 0    # แต่เทรนด์ไปต่อ
+
+
+def test_the_label_never_counts_forward_across_a_gap():
+    # บอทดับไปหนึ่งชั่วโมง แถวถัดไปในไฟล์ไม่ใช่แท่งถัดไปในตลาด
+    frame = _forward_frame(times=[
+        "2026-09-09 09:00:00", "2026-09-09 09:15:00", "2026-09-09 10:30:00",
+        "2026-09-09 10:45:00", "2026-09-09 11:00:00",
+    ])
+
+    labelled = outcomes.add_forward_outcomes(frame, horizon=2, sl_mult=1.5)
+
+    assert pd.isna(labelled.iloc[0]["fwd_net_r"])   # หน้าต่างคร่อมช่องที่ขาด
+    assert pd.notna(labelled.iloc[2]["fwd_net_r"])  # หลังช่องขาดยังติดกันดี
+
+
+def test_the_newest_candles_have_no_future_to_label_yet():
+    labelled = outcomes.add_forward_outcomes(_forward_frame(), horizon=2, sl_mult=1.5)
+
+    assert pd.isna(labelled.iloc[3]["fwd_net_r"])
+    assert pd.isna(labelled.iloc[4]["fwd_net_r"])
+
+
+def test_a_candle_with_no_atr_is_left_unlabelled():
+    # แถวก่อน 2026-09-09 ไม่มีคอลัมน์ adx_14/atr_14 — หารด้วยศูนย์ไม่ได้
+    frame = _forward_frame(atr_14=[float("nan"), 2.0, 2.0, 2.0, 2.0])
+
+    labelled = outcomes.add_forward_outcomes(frame, horizon=2, sl_mult=1.5)
+
+    assert pd.isna(labelled.iloc[0]["fwd_net_r"])
+    assert pd.notna(labelled.iloc[1]["fwd_net_r"])
+
+
+def test_the_forward_label_uses_the_same_stop_as_the_live_bot():
+    # ป้ายวัดเป็น R ถ้า SL_ATR_MULT สองที่หลุดจากกัน R ที่รายงานจะไม่ใช่ R ของไม้จริง
+    import runner
+    assert outcomes.SL_ATR_MULT == runner.SL_ATR_MULT
+
+
+def test_a_split_with_one_tiny_side_is_called_noise_not_evidence():
+    split = {
+        "passed": {"count": 4, "mean": 0.4, "median": 0.35, "positive": 0.5},
+        "blocked": {"count": 220, "mean": -0.1, "median": -0.1, "positive": 0.4},
+    }
+
+    text = "\n".join(outcomes.format_split("ADX", split, min_sample=30))
+
+    assert "+0.50R" in text        # ส่วนต่างยังรายงาน
+    assert "เสียงรบกวน" in text    # แต่บอกว่ายังเชื่อไม่ได้
+
+
+def test_a_split_with_both_sides_large_is_reported_without_the_warning():
+    split = {
+        "passed": {"count": 90, "mean": 0.4, "median": 0.35, "positive": 0.6},
+        "blocked": {"count": 220, "mean": -0.1, "median": -0.1, "positive": 0.4},
+    }
+
+    text = "\n".join(outcomes.format_split("ADX", split, min_sample=30))
+
+    assert "เสียงรบกวน" not in text
+
+
+def test_the_outcome_report_says_so_when_nothing_can_be_labelled_yet():
+    frame = _forward_frame().iloc[:2]
+
+    text = "\n".join(outcomes.analyse(frame, horizon=8))
+
+    assert "ยังไม่มีแท่งไหนติดป้ายได้" in text
 
 
 # ---------- หา Symbol ของ broker ----------

@@ -22,17 +22,20 @@ defaults for every flag `command_all` reads, so the bare invocation works with n
 subcommand.
 
 ```
-run.py          CLI: check | symbols | signal | watch | trade | backtest | notify | test | all
+run.py          CLI: check | symbols | signal | watch | trade | backtest | sweep
+                     report | review | outcomes | notify | test | all
 runner.py       the one loop — fetch once per candle, then log + decide + optionally trade
 strategy.py     pure decision engine: context dict in, Decision out. No MT5 imports.
 notify.py       Telegram: categories, formatting, anti-spam. No MT5 imports either.
 mt5_core.py     connect, symbol setup, rates, indicators, the crossover rule, logging, state
 mt5_trade.py    broker-facing only: price/volume normalization, stop distance, filling
                 mode, risk sizing, order send/close. Imported by runner.py alone.
+outcomes.py     labels each logged candle with what the market did next, then measures
+                the filters against those labels. Pure, no MT5.
 backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 report.py       offline digest of the CSVs and bot.log
-tests/          134 logic tests, no MT5 required
+tests/          143 logic tests, no MT5 required
 ```
 
 ## Running
@@ -54,7 +57,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 134 logic tests, runs under WSL
+python run.py test         # 143 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -266,6 +269,35 @@ append now compares the file's header against the row's keys and calls
 `align_csv_columns()` to rewrite the file — old rows padded with blanks, rows already
 written under the newer schema re-mapped positionally — before appending. Adding a column
 to a log row is therefore safe; renaming one still orphans the old column's data.
+
+## Measuring the filters against collected data
+
+`outcomes.py` answers the question the hand-labelled columns cannot answer for months:
+**does a filter actually separate anything?** `market_training_data.csv` already holds OHLC
+for every closed M15 candle, so the rows after a candle *are* its future — no MT5, no
+waiting for a human to fill in `trade_result`.
+
+The point is density. Crossovers arrive two or three times a day, so signal-outcome pairs
+accumulate at perhaps 60 a month; every candle gets a forward label, so those accumulate at
+2,800 a month. Filters are what the bot spends almost all of its time doing, and this is the
+only path that measures them at the rate they actually run.
+
+- **Labels are in R, not currency** (`ATR × SL_ATR_MULT`), the same unit `backtest.py`
+  reports, so a day with ATR 13 and a day with ATR 6 can sit in the same average.
+  `outcomes.SL_ATR_MULT` must equal `runner.SL_ATR_MULT`;
+  `test_the_forward_label_uses_the_same_stop_as_the_live_bot` pins it.
+- **`_usable_rows()` never counts forward across a gap.** If the bot was down for an hour,
+  the next row in the file is not the next candle in the market, and a window that straddles
+  the hole labels a candle with someone else's future. Those rows are dropped, not guessed —
+  which is why 39 collected candles yielded only 14 labels.
+- **`fwd_trend_r` is signed by the H1 trend**, so positive always means "the trend
+  continued" whichever way price went. Flip that sign and every trend filter looks harmful.
+- **This is not a backtest.** It measures the raw market after a candle: no spread, no
+  stop progression, no TP, no position management. `backtest.simulate()` models all of
+  that. Never compare the two numbers directly, and never quote an `outcomes` R as a
+  profit.
+- **`MIN_SAMPLE` is the honesty guard.** `format_split()` still prints the difference when
+  a side is thin, but labels it noise. A 0.5R edge over four candles is four candles.
 
 ## Deliberately not built
 

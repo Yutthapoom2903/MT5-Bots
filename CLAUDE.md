@@ -45,7 +45,7 @@ backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 menu.py         numbered menu over the same subcommands. Pure except run().
 report.py       offline digest of the CSVs and bot.log
-tests/          176 logic tests, no MT5 required
+tests/          203 logic tests, no MT5 required
 ```
 
 ## Running
@@ -67,7 +67,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 176 logic tests, runs under WSL
+python run.py test         # 203 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -178,6 +178,17 @@ not in every package version. So `trade.closing_deals()` swallows the failure an
 cycles before giving up — deal history does not always land the instant a position closes,
 and pruning on the first miss means the close is never reported at all. Reporting a closed
 trade is a bonus; it must never take down the loop that is managing a live stop.
+
+`HOLD_DIGEST_CANDLES` folds HOLD candles into one message per N (4 = hourly on M15);
+`SEND_HOLD` on with a digest of 1 is the old per-candle behaviour. `QUIET_HOURS` ships as
+midnight–07:00 because the bot runs next to a sleeping human — quiet, never suppressed.
+
+`position_lines()` draws where price sits between SL and TP, and **`r_now()` takes the 1R
+distance recorded at entry, not the current SL distance** — the live stop moves to
+breakeven and then trails, so dividing by it reported a trade that was +1R as -10R.
+`runner._remembered_risk()` is where that number lives (`state["position_risk"]`).
+`runner.SESSION_STATS` counts candles, crossovers and blockers in memory for the heartbeat
+digest; it resets on restart, which is what "this session" means anyway.
 
 `run.py notify --dry` renders one sample of every message shape offline. It calls every
 `Notifier` event method, so a shape that raises fails there instead of at 3am.

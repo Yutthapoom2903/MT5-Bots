@@ -1568,24 +1568,67 @@ def test_hold_candles_stay_silent_when_the_switch_is_off():
     assert recorder.messages == []
 
 
+def _hold_candles(recorder, count, **changes):
+    """ป้อนแท่ง HOLD เข้าไปกี่แท่งก็ได้ แล้วคืนผลของแท่งสุดท้าย"""
+    result = None
+
+    for step in range(count):
+        context = _sample_context(m15_signal="HOLD", close=4400.0 + step, **changes)
+        decision = strategy.evaluate(context)
+        result = recorder.notifier.candle_verdict(decision, context, "XAUUSD")
+
+    return result
+
+
 def test_hold_candles_are_announced_when_the_switch_is_on():
     recorder = Recorder()
-    context = _sample_context(m15_signal="HOLD")
-    decision = strategy.evaluate(context)
 
-    with SwitchedTo("SEND_HOLD", True):
-        assert recorder.notifier.candle_verdict(decision, context, "XAUUSD") is True
+    with SwitchedTo("SEND_HOLD", True), SwitchedTo("HOLD_DIGEST_CANDLES", 1):
+        assert _hold_candles(recorder, 1) is True
 
 
 def test_a_hold_message_is_quiet_so_it_does_not_buzz_every_fifteen_minutes():
     recorder = Recorder()
-    context = _sample_context(m15_signal="HOLD")
-    decision = strategy.evaluate(context)
 
-    with SwitchedTo("SEND_HOLD", True):
-        recorder.notifier.candle_verdict(decision, context, "XAUUSD")
+    with SwitchedTo("SEND_HOLD", True), SwitchedTo("HOLD_DIGEST_CANDLES", 1):
+        _hold_candles(recorder, 1)
 
     assert recorder.messages[0][1] is True
+
+
+def test_hold_candles_are_held_back_until_the_digest_is_full():
+    """
+    HOLD ทุกแท่งคือข้อความทุก 15 นาทีตลอดคืน รวมเป็นก้อนแล้วส่งทีเดียว
+
+    สามแท่งแรกต้องเงียบสนิท ไม่ใช่เงียบเพราะถูกมองว่าซ้ำ
+    """
+    recorder = Recorder()
+
+    with SwitchedTo("SEND_HOLD", True), SwitchedTo("HOLD_DIGEST_CANDLES", 4):
+        assert _hold_candles(recorder, 3) is False
+        assert recorder.messages == []
+
+        assert _hold_candles(recorder, 1) is True
+        assert len(recorder.messages) == 1
+
+
+def test_the_hold_digest_says_how_many_candles_it_covers():
+    recorder = Recorder()
+
+    with SwitchedTo("SEND_HOLD", True), SwitchedTo("HOLD_DIGEST_CANDLES", 4):
+        _hold_candles(recorder, 4)
+
+    assert "4 แท่งที่ผ่านมา" in recorder.messages[0][0]
+
+
+def test_the_digest_starts_over_after_it_is_sent():
+    """ส่งแล้วต้องเริ่มนับใหม่ ไม่ใช่ส่งทุกแท่งต่อจากนั้นเพราะหน้าต่างยังเต็มอยู่"""
+    recorder = Recorder()
+
+    with SwitchedTo("SEND_HOLD", True), SwitchedTo("HOLD_DIGEST_CANDLES", 2):
+        _hold_candles(recorder, 2)
+        assert _hold_candles(recorder, 1) is False
+        assert len(recorder.messages) == 1
 
 
 def test_a_near_miss_message_names_every_blocker():
@@ -1604,15 +1647,34 @@ def test_a_near_miss_message_names_every_blocker():
 
 
 def test_a_passing_signal_is_announced_loudly():
+    """
+    เทสนี้เคยอ่านนาฬิกาของเครื่องที่รันมัน พอ QUIET_HOURS มีค่าจริงก็ล้มตอนตีหนึ่ง
+    ทั้งที่โค้ดถูก — ความดังของหมวดกับชั่วโมงเงียบเป็นคนละเรื่อง แยกกันทดสอบ
+    """
     recorder = Recorder()
     context = _sample_context()
     decision = strategy.evaluate(context)
 
     assert decision.enter
-    recorder.notifier.candle_verdict(decision, context, "XAUUSD", adx_min=strategy.ADX_MIN)
+    with SwitchedTo("QUIET_HOURS", ()):
+        recorder.notifier.candle_verdict(decision, context, "XAUUSD", adx_min=strategy.ADX_MIN)
 
     message, quiet = recorder.messages[0]
     assert quiet is False
+    assert "SELL" in message
+
+
+def test_quiet_hours_mute_even_a_loud_message():
+    """กลางดึกยังต้องได้ข้อความครบ แค่ไม่ปลุกคนที่นอนอยู่ข้างๆ เครื่อง"""
+    recorder = Recorder()
+    context = _sample_context()
+    decision = strategy.evaluate(context)
+
+    with SwitchedTo("QUIET_HOURS", tuple(range(24))):
+        recorder.notifier.candle_verdict(decision, context, "XAUUSD", adx_min=strategy.ADX_MIN)
+
+    message, quiet = recorder.messages[0]
+    assert quiet is True
     assert "SELL" in message
 
 
@@ -1659,6 +1721,111 @@ def test_a_very_long_message_is_cut_before_telegram_rejects_it():
     message = notify.format_message("entry", "หัวข้อ", ["x" * 9000])
 
     assert len(message) <= notify.MAX_MESSAGE_CHARS
+
+
+# ---------- แถบและจุดสีในข้อความ ----------
+
+def test_the_position_bar_puts_price_between_stop_and_target():
+    """● ต้องอยู่กลางแถบพอดีเมื่อราคาอยู่กึ่งกลางระหว่าง SL กับ TP"""
+    track = notify.position_track(entry=100.0, sl=90.0, tp=110.0, price=100.0, width=11)
+
+    assert track[5] == notify.TRACK_PRICE
+    assert len(track) == 11
+
+
+def test_the_position_bar_reads_the_same_way_for_a_sell():
+    """
+    ฝั่งขาย TP ต่ำกว่า SL ระยะจึงกลับเครื่องหมายทั้งคู่ สัดส่วนต้องออกมาเหมือนกัน
+
+    ถ้าอ่านกลับด้าน ไม้ที่กำลังได้กำไรจะดูเหมือนใกล้ชน SL
+    """
+    buy = notify.position_track(entry=100.0, sl=90.0, tp=110.0, price=108.0, width=11)
+    sell = notify.position_track(entry=100.0, sl=110.0, tp=90.0, price=92.0, width=11)
+
+    assert buy.index(notify.TRACK_PRICE) == sell.index(notify.TRACK_PRICE)
+
+
+def test_the_position_bar_marks_where_the_trade_was_entered():
+    track = notify.position_track(entry=100.0, sl=90.0, tp=110.0, price=105.0, width=11)
+
+    assert notify.TRACK_ENTRY in track
+    assert notify.TRACK_PRICE in track
+
+
+def test_a_price_beyond_the_target_stays_inside_the_bar():
+    """ราคาวิ่งเลย TP ไปแล้วต้องไม่ทำให้ index หลุดออกนอกแถบ"""
+    track = notify.position_track(entry=100.0, sl=90.0, tp=110.0, price=140.0, width=11)
+
+    assert track.index(notify.TRACK_PRICE) == 10
+
+
+def test_r_is_measured_against_the_risk_taken_at_entry():
+    """
+    1R คือระยะ SL ตอนเข้าไม้ ไม่ใช่ระยะ SL ปัจจุบัน
+
+    SL ถูกขยับไป breakeven แล้วไล่ตามราคา คิดจากระยะปัจจุบันทำให้ไม้ที่กำไร 1R
+    แสดงเป็น -10R ซึ่งเคยหลุดไปอยู่ในข้อความจริงมาแล้ว
+    """
+    assert notify.r_now(entry=100.0, price=110.0, risk=10.0, signal="BUY") == 1.0
+    assert notify.r_now(entry=100.0, price=90.0, risk=10.0, signal="SELL") == 1.0
+    assert notify.r_now(entry=100.0, price=95.0, risk=10.0, signal="BUY") == -0.5
+
+
+def test_r_is_unknown_when_the_risk_was_never_recorded():
+    """เดา 1R ไม่ได้ ต้องไม่บอกตัวเลขที่ผิดออกไป"""
+    assert notify.r_now(entry=100.0, price=110.0, risk=None, signal="BUY") is None
+    assert notify.r_now(entry=100.0, price=110.0, risk=0, signal="BUY") is None
+
+
+def test_the_position_line_drops_the_r_value_but_keeps_the_bar():
+    lines = notify.position_lines(entry=100.0, sl=90.0, tp=110.0, price=105.0)
+
+    assert len(lines) == 1
+    assert "R</b>" not in lines[0]
+
+
+def test_a_sparkline_shows_the_shape_of_the_move():
+    line = notify.spark([1, 2, 3, 4, 5])
+
+    assert len(line) == 5
+    assert line[0] == notify.SPARK[0]
+    assert line[-1] == notify.SPARK[-1]
+
+
+def test_a_flat_series_does_not_divide_by_zero():
+    assert notify.spark([5, 5, 5]) == notify.SPARK[0] * 3
+
+
+def test_one_number_is_not_a_sparkline():
+    assert notify.spark([5]) == ""
+
+
+def test_a_threshold_dot_is_blank_until_the_threshold_is_known():
+    """ไม่รู้เกณฑ์ต้องไม่ทายให้ — จุดเขียวที่ไม่มีเกณฑ์รองรับคือคำโกหก"""
+    assert notify.threshold_dot(24.6, None) == ""
+
+
+def test_a_threshold_dot_follows_the_filter_it_describes():
+    assert notify.threshold_dot(24.6, 20) == notify.DOT_GOOD
+    assert notify.threshold_dot(11.2, 20) == notify.DOT_BAD
+    assert notify.threshold_dot(64.0, 50, higher_is_better=False) == notify.DOT_BAD
+    assert notify.threshold_dot(34.0, 50, higher_is_better=False) == notify.DOT_GOOD
+
+
+def test_the_night_summary_names_the_filter_that_blocked_most_often():
+    lines = "\n".join(notify.night_lines({
+        "candles": 43, "crossovers": 2,
+        "blockers": {"Spread": 1, "ADX": 5}, "closes": [1, 2, 3],
+    }))
+
+    assert "43 แท่ง" in lines
+    assert "ADX" in lines
+    assert lines.index("ADX") < lines.index("Spread")   # เรียงจากที่บล็อกบ่อยที่สุด
+
+
+def test_the_night_summary_is_skipped_when_there_is_nothing_to_say():
+    assert notify.night_lines(None) == []
+    assert notify.night_lines({}) == []
 
 
 # ---------- วินิจฉัยตอนแจ้งเตือนไม่มา ----------

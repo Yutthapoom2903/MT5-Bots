@@ -255,6 +255,30 @@ def handle_existing_positions(signal, logger):
 # จางคือไม่มีอะไรเกิดขึ้น ซึ่งเป็นกรณีส่วนใหญ่ของคืนหนึ่ง
 VERDICT_STYLE = {"BUY": core.GREEN, "SELL": core.RED}
 
+# สถิติของรอบที่กำลังรัน ใช้เติม heartbeat ให้ตอบได้ว่า "คืนนี้เห็นอะไรมาบ้าง"
+# อยู่ในหน่วยความจำเหมือนสถานะของ notify — restart แล้วเริ่มนับใหม่ ซึ่งตรงกับ
+# คำว่า "รอบนี้" อยู่แล้ว ส่วนตัวเลขที่ต้องอยู่ข้ามรอบมี report.py อ่านจาก CSV ให้
+SESSION_STATS_CANDLES = 48   # เก็บราคาปิดล่าสุดกี่แท่งไว้วาด sparkline
+SESSION_STATS = {"candles": 0, "crossovers": 0, "blockers": {}, "closes": []}
+
+
+def record_candle(decision, context):
+    """นับแท่งที่ผ่านตาไปแล้วหนึ่งแท่ง พร้อมตัวกรองที่บล็อกมันไว้"""
+    SESSION_STATS["candles"] += 1
+
+    close = context.get("close")
+    if close is not None:
+        SESSION_STATS["closes"].append(close)
+        del SESSION_STATS["closes"][:-SESSION_STATS_CANDLES]
+
+    if decision.signal == "HOLD":
+        return
+
+    SESSION_STATS["crossovers"] += 1
+
+    for check in decision.blockers:
+        SESSION_STATS["blockers"][check.name] = SESSION_STATS["blockers"].get(check.name, 0) + 1
+
 
 def verdict_line(decision):
     """คำตัดสินหนึ่งบรรทัดที่ย้อมสีตามผล — ข้อความเหมือนเดิมทุกตัวอักษร เพิ่มแค่สี"""
@@ -625,6 +649,8 @@ def manage_positions(context, state, logger):
             NOTIFIER.stop_moved(
                 SYMBOL, position.ticket, position.sl, new_sl,
                 position.price_open, price, _stop_reason(position, new_sl),
+                tp=getattr(position, "tp", None),
+                risk=_remembered_risk(state, position), signal=_signal_of(position),
             )
 
 
@@ -656,19 +682,19 @@ def trading_allowed(state, logger):
     return True, "", summary
 
 
-def heartbeat(state, account, logger):
+def heartbeat(state, account, logger, force=False):
     """
     แจ้งเป็นระยะว่ายังทำงานอยู่ — บอทที่ตายเงียบคือบอทที่แย่ที่สุด
 
     เก็บเวลาส่งล่าสุดไว้ใน state จึงไม่สแปมซ้ำหลัง restart
     """
-    if not HEARTBEAT_EVERY_HOURS:
+    if not force and not HEARTBEAT_EVERY_HOURS:
         return
 
     now = datetime.now()
     last = state.get("last_heartbeat")
 
-    if last:
+    if last and not force:
         try:
             if now - datetime.fromisoformat(last) < timedelta(hours=HEARTBEAT_EVERY_HOURS):
                 return
@@ -682,9 +708,66 @@ def heartbeat(state, account, logger):
 
     logger.info("ส่ง heartbeat: ถืออยู่ %d ไม้ equity %.2f", len(positions), account.equity)
     NOTIFIER.heartbeat(
-        SYMBOL, account.equity, account.currency, positions, summary,
+        SYMBOL, account.equity, account.currency,
+        [position_view(position, state) for position in positions], summary,
         state.get("last_candle_time", "-"), time.time() - STARTED_AT,
+        stats=SESSION_STATS, paused=bool(state.get("entries_paused")),
     )
+
+
+def handle_commands(state, account, logger):
+    """
+    ทำตามปุ่มที่กดมาจาก Telegram
+
+    หยุด/กลับมาเก็บลงไฟล์สถานะ เพราะ "หยุดเข้าไม้" ที่หายไปหลัง restart คือคำสั่ง
+    ที่ไม่ได้ทำตาม ส่วนคำสั่งทั้งหมดเป็นการตั้งสถานะ ไม่มีอันไหนส่งคำสั่งซื้อขาย
+    """
+    for command in NOTIFIER.take_commands():
+        action = command["action"]
+        logger.info("รับคำสั่งจาก Telegram: %s", notify.CONTROL_ACTIONS.get(action, action))
+
+        if action == "status":
+            NOTIFIER.acknowledge(command["callback_id"], "กำลังส่งสรุป")
+            heartbeat(state, account, logger, force=True)
+            continue
+
+        paused = action == "pause"
+
+        if bool(state.get("entries_paused")) == paused:
+            NOTIFIER.acknowledge(command["callback_id"],
+                                 "หยุดอยู่แล้ว" if paused else "ยังเข้าไม้ได้อยู่แล้ว")
+            continue
+
+        state["entries_paused"] = paused
+        core.save_state(STATE_FILE, state)
+
+        NOTIFIER.acknowledge(command["callback_id"],
+                             "หยุดเข้าไม้ใหม่แล้ว" if paused else "กลับมาเข้าไม้แล้ว")
+        NOTIFIER.entries_paused(SYMBOL, paused)
+
+
+def _signal_of(position):
+    """ทิศของไม้เป็นคำที่คนอ่านออก — notify ไม่ควรต้องรู้จักค่าคงที่ของ MT5"""
+    return "BUY" if getattr(position, "type", None) == mt5.POSITION_TYPE_BUY else "SELL"
+
+
+def position_view(position, state=None):
+    """
+    ย่อ position ของ MT5 เป็น dict ธรรมดาก่อนส่งให้ notify
+
+    notify.py ต้องไม่รู้จักโครงสร้างของแพ็กเกจ MT5 ไม่งั้นเทสออฟไลน์ต้องปลอม
+    object ของ broker ขึ้นมาทั้งตัวเพื่อทดสอบการจัดข้อความหนึ่งบรรทัด
+    """
+    return {
+        "ticket": getattr(position, "ticket", "-"),
+        "entry": getattr(position, "price_open", None),
+        "sl": getattr(position, "sl", None),
+        "tp": getattr(position, "tp", None),
+        "price": getattr(position, "price_current", None),
+        "signal": _signal_of(position),
+        # 1R ตอนเข้าไม้ ไม่ใช่ระยะ SL ปัจจุบัน — SL ขยับหนีไปแล้วตั้งแต่ breakeven
+        "risk": _remembered_risk(state, position) if state is not None else None,
+    }
 
 
 def roll_over_day(state, account, logger):
@@ -807,6 +890,7 @@ def run(trade_enabled=False):
             continue
 
         roll_over_day(state, account, logger)
+        handle_commands(state, account, logger)
         heartbeat(state, account, logger)
 
         info = mt5.symbol_info(SYMBOL)
@@ -868,14 +952,20 @@ def run(trade_enabled=False):
 
         # แจ้งทุกแท่ง แล้วให้ notify.py เป็นคนตัดสินว่าแท่งนี้ควรส่งไหม
         # ผ่านครบต้องรู้เสมอ ติดตัวกรองก็น่าดู ส่วน HOLD ปิดไว้เป็นค่าเริ่มต้น
+        record_candle(decision, context)
+
         NOTIFIER.candle_verdict(
             decision, context, SYMBOL,
             adx_min=strategy.ADX_MIN, watch_mode=not trade_enabled,
+            max_spread=strategy.MAX_SPREAD_POINTS,
         )
 
         if decision.enter:
             if not trade_enabled:
                 logger.info("โหมดเฝ้าดู — ถ้าเปิด trade ไว้จะเข้า %s ตรงนี้", decision.signal)
+            elif state.get("entries_paused"):
+                # สั่งหยุดไว้จาก Telegram — ไม้ที่ถืออยู่ยังถูกดูแลตามปกติข้างบน
+                logger.info("สั่งหยุดเข้าไม้ไว้ — ข้ามสัญญาณ %s", decision.signal)
             else:
                 allowed, reason, summary = trading_allowed(state, logger)
                 state["day_summary"] = summary

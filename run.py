@@ -189,8 +189,12 @@ def command_notify(args):
         return _diagnose_notifications(notify)
 
     if args.dry:
-        def transport(message, quiet=False):
+        def transport(message, quiet=False, buttons=None):
             print(f"\n{'-' * 62}\n{'[เงียบ] ' if quiet else ''}{message}")
+
+            for row in (buttons or {}).get("inline_keyboard", []):
+                print("  [ " + " ]  [ ".join(button["text"] for button in row) + " ]")
+
             return True
 
         # โหมด dry ไม่ได้ต่อเน็ต แต่ต้องหลอกให้ Notifier คิดว่าตั้งค่าครบ ไม่งั้นมันเงียบ
@@ -276,12 +280,29 @@ def _sample_notifications(sender, strategy):
     sender.reconnected(symbol)
     sender.market_closed(symbol, 300)
     sender.market_reopened(symbol)
-    sender.candle_verdict(decision, context, symbol, adx_min=strategy.ADX_MIN, watch_mode=True)
+    sender.candle_verdict(decision, context, symbol, adx_min=strategy.ADX_MIN, watch_mode=True,
+                          max_spread=strategy.MAX_SPREAD_POINTS)
     sender.candle_verdict(blocked, dict(context, adx=11.2, spread_points=64.0), symbol,
-                          adx_min=strategy.ADX_MIN, watch_mode=True)
+                          adx_min=strategy.ADX_MIN, watch_mode=True,
+                          max_spread=strategy.MAX_SPREAD_POINTS)
+
+    # HOLD ถูกรวมเป็นสรุปทุก HOLD_DIGEST_CANDLES แท่ง ป้อนให้ครบรอบจะได้เห็นของจริง
+    import notify
+
+    hold = strategy.evaluate(dict(context, m15_signal="HOLD"))
+    for step in range(max(1, notify.HOLD_DIGEST_CANDLES)):
+        sender.candle_verdict(
+            hold,
+            dict(context, m15_signal="HOLD", close=4401.62 + step * 1.8,
+                 rsi=48.4 + step * 2.1, adx=24.6 - step * 1.4,
+                 candle_time=f"2026-09-09 19:{15 + step * 15:02d}:00"),
+            symbol, adx_min=strategy.ADX_MIN, watch_mode=True,
+            max_spread=strategy.MAX_SPREAD_POINTS,
+        )
     sender.entry_filled(symbol, "SELL", 0.01, 4401.62, 4420.73, 4363.40, "19.10", "USD", 987654)
     sender.entry_failed(symbol, "SELL", "retcode 10030: Unsupported filling mode")
-    sender.stop_moved(symbol, 987654, 4420.73, 4399.71, 4401.62, 4382.51, "เสมอทุนแล้ว")
+    sender.stop_moved(symbol, 987654, 4420.73, 4399.71, 4401.62, 4382.51, "เสมอทุนแล้ว",
+                      tp=4363.40, risk=19.11, signal="SELL")
     sender.partial_taken(symbol, 987654, 0.05, 0.10, 1.0)
     sender.partial_too_small(symbol, 987654, 0.01, 1.0)
     sender.closed_on_reverse(symbol, 987654, "BUY")
@@ -290,7 +311,17 @@ def _sample_notifications(sender, strategy):
     sender.halted(symbol, "แพ้ติดกัน 3 ไม้ หยุดพักถึงพรุ่งนี้", summary)
     sender.resumed(symbol, "2026-09-10")
     sender.daily_summary(symbol, "2026-09-09", summary, 1041.20, "USD")
-    sender.heartbeat(symbol, 1041.20, "USD", [1], summary, "2026-09-09 19:15:00", 47100)
+    sender.heartbeat(
+        symbol, 1041.20, "USD",
+        [{"ticket": 987654, "entry": 4401.62, "sl": 4399.71, "tp": 4363.40,
+          "price": 4382.51, "signal": "SELL", "risk": 19.11}],
+        summary, "2026-09-09 19:15:00", 47100,
+        stats={"candles": 43, "crossovers": 2,
+               "blockers": {"ความแรงเทรนด์ ADX": 2, "Spread": 1},
+               "closes": [4390.2, 4394.8, 4401.6, 4398.3, 4392.1, 4386.7, 4382.5]},
+    )
+    sender.entries_paused(symbol, True)
+    sender.entries_paused(symbol, False)
     sender.bot_stopped(symbol, "ผู้ใช้สั่งหยุด (Ctrl+C)")
 
     return list(sender.sent)

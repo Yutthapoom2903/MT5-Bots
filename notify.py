@@ -16,6 +16,7 @@
 """
 
 import html
+import json
 import time
 from collections import namedtuple
 from datetime import datetime
@@ -37,7 +38,16 @@ SEND_HOLD = True          # ทุกแท่งที่ยังไม่ม�
 SEND_NEAR_MISS = True     # มีสัญญาณตัดกันแต่ติดตัวกรอง — นี่คือของที่น่าดู
 
 # ---------- พฤติกรรมการส่ง ----------
-QUIET_HOURS = ()          # ชั่วโมงที่ส่งแบบไม่มีเสียง เช่น range(0, 7) = เที่ยงคืนถึงเจ็ดโมง
+# บอทรันข้ามคืนข้างเตียง ชั่วโมงพวกนี้ยังส่งครบแต่ไม่ปลุก
+QUIET_HOURS = tuple(range(0, 7))   # เที่ยงคืน–ก่อนเจ็ดโมง
+
+# ปุ่มใต้ข้อความสรุป — กดสั่งบอทจากมือถือได้โดยไม่ต้อง SSH เข้าเครื่อง
+SEND_BUTTONS = True
+CONTROL_POLL_LIMIT = 20   # ดึงคำสั่งกี่รายการต่อรอบ
+
+# HOLD มาทุก 15 นาทีตลอดคืน = ~44 ข้อความต่อรอบ รวมเป็นสรุปทุกกี่แท่งแทน
+# 4 แท่ง M15 = ชั่วโมงละครั้ง ตั้งเป็น 1 คือกลับไปส่งทุกแท่งแบบเดิม
+HOLD_DIGEST_CANDLES = 4
 DEDUP_SECONDS = 900       # เนื้อความเดิมในหมวดเดิมภายในกี่วินาทีถือว่าซ้ำ ไม่ต้องส่ง
 MAX_MESSAGE_CHARS = 3900  # Telegram ตัดที่ 4096 เผื่อไว้หน่อย
 HTTP_TIMEOUT = 10
@@ -113,6 +123,170 @@ def r_blocks(r_multiple, width=6):
     return ("🟩" if r_multiple >= 0 else "🟥") * count
 
 
+# จุดสีบอกสถานะของค่าหนึ่งตัว วางไว้นอก <code> เพราะ emoji กว้างไม่เท่าตัวอักษร
+# monospace ใส่ในแถบแล้วคอลัมน์จะเลื่อนกันทั้งบล็อก
+DOT_GOOD = "🟢"
+DOT_WARN = "🟡"
+DOT_BAD = "🔴"
+
+SPARK = "▁▂▃▄▅▆▇█"
+
+TRACK_LINE = "─"
+TRACK_ENTRY = "┼"
+TRACK_PRICE = "●"
+
+
+def spark(values):
+    """กราฟจิ๋วบรรทัดเดียว — เห็นรูปร่างของราคาที่ผ่านมาโดยไม่ต้องส่งรูป"""
+    numbers = [value for value in values if is_number(value)]
+
+    if len(numbers) < 2:
+        return ""
+
+    low, high = min(numbers), max(numbers)
+    span = high - low
+
+    if span <= 0:
+        return SPARK[0] * len(numbers)
+
+    return "".join(SPARK[min(len(SPARK) - 1, int((value - low) / span * len(SPARK)))]
+                   for value in numbers)
+
+
+def r_now(entry, price, risk, signal):
+    """
+    กำไร/ขาดทุนตอนนี้เป็น R
+
+    `risk` คือระยะ 1R ตอนเข้าไม้ ไม่ใช่ระยะ SL ปัจจุบัน — SL ถูกขยับไป breakeven
+    แล้วไล่ตามราคาเรื่อยๆ คิดจากระยะปัจจุบันจึงได้ตัวเลขมหาศาลที่ไม่มีความหมาย
+    (ไม้ที่กำไรอยู่ 1R จริงๆ เคยแสดงเป็น -10R มาแล้วด้วยวิธีนั้น)
+    runner เก็บค่านี้ไว้ใน state["position_risk"] ต่อ ticket ด้วยเหตุผลเดียวกัน
+    """
+    if not (is_number(entry) and is_number(price) and is_number(risk)) or risk <= 0:
+        return None
+
+    move = price - entry if signal == "BUY" else entry - price
+    return move / risk
+
+
+def position_track(entry, sl, tp, price, width=13):
+    """
+    ราคาอยู่ตรงไหนระหว่าง SL กับ TP
+
+    สัดส่วนคิดจากระยะ SL→TP ซึ่งกลับเครื่องหมายพร้อมกันทั้งคู่เมื่อเป็นฝั่งขาย
+    0 คือชน SL และ 1 คือชน TP เหมือนกันทั้งสองฝั่ง
+    """
+    if not (is_number(sl) and is_number(tp) and is_number(price)) or tp == sl:
+        return ""
+
+    def index(value):
+        ratio = (value - sl) / (tp - sl)
+        return max(0, min(width - 1, int(round(ratio * (width - 1)))))
+
+    track = [TRACK_LINE] * width
+
+    if is_number(entry):
+        track[index(entry)] = TRACK_ENTRY
+
+    track[index(price)] = TRACK_PRICE
+    return "".join(track)
+
+
+def position_lines(entry, sl, tp, price, risk=None, signal=None):
+    """
+    แถบ SL→TP พร้อม R ตอนนี้ — ไม้ใกล้อะไรมากกว่ากัน เห็นได้โดยไม่ต้องคิดเลข
+
+    ไม่รู้ 1R ก็ยังวาดแถบให้ แค่ไม่บอก R เพราะเดาเอาแล้วจะผิดทุกครั้งที่ SL ขยับ
+    """
+    track = position_track(entry, sl, tp, price)
+
+    if not track:
+        return []
+
+    r_multiple = r_now(entry, price, risk, signal)
+
+    if not is_number(r_multiple):
+        return [f"<code>SL ├{track}┤ TP</code>"]
+
+    dot = DOT_GOOD if r_multiple > 0 else DOT_BAD if r_multiple < 0 else DOT_WARN
+    return [f"<code>SL ├{track}┤ TP</code> {dot} <b>{r_multiple:+.2f}R</b>"]
+
+
+def threshold_dot(value, limit, higher_is_better=True):
+    """จุดสีของค่าที่มีเกณฑ์ตายตัว — ว่างเปล่าถ้ายังไม่รู้เกณฑ์ ไม่ใช่เดาให้"""
+    if limit is None or not is_number(value):
+        return ""
+
+    passed = value >= limit if higher_is_better else value <= limit
+    return DOT_GOOD if passed else DOT_BAD
+
+
+# คำสั่งที่รับจากปุ่ม — จงใจไม่มี "ปิดไม้ทั้งหมด" เพราะปุ่มเดียวที่กดพลาดในกระเป๋า
+# แล้วปิดไม้จริงเป็นราคาที่แพงเกินไปสำหรับความสะดวก หยุดเข้าไม้ใหม่ให้ผลที่ต้องการ
+# โดยไม่ทำอะไรกับไม้ที่ถืออยู่ ซึ่งยังถูกดูแล SL ตามปกติ
+CONTROL_ACTIONS = {
+    "status": "ขอสรุปตอนนี้",
+    "pause": "หยุดเข้าไม้ใหม่",
+    "resume": "กลับมาเข้าไม้",
+}
+
+
+def keyboard(*rows):
+    """reply_markup ของ Telegram — โครงสร้างล้วน ไม่ยิงเน็ต"""
+    return {"inline_keyboard": [
+        [{"text": text, "callback_data": data} for text, data in row] for row in rows
+    ]}
+
+
+def control_keyboard(paused=False):
+    """ปุ่มใต้ข้อความสรุป — ปุ่มหยุด/กลับมาสลับกันตามสถานะจริง ไม่ใช่โชว์ทั้งคู่"""
+    if not SEND_BUTTONS:
+        return None
+
+    toggle = ("▶️ กลับมาเข้าไม้", "resume") if paused else ("⏸ หยุดเข้าไม้ใหม่", "pause")
+    return keyboard([("📅 สรุปตอนนี้", "status"), toggle])
+
+
+def parse_updates(updates, chat_id=None):
+    """
+    แปลงคำตอบของ getUpdates เป็นรายการคำสั่ง คืน (คำสั่ง, update_id ล่าสุด)
+
+    รับทั้งปุ่มที่กดและข้อความที่พิมพ์เอง (/status /pause /resume)
+    ทิ้งของที่มาจากแชทอื่นเสมอ — ใครก็ตามที่เจอชื่อบอทสั่งให้หยุดเทรดได้ไม่ได้
+    บริสุทธิ์ทั้งหมด เทสได้โดยไม่ต้องต่อเน็ต
+    """
+    commands = []
+    highest = None
+
+    for update in updates or []:
+        update_id = update.get("update_id")
+        if update_id is not None:
+            highest = update_id if highest is None else max(highest, update_id)
+
+        query = update.get("callback_query")
+
+        if query:
+            action = query.get("data")
+            origin = ((query.get("message") or {}).get("chat") or {}).get("id")
+            callback_id = query.get("id")
+        else:
+            message = update.get("message") or {}
+            text = str(message.get("text", "")).strip().lstrip("/").split("@")[0]
+            action = text if text in CONTROL_ACTIONS else None
+            origin = (message.get("chat") or {}).get("id")
+            callback_id = None
+
+        if action not in CONTROL_ACTIONS:
+            continue
+
+        if chat_id is not None and str(origin) != str(chat_id):
+            continue
+
+        commands.append({"action": action, "callback_id": callback_id})
+
+    return commands, highest
+
+
 def money(amount, currency=""):
     """ใส่เครื่องหมายหน้าเสมอ กำไรกับขาดทุนจะได้แยกออกด้วยการกวาดตา"""
     if not is_number(amount):
@@ -155,13 +329,13 @@ def duration(seconds):
     return f"{minutes} นาที"
 
 
-def metric_line(label, value, low, high, unit="", note=""):
-    """หนึ่งบรรทัดของ indicator: ชื่อ ตัวเลข แถบ แล้วค่อยหมายเหตุ"""
+def metric_line(label, value, low, high, unit="", note="", dot=""):
+    """หนึ่งบรรทัดของ indicator: ชื่อ ตัวเลข แถบ จุดสี แล้วค่อยหมายเหตุ"""
     if not is_number(value):
         return f"<code>{label:<6}    —</code> {escape(note)}".rstrip()
 
-    text = f"<code>{label:<6}{value:7.1f}{unit} {bar(value, low, high)}</code>"
-    return f"{text} {escape(note)}".rstrip()
+    parts = [f"<code>{label:<6}{value:7.1f}{unit} {bar(value, low, high)}</code>", dot, escape(note)]
+    return " ".join(part for part in parts if part)
 
 
 def check_lines(checks):
@@ -172,7 +346,7 @@ def check_lines(checks):
     ]
 
 
-def market_lines(context, adx_min=None, rsi_low=30.0, rsi_high=70.0):
+def market_lines(context, adx_min=None, rsi_low=30.0, rsi_high=70.0, max_spread=None):
     """สภาพตลาดย่อหนึ่งบล็อก ใช้ซ้ำได้ทั้งข้อความสัญญาณและข้อความเข้าไม้"""
     rsi = context.get("rsi")
     adx = context.get("adx")
@@ -190,15 +364,84 @@ def market_lines(context, adx_min=None, rsi_low=30.0, rsi_high=70.0):
     if adx_min is not None and is_number(adx):
         adx_note = "มีเทรนด์" if adx >= adx_min else f"sideway (ต้อง ≥ {adx_min:.0f})"
 
+    # จุดสีบอกว่า "ตัวกรองตัวนี้ผ่านไหม" ไม่ใช่ "ค่าดีไหม" — เกณฑ์เดียวกับ strategy.py
+    rsi_dot = "" if not is_number(rsi) else (
+        DOT_WARN if rsi >= rsi_high or rsi <= rsi_low else DOT_GOOD
+    )
+
     return [
         f"<code>ราคา  {context.get('close', 0):10,.2f}</code>",
         f"<code>H1</code> {trend(context.get('h1_trend', '?'))}   "
         f"<code>M5</code> {trend(context.get('m5_trend', '?'))}",
-        metric_line("RSI", rsi, 0, 100, note=rsi_note),
-        metric_line("ADX", adx, 0, 50, note=adx_note),
+        metric_line("RSI", rsi, 0, 100, note=rsi_note, dot=rsi_dot),
+        metric_line("ADX", adx, 0, 50, note=adx_note, dot=threshold_dot(adx, adx_min)),
         metric_line("ATR", context.get("atr"), 0, 25, note="ความผันผวนต่อแท่ง"),
-        metric_line("Spread", context.get("spread_points"), 0, 60, note="points"),
+        metric_line("Spread", context.get("spread_points"), 0, 60, note="points",
+                    dot=threshold_dot(context.get("spread_points"), max_spread,
+                                      higher_is_better=False)),
     ]
+
+
+def hold_digest_lines(window, adx_min=None, max_spread=None):
+    """
+    สรุปช่วง HOLD หลายแท่งเป็นบล็อกเดียว — สภาพล่าสุดเต็มรูปแบบ แล้วต่อด้วยช่วงที่ผ่านมา
+
+    แท่งเดียวไม่มีอะไรให้สรุป ส่งหน้าตาเดิมไปเลย
+    """
+    if not window:
+        return []
+
+    latest = market_lines(window[-1], adx_min, max_spread=max_spread)
+
+    if len(window) == 1:
+        return latest
+
+    def span(key, digits=1):
+        values = [item.get(key) for item in window]
+        values = [value for value in values if is_number(value)]
+        if not values:
+            return "—"
+        return f"{min(values):,.{digits}f} – {max(values):,.{digits}f}"
+
+    closes = [item.get("close") for item in window]
+    trend_line = spark(closes)
+
+    return latest + [
+        "",
+        f"<b>{len(window)} แท่งที่ผ่านมา</b>",
+        f"<code>ราคา   {span('close', 2)}</code>" + (f"  {trend_line}" if trend_line else ""),
+        f"<code>RSI    {span('rsi')}</code>",
+        f"<code>ADX    {span('adx')}</code>",
+        f"<code>Spread {span('spread_points')}</code>",
+    ]
+
+
+def night_lines(stats):
+    """
+    สรุปว่ารอบนี้บอทเห็นอะไรมาบ้าง — ตอบ "คืนนี้เป็นไง" โดยไม่ต้องรอเปิด report ตอนเช้า
+
+    ตัวเลขนับในหน่วยความจำของรอบที่กำลังรัน restart แล้วเริ่มใหม่ ซึ่งตรงกับคำว่า
+    "รอบนี้" อยู่แล้ว
+    """
+    if not stats:
+        return []
+
+    candles = stats.get("candles", 0)
+    lines = [f"<code>รอบนี้   {candles} แท่ง · crossover {stats.get('crossovers', 0)} ครั้ง</code>"]
+
+    closes = stats.get("closes") or []
+    trend_line = spark(closes)
+    if trend_line:
+        lines.append(f"<code>ราคา   {trend_line}</code>")
+
+    blockers = stats.get("blockers") or {}
+    if blockers:
+        top = sorted(blockers.items(), key=lambda item: (-item[1], item[0]))[:3]
+        lines.append("ติดบ่อยสุด: " + " · ".join(
+            f"{escape(name)} <b>{count}</b>" for name, count in top
+        ))
+
+    return lines
 
 
 def format_message(category_key, title, lines, footer=None):
@@ -263,12 +506,15 @@ class Notifier:
         self.skipped = 0
         self._last_at = {}
         self._last_body = {}
+        self._hold_window = []  # แท่ง HOLD ที่รอรวมเป็นสรุปเดียว
+        self._update_offset = None   # update_id ถัดไปที่จะอ่านจาก getUpdates
 
     @property
     def configured(self):
         return bool(self.token and self.chat_id)
 
-    def send(self, category_key, title, lines, key=None, loud=None, footer=None, force=False):
+    def send(self, category_key, title, lines, key=None, loud=None, footer=None, force=False,
+             buttons=None):
         """
         คืน True เมื่อส่งออกไปจริง — False เมื่อหมวดปิด ซ้ำ ติดคูลดาวน์ หรือส่งไม่สำเร็จ
 
@@ -299,7 +545,8 @@ class Notifier:
             return False
 
         loud = category.loud if loud is None else loud
-        return bool(self.transport(message, quiet=not loud or self._in_quiet_hours()))
+        return bool(self.transport(message, quiet=not loud or self._in_quiet_hours(),
+                                   buttons=buttons))
 
     def _is_repeat(self, stamp, message, now, cooldown):
         last_at = self._last_at.get(stamp)
@@ -321,7 +568,7 @@ class Notifier:
         if len(self.sent) > REMEMBER_LAST:
             del self.sent[:-REMEMBER_LAST]
 
-    def _post(self, message, quiet=False):
+    def _post(self, message, quiet=False, buttons=None):
         """
         ส่งจริง — ล้มเหลวได้โดยไม่ทำให้บอทหยุด แต่ต้องเห็นใน log เสมอ
 
@@ -336,6 +583,9 @@ class Notifier:
             "disable_web_page_preview": True,
             "disable_notification": quiet,
         }
+
+        if buttons:
+            payload["reply_markup"] = json.dumps(buttons)
 
         for attempt in (1, 2):
             try:
@@ -416,7 +666,8 @@ class Notifier:
 
     # ---------- สัญญาณ ----------
 
-    def candle_verdict(self, decision, context, symbol, adx_min=None, watch_mode=False):
+    def candle_verdict(self, decision, context, symbol, adx_min=None, watch_mode=False,
+                       max_spread=None):
         """
         คำตัดสินหนึ่งแท่ง — ความถี่ต่างกันสามระดับจึงคุมด้วยสวิตช์คนละตัว
 
@@ -429,16 +680,26 @@ class Notifier:
             if not SEND_HOLD:
                 return False
 
-            return self.send("signal", "ยังไม่มีสัญญาณ", [
-                *market_lines(context, adx_min),
-            ], key="hold", loud=False, footer=footer)
+            # เก็บสะสมแล้วส่งทีเดียว — HOLD ทุกแท่งคือข้อความทุก 15 นาทีตลอดคืน
+            self._hold_window.append(context)
+
+            if len(self._hold_window) < max(1, HOLD_DIGEST_CANDLES):
+                return False
+
+            window, self._hold_window = self._hold_window, []
+            title = ("ยังไม่มีสัญญาณ" if len(window) == 1
+                     else f"{len(window)} แท่งที่ผ่านมายังไม่มีสัญญาณ")
+
+            return self.send("signal", title,
+                             hold_digest_lines(window, adx_min, max_spread),
+                             key="hold", loud=False, footer=footer)
 
         if decision.enter:
             head = "สัญญาณผ่านตัวกรองครบ" + (" (โหมดเฝ้าดู ไม่ส่งคำสั่ง)" if watch_mode else "")
             return self.send("signal", head, [
                 f"<b>{direction(decision.signal)}</b>",
                 "",
-                *market_lines(context, adx_min),
+                *market_lines(context, adx_min, max_spread=max_spread),
                 "",
                 *check_lines(decision.checks),
             ], key="pass", loud=True, footer=footer)
@@ -450,7 +711,7 @@ class Notifier:
         return self.send("signal", f"เกือบเข้า {decision.signal} แต่ติด {blockers}", [
             f"<b>{direction(decision.signal)}</b>",
             "",
-            *market_lines(context, adx_min),
+            *market_lines(context, adx_min, max_spread=max_spread),
             "",
             *check_lines(decision.checks),
         ], key=f"near-miss-{decision.signal}", loud=False, footer=footer)
@@ -481,7 +742,8 @@ class Notifier:
 
     # ---------- ดูแลไม้ ----------
 
-    def stop_moved(self, symbol, ticket, old_sl, new_sl, entry, price, reason):
+    def stop_moved(self, symbol, ticket, old_sl, new_sl, entry, price, reason,
+                   tp=None, risk=None, signal=None):
         moved = abs(new_sl - old_sl) if old_sl else None
         distance = abs(price - new_sl)
 
@@ -490,6 +752,7 @@ class Notifier:
             f"<code>SL ใหม่  {new_sl:10,.2f}</code>" + (f"  ↗ {moved:,.2f}" if moved else ""),
             f"<code>เข้าที่  {entry:10,.2f}</code>",
             f"<code>ราคา    {price:10,.2f}</code>",
+            *position_lines(entry, new_sl, tp, price, risk, signal),
             "",
             f"ตอนนี้ SL ห่างราคา {distance:,.2f}",
         ], key=f"stop-{ticket}", footer=f"{symbol} · ticket {ticket}")
@@ -580,15 +843,90 @@ class Notifier:
             f"<code>ทุนปิดวัน {balance:,.2f} {escape(currency)}</code>",
         ], key=f"day-{day}", loud=True, footer=symbol)
 
-    def heartbeat(self, symbol, equity, currency, positions, summary, last_candle, uptime_seconds):
-        self.send("summary", "ยังทำงานอยู่", [
+    # ---------- คำสั่งที่กดกลับมา ----------
+
+    def take_commands(self):
+        """
+        ดึงปุ่มที่ถูกกดตั้งแต่รอบก่อน — ล้มเหลวคืนลิสต์ว่าง ไม่มีทางทำให้ลูปตาย
+
+        offset เก็บในหน่วยความจำเหมือนสถานะอื่นของคลาสนี้ restart แล้วอ่านซ้ำ
+        หนึ่งรอบไม่เป็นไร คำสั่งทุกตัวเป็นการตั้งสถานะ ไม่ใช่การส่งคำสั่งซื้อขาย
+        """
+        if not self.configured or not SEND_BUTTONS:
+            return []
+
+        payload = {"timeout": 0, "limit": CONTROL_POLL_LIMIT,
+                   "allowed_updates": json.dumps(["message", "callback_query"])}
+
+        if self._update_offset is not None:
+            payload["offset"] = self._update_offset
+
+        status, body = call_api(self.token, "getUpdates", payload)
+
+        if status != 200 or not body.get("ok"):
+            self.logger.debug("อ่านคำสั่งจาก Telegram ไม่ได้: %s", body.get("description"))
+            return []
+
+        commands, highest = parse_updates(body.get("result"), self.chat_id)
+
+        if highest is not None:
+            self._update_offset = highest + 1
+
+        return commands
+
+    def acknowledge(self, callback_id, text):
+        """ตอบปุ่มที่กด ไม่งั้น Telegram หมุนติ้วอยู่ห้าวินาทีเหมือนบอทค้าง"""
+        if not callback_id or not self.configured:
+            return False
+
+        status, _ = call_api(self.token, "answerCallbackQuery",
+                             {"callback_query_id": callback_id, "text": text})
+        return status == 200
+
+    def entries_paused(self, symbol, paused):
+        """ยืนยันว่าคำสั่งที่กดมีผลแล้ว — กดแล้วเงียบคือกดแล้วไม่รู้ว่าโดนไหม"""
+        title = "หยุดเข้าไม้ใหม่แล้ว" if paused else "กลับมาเข้าไม้ได้แล้ว"
+        detail = ("ไม้ที่เปิดอยู่ยังถูกดูแล SL ตามปกติ หยุดแค่การเข้าไม้ใหม่"
+                  if paused else "รอบถัดไปที่สัญญาณผ่านตัวกรองจะเข้าไม้ตามปกติ")
+
+        self.send("risk", title, [detail], key="paused", force=True,
+                  buttons=control_keyboard(paused), footer=symbol)
+
+    def heartbeat(self, symbol, equity, currency, positions, summary, last_candle,
+                  uptime_seconds, stats=None, paused=False):
+        lines = [
             f"<code>Equity   {equity:10,.2f} {escape(currency)}</code>",
             f"<code>ถืออยู่   {len(positions)} ไม้</code>",
             f"<code>วันนี้    {summary.get('trades', 0)} ไม้ "
             f"{summary.get('profit', 0.0):+,.2f}</code>",
             f"<code>แท่งล่าสุด {escape(last_candle)}</code>",
             f"<code>รันมาแล้ว {escape(duration(uptime_seconds))}</code>",
-        ], key="heartbeat", loud=False, footer=symbol)
+        ]
+
+        # ไม้ที่เปิดอยู่ได้แถบของตัวเอง — heartbeat เดิมบอกแค่จำนวน ซึ่งไม่ตอบว่า
+        # ตอนนี้ไม้กำลังไปทางไหน ตัวที่ไม่ใช่ dict (เทสเก่า) ข้ามไปเงียบๆ
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+
+            bars = position_lines(position.get("entry"), position.get("sl"),
+                                  position.get("tp"), position.get("price"),
+                                  position.get("risk"), position.get("signal"))
+            if not bars:
+                continue
+
+            lines += ["", f"<code>ticket {escape(position.get('ticket', '-'))}</code> "
+                          f"{direction(position.get('signal', 'HOLD'))}", *bars]
+
+        night = night_lines(stats)
+        if night:
+            lines += ["", *night]
+
+        if paused:
+            lines.insert(0, "<b>⏸ หยุดเข้าไม้ใหม่อยู่</b>")
+
+        self.send("summary", "ยังทำงานอยู่", lines, key="heartbeat", loud=False,
+                  footer=symbol, buttons=control_keyboard(paused), force=True)
 
 
 # ---------- วินิจฉัยตอนแจ้งเตือนไม่มา ----------

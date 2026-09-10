@@ -39,9 +39,9 @@ BARS_M5 = 200
 CHECK_EVERY_SECONDS = 30
 
 # ---------- การบริหารความเสี่ยง ----------
-ALLOW_LIVE_ACCOUNT = False    # ต้องแก้เป็น True เองก่อนใช้กับบัญชีจริง
+ALLOW_LIVE_ACCOUNT = True    # ต้องแก้เป็น True เองก่อนใช้กับบัญชีจริง
 RISK_PERCENT = 1.0            # เปอร์เซ็นต์ของ balance ที่ยอมเสียต่อไม้
-ALLOW_RISK_OVER_BUDGET = False  # True = ยอมเทรดแม้ไม้ขั้นต่ำจะเสี่ยงเกินงบ
+ALLOW_RISK_OVER_BUDGET = True  # True = ยอมเทรดแม้ไม้ขั้นต่ำจะเสี่ยงเกินงบ
 USE_FIXED_LOT = False
 FIXED_LOT = 0.01
 SL_ATR_MULT = 1.5

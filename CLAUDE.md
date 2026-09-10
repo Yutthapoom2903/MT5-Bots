@@ -45,7 +45,7 @@ backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
 backtest.py     historical simulation — pure, mirrors the live rules
 menu.py         numbered menu over the same subcommands. Pure except run().
 report.py       offline digest of the CSVs and bot.log
-tests/          166 logic tests, no MT5 required
+tests/          173 logic tests, no MT5 required
 ```
 
 ## Running
@@ -67,12 +67,19 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 166 logic tests, runs under WSL
+python run.py test         # 173 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
 pytest tests/              # same tests, if pytest is installed
 ```
+
+`core.connect()` passes `path` to `mt5.initialize()` when `MT5_TERMINAL_PATH` is set in
+`.env` (or `core.TERMINAL_PATH` in code). Without it the package locates the terminal
+itself, which works from the desktop session and fails from a session with no screen —
+SSH, a scheduled task — with `-10003 ... not found` even while the terminal is running.
+`run.py main()` loads `.env` before dispatching so every command sees it, not only the
+ones that happen to import `runner`. `_path_hint()` puts the fix in the error message.
 
 `tests/stubs/MetaTrader5.py` supplies constants when the real package is missing and is
 skipped when it is present, so the suite tests against real constants on Windows. When you

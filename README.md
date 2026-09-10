@@ -137,7 +137,7 @@ session ไหน ถ้า broker เป็น GMT+3 ชั่วโมง 17�
 | `python run.py outcomes` | **วัดว่าตัวกรองแยกอะไรได้จริงไหม** | ไม่ |
 | `python run.py review` | สรุปผลจากข้อมูลที่คุณติดป้ายกำกับเอง | ไม่ |
 | `python run.py notify` | ส่งตัวอย่างแจ้งเตือนครบทุกหมวด | ไม่ |
-| `python run.py test` | รันเทส logic 166 ข้อ | ไม่ |
+| `python run.py test` | รันเทส logic 173 ข้อ | ไม่ |
 
 `--trade` ต้องแก้ `ALLOW_LIVE_ACCOUNT = True` ใน `runner.py` เองก่อน ถึงจะใช้กับบัญชีจริงได้
 
@@ -152,6 +152,26 @@ pip install -r requirements.txt
 ```
 
 ต้องมี MT5 terminal **เปิดอยู่ ล็อกอินแล้ว และเปิด Algo Trading** บอทไม่ได้ล็อกอินเอง
+
+### สั่งผ่าน SSH หรือ scheduled task
+
+แพ็กเกจ `MetaTrader5` หา terminal เองไม่เจอเมื่อสั่งจาก session ที่ไม่มีหน้าจอ
+ล้มด้วย `[-10003] IPC initialize failed, MetaTrader 5 x64 not found` ทั้งที่ terminal
+เปิดค้างอยู่ใน session อื่น บอกทางไปให้ตรงๆ ใน `.env`
+
+```
+MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
+```
+
+หา path จริงของตัวที่รันอยู่ด้วย
+
+```powershell
+powershell -c "Get-Process terminal64 | Select-Object -ExpandProperty Path"
+```
+
+ตั้งแล้ว SSH สั่งงาน terminal ที่เปิดค้างอยู่ในหน้าจอได้ตามปกติ — เปิดและล็อกอิน MT5
+ครั้งแรกยังต้องทำผ่านหน้าจอ (RDP หรือหน้าเครื่อง) เพราะเป็น GUI
+**disconnect RDP ได้ แต่อย่า sign out** — sign out คือปิด terminal ไปด้วย
 
 **WSL/Linux** (เครื่องที่อ่านผล) — `MetaTrader5` ไม่มีตัว Linux ต้องลงเฉพาะที่เหลือ
 

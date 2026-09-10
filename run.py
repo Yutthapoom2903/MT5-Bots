@@ -622,6 +622,16 @@ def main():
     import MetaTrader5 as mt5
     import mt5_core as core
 
+    # .env ถือ MT5_TERMINAL_PATH ซึ่ง core.connect() ต้องใช้ตอนแพ็กเกจหา terminal
+    # เองไม่เจอ อ่านตรงนี้ทีเดียวเพื่อให้ทุกคำสั่งเห็นเหมือนกัน ไม่ใช่เฉพาะคำสั่ง
+    # ที่บังเอิญ import runner เข้ามาด้วย
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        pass
+    else:
+        load_dotenv()
+
     try:
         return COMMANDS[command](args) or 0
     except core.MT5Error as error:

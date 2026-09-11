@@ -38,10 +38,12 @@ def items():
 
         Item("7", "จำลองย้อนหลังบนข้อมูลจริง", "backtest", True, {}, "วิเคราะห์"),
         Item("8", "กวาดค่า ดูว่าผลทนหรือฟลุค", "sweep", True, {}, "วิเคราะห์"),
+        Item("9", "จูนจากอดีต วัดผลกับช่วงที่ไม่เคยเห็น", "walkforward", True,
+             {}, "วิเคราะห์"),
 
-        Item("9", "เช็คว่าทำไม Telegram ไม่เข้า", "notify", False,
+        Item("10", "เช็คว่าทำไม Telegram ไม่เข้า", "notify", False,
              {"check": True, "dry": False}, "เครื่องมือ"),
-        Item("10", "รันเทส logic", "test", False, {}, "เครื่องมือ"),
+        Item("11", "รันเทส logic", "test", False, {}, "เครื่องมือ"),
     ]
 
 

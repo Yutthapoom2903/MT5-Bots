@@ -741,6 +741,119 @@ def test_sweep_report_calls_out_a_strategy_with_no_edge():
     assert "ไม่มีชุดไหนเป็นบวก" in backtest.format_sweep(rows)
 
 
+# ---------- เดินหน้าทีละช่วง ----------
+
+def _long_market():
+    """ตลาดยาวพอจะแบ่งเป็นหลายช่วงได้จริง"""
+    return _trending_market(cycles=25, length=120)
+
+
+def test_the_training_window_never_touches_the_window_it_is_scored_on():
+    """ค่าที่เลือกต้องมาจากอดีตล้วน ถ้าช่วงฝึกกินเข้าไปในช่วงทดสอบ ตัวเลขที่ได้คือการโกง"""
+    bounds = backtest.fold_bounds(total=1000, folds=4, warmup=60)
+
+    assert len(bounds) == 4
+
+    for (train_end, test_end), (next_train_end, _) in zip(bounds, bounds[1:]):
+        assert train_end < test_end            # ช่วงทดสอบอยู่หลังช่วงฝึกเสมอ
+        assert next_train_end == test_end      # ช่วงถัดไปฝึกได้ถึงแค่ที่ทดสอบไปแล้ว
+
+
+def test_a_history_too_short_to_split_says_so_instead_of_returning_numbers():
+    """ข้อมูลสั้นแล้วยังแบ่ง จะได้ช่วงที่มีแต่แท่งอุ่นเครื่อง แล้วรายงานตัวเลขที่ไม่มีความหมาย"""
+    assert backtest.fold_bounds(total=200, folds=4, warmup=60) == []
+
+    result = backtest.walk_forward(_trending_market(cycles=1, length=60),
+                                   None, None, {"use_filters": False})
+
+    assert result["reason"] is not None
+    assert result["folds"] == []
+    assert result["reason"] in backtest.format_walk_forward(result)
+
+
+def test_walk_forward_does_not_trade_the_warmup_bars_it_prepends():
+    """ช่วงทดสอบมีแท่งก่อนหน้านำมาให้ indicator นิ่ง แต่ห้ามเข้าไม้ในแท่งพวกนั้น"""
+    result = backtest.walk_forward(_long_market(), None, None,
+                                   {"use_filters": False}, folds=3)
+
+    scored = [fold for fold in result["folds"] if fold["first_entry"] is not None]
+
+    assert scored
+    for fold in scored:
+        assert fold["first_entry"] >= fold["test_from"]
+
+
+def test_walk_forward_scores_the_default_settings_on_the_same_window():
+    """คำถามคือ 'จูนแล้วดีกว่าไม่จูนไหม' ถ้าไม่วัดค่า default บนช่วงเดียวกันก็ตอบไม่ได้"""
+    result = backtest.walk_forward(_long_market(), None, None,
+                                   {"use_filters": False}, folds=3)
+
+    assert result["baseline"]["trades"] > 0
+    assert all("baseline" in fold for fold in result["folds"])
+
+
+def test_walk_forward_restores_the_threshold_it_tunes():
+    before = strategy.ADX_MIN
+
+    backtest.walk_forward(_long_market(), None, None, {"use_filters": False}, folds=3)
+    assert strategy.ADX_MIN == before
+
+    try:
+        backtest.walk_forward(None, None, None, {}, folds=3)
+    except Exception:
+        pass
+
+    assert strategy.ADX_MIN == before
+
+
+def _walk_result(tuned_r, baseline_r, trades, picks):
+    """ผลลัพธ์สำเร็จรูปสำหรับเทสคำตัดสิน ไม่ต้องจำลองจริง"""
+    return {
+        "bars": 5000,
+        "grid_keys": ["sl_atr_mult"],
+        "reason": None,
+        "folds": [{"number": number, "chosen": {"sl_atr_mult": pick}, "skipped": None,
+                   "test_from": pd.Timestamp("2026-01-01"), "test_to": pd.Timestamp("2026-02-01"),
+                   "train_bars": 100, "test_bars": 100, "first_entry": None,
+                   "train": {"trades": 10}, "tuned": {"trades": 10, "expectancy_r": tuned_r},
+                   "baseline": {"trades": 10, "expectancy_r": baseline_r}}
+                  for number, pick in enumerate(picks, start=1)],
+        "tuned": {"trades": trades, "expectancy_r": tuned_r, "total_r": tuned_r * trades},
+        "baseline": {"trades": trades, "expectancy_r": baseline_r,
+                     "total_r": baseline_r * trades},
+    }
+
+
+def test_a_tuned_result_that_beats_default_on_too_few_trades_is_called_noise():
+    text = backtest.format_walk_forward(
+        _walk_result(tuned_r=0.5, baseline_r=0.1, trades=12, picks=[1.0, 1.0]))
+
+    assert "noise" in text
+    assert "อย่าเพิ่งเอาไปเปลี่ยนค่า" in text
+
+
+def test_the_verdict_says_tuning_did_not_help_when_the_defaults_did_better():
+    text = backtest.format_walk_forward(
+        _walk_result(tuned_r=0.05, baseline_r=0.20, trades=200, picks=[1.0, 1.0]))
+
+    assert "ไม่ดีขึ้นนอกช่วงฝึก" in text
+    assert "ใช้ค่า default ต่อไป" in text
+
+
+def test_parameters_that_change_every_window_are_called_out_as_noise():
+    text = backtest.format_walk_forward(
+        _walk_result(tuned_r=0.4, baseline_r=0.1, trades=200, picks=[1.0, 1.5, 2.0, 1.0]))
+
+    assert "เปลี่ยนเกือบทุกช่วง" in text
+
+
+def test_one_setting_winning_every_window_is_called_steady():
+    text = backtest.format_walk_forward(
+        _walk_result(tuned_r=0.4, baseline_r=0.1, trades=200, picks=[1.5, 1.5, 1.5]))
+
+    assert "นิ่งจริง" in text
+
+
 # ---------- รายงานสรุป ----------
 
 def test_report_survives_a_directory_with_no_files():

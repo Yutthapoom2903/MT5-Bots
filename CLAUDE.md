@@ -32,7 +32,8 @@ subcommand.
 
 ```
 run.py          CLI: menu | check | symbols | signal | watch | trade | backtest
-                     sweep | report | review | outcomes | notify | test | all
+                     sweep | walkforward | report | review | outcomes | notify
+                     test | all
 runner.py       the one loop — fetch once per candle, then log + decide + optionally trade
 strategy.py     pure decision engine: context dict in, Decision out. No MT5 imports.
 notify.py       Telegram: categories, formatting, anti-spam. No MT5 imports either.
@@ -244,6 +245,21 @@ that test. The inner position loop takes numpy arrays, not DataFrames, for the s
 `sweep()` prepares indicators once and reuses them, and restores `strategy.ADX_MIN` in a
 `finally`. Its point is robustness, not optimisation — a grid that is profitable only in one
 cell is noise, and `format_sweep()` says so rather than reporting a winner.
+
+`walk_forward()` is the part that says whether tuning survives contact with data it has not
+seen. It splits the bars into `folds + 1` equal blocks, tunes on everything before block *i*
+(an expanding window, which is what a person actually does), and scores that choice on block
+*i* alone — then scores the shipped defaults on the same block, because the question is not
+"did the tuned settings make money" but "did tuning beat not tuning". Indicators are prepared
+once over the whole frame and that is not lookahead — every one is a rolling function of bars
+up to *i*; the leak that matters is parameter *selection*, and that is what the split fences
+off. Each test block is handed `warmup_bars()` of lead-in so its first trade lands on the
+block's first bar rather than `warmup` bars into it; `fold["first_entry"]` records that bar so
+`test_walk_forward_does_not_trade_the_warmup_bars_it_prepends` can pin it. `simulate()` and
+`walk_forward()` must keep reading warmup from `warmup_bars()` — two copies of that number
+silently shift where every window starts. A history too short to split returns `reason` and no
+folds instead of numbers from a block that is all warmup, and `MIN_TEST_TRADES` labels a thin
+out-of-sample record as noise the way `MIN_SAMPLE` does in `outcomes.py`.
 
 Results are in R (risk multiples), not currency — independent of balance and lot size.
 `compare()` runs with and without filters; that delta is the point of the tool.

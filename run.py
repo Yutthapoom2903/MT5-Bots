@@ -14,6 +14,7 @@
     python run.py trade        เฝ้าดูและส่งคำสั่งจริง
     python run.py backtest     จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริง
     python run.py sweep        กวาดหลายชุดค่าเพื่อดูว่าผลทนต่อการเปลี่ยนค่าไหม
+    python run.py walkforward  จูนจากอดีต แล้ววัดผลบนช่วงที่ยังไม่เคยเห็น
     python run.py report       สรุปว่าบอททำอะไรไปบ้าง จากไฟล์ที่มันเขียนไว้
     python run.py review       สรุปผลจากข้อมูลที่คุณติดป้ายกำกับไว้เอง
     python run.py outcomes     ตัวกรองแยกแท่งที่เทรนด์ไปต่อได้จริงไหม จากข้อมูลที่เก็บเอง
@@ -379,6 +380,29 @@ def command_sweep(args):
     print("\nอย่าหยิบค่าที่ดีที่สุดไปใช้ตรงๆ ค่าที่อยู่กลางย่านที่กำไรทั้งย่านทนกว่ามาก")
 
 
+def command_walkforward(args):
+    """จูนค่าจากอดีต แล้ววัดผลบนช่วงถัดไปที่ยังไม่เคยเห็น
+
+    sweep บอกได้แค่ว่ากริดทนไหม แต่วัดบนข้อมูลชุดเดียวกับที่ใช้เลือกค่า คำสั่งนี้ตอบ
+    คำถามที่ต่างออกไป: ค่าที่จูนมาแล้วยังดีอยู่ไหมกับข้อมูลที่มันไม่เคยเห็น
+    """
+    import backtest
+
+    m15, h1, m5 = _load_history(args.months)
+
+    grid = dict(backtest.DEFAULT_GRID)
+    if args.quick:
+        grid = {"sl_atr_mult": (1.0, 1.5, 2.0), "tp_atr_mult": (2.0, 3.0, 4.0)}
+
+    def progress(number, total):
+        print(f"ช่วงที่ {number}/{total} ...")
+
+    result = backtest.walk_forward(m15, h1, m5, {"spread_points": args.spread}, grid,
+                                   folds=args.folds, progress=progress)
+    print()
+    print(backtest.format_walk_forward(result))
+
+
 def command_review(args):
     import backtest_engine
     backtest_engine.run_backtest(args.csv)
@@ -528,7 +552,7 @@ def command_all(args):
     """คำสั่งเดียวจบ — หา Symbol ตรวจความพร้อม วิเคราะห์ย้อนหลัง แล้วเฝ้าดูสด"""
     import runner
 
-    total = 4 if args.skip_backtest else 6
+    total = 4 if args.skip_backtest else 7
 
     _phase(1, total, "หา Symbol ที่ broker ใช้")
     _auto_symbol(args)
@@ -545,7 +569,9 @@ def command_all(args):
                    command_backtest, args)
         _try_phase(5, total, "กวาดค่า — ผลทนต่อการเปลี่ยนค่าหรือแค่ฟลุค",
                    command_sweep, args)
-        step = 6
+        _try_phase(6, total, "จูนแล้วยังดีกับช่วงที่ไม่เคยเห็นไหม",
+                   command_walkforward, args)
+        step = 7
 
     _phase(step, total, "เทรดสด" if args.trade else "เฝ้าดูตลาดสด (ไม่ส่งคำสั่ง)")
 
@@ -568,7 +594,7 @@ def build_parser():
     # พิมพ์ run.py เปล่าๆ ต้องทำงานได้ทันที จึงต้องมี default ของทุก flag ที่ all ใช้
     parser.set_defaults(
         command=None, trade=False, months=6, spread=30.0,
-        top=15, quick=False, skip_backtest=False, no_compare=False,
+        top=15, quick=False, skip_backtest=False, no_compare=False, folds=4,
         csv="market_training_data.csv", keywords=None, dry=False, check=False,
         horizon=8,
     )
@@ -599,6 +625,13 @@ def build_parser():
     sweep.add_argument("--spread", type=float, default=30.0)
     sweep.add_argument("--top", type=int, default=15, help="แสดงกี่แถว")
     sweep.add_argument("--quick", action="store_true", help="กวาดเฉพาะ SL/TP ไม่รวม ADX")
+
+    forward_test = subparsers.add_parser(
+        "walkforward", help="จูนจากอดีต แล้ววัดผลบนช่วงที่ยังไม่เคยเห็น")
+    forward_test.add_argument("--months", type=int, default=6)
+    forward_test.add_argument("--spread", type=float, default=30.0)
+    forward_test.add_argument("--folds", type=int, default=4, help="แบ่งกี่ช่วงทดสอบ")
+    forward_test.add_argument("--quick", action="store_true", help="กวาดเฉพาะ SL/TP")
 
     subparsers.add_parser("report", help="สรุปว่าบอททำอะไรไปบ้าง")
 
@@ -638,6 +671,7 @@ COMMANDS = {
     "trade": command_trade,
     "backtest": command_backtest,
     "sweep": command_sweep,
+    "walkforward": command_walkforward,
     "report": command_report,
     "review": command_review,
     "outcomes": command_outcomes,

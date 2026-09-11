@@ -14,10 +14,12 @@ run() เป็นที่เดียวที่คุยกับผู้�
 import os
 from collections import namedtuple
 
+from bot import paths
+
 Item = namedtuple("Item", "key label command needs_mt5 overrides group")
 
-FEATURE_LOG = "market_training_data.csv"
-TRADE_LOG = "trade_log.csv"
+FEATURE_LOG = paths.FEATURE_LOG
+TRADE_LOG = paths.TRADE_LOG
 
 QUIT_KEYS = ("q", "quit", "exit", "0")
 
@@ -194,7 +196,7 @@ def _invoke(function, args, needs_mt5, out):
         return
 
     import MetaTrader5 as mt5
-    import mt5_core as core
+    from bot import core
 
     try:
         function(args)

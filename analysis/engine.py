@@ -10,7 +10,9 @@ import sys
 
 import pandas as pd
 
-CSV_FILE = "market_training_data.csv"
+from bot import paths
+
+CSV_FILE = paths.FEATURE_LOG
 REQUIRED_COLUMNS = ("your_decision", "trade_result")
 
 

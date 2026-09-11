@@ -77,7 +77,7 @@ powercfg /change hibernate-timeout-ac 0
 กด `Ctrl+C` แล้ว push — CSV ติดตาม git อยู่ ไม่ push ข้อมูลไม่ไปไหน
 
 ```powershell
-git add *.csv && git commit -m "add data" && git push
+git add data/*.csv && git commit -m "add data" && git push
 ```
 
 ### ที่ทำงาน (WSL ไม่มี MT5)
@@ -94,7 +94,7 @@ git pull
 .venv/bin/python run.py outcomes   # ตัวกรองแยกแท่งที่เทรนด์ไปต่อได้จริงไหม
 ```
 
-> `bot.log` อยู่ใน `.gitignore` ส่วน "ปัญหาใน bot.log" ของ report จึงว่างเสมอที่ทำงาน
+> `data/bot.log` อยู่ใน `.gitignore` ส่วน "ปัญหาใน data/bot.log" ของ report จึงว่างเสมอที่ทำงาน
 > อยากอ่าน error ต้องดูที่เครื่องบ้าน
 
 ### สองอย่างที่ต้องรู้เรื่องข้อมูลที่ได้
@@ -133,13 +133,14 @@ session ไหน ถ้า broker เป็น GMT+3 ชั่วโมง 17�
 | `python run.py trade` | เฝ้าดูและส่งคำสั่งจริง | ใช่ |
 | `python run.py backtest` | จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริง | ใช่ |
 | `python run.py sweep` | กวาดหลายชุดค่า ดูว่าผลทนหรือแค่ฟลุค | ใช่ |
+| `python run.py walkforward` | **จูนจากอดีต แล้ววัดกับช่วงที่ไม่เคยเห็น** | ใช่ |
 | `python run.py report` | **สรุปว่าบอททำอะไรไปบ้าง** | ไม่ |
 | `python run.py outcomes` | **วัดว่าตัวกรองแยกอะไรได้จริงไหม** | ไม่ |
 | `python run.py review` | สรุปผลจากข้อมูลที่คุณติดป้ายกำกับเอง | ไม่ |
 | `python run.py notify` | ส่งตัวอย่างแจ้งเตือนครบทุกหมวด | ไม่ |
-| `python run.py test` | รันเทส logic 215 ข้อ | ไม่ |
+| `python run.py test` | รันเทส logic 228 ข้อ | ไม่ |
 
-`--trade` ต้องแก้ `ALLOW_LIVE_ACCOUNT = True` ใน `runner.py` เองก่อน ถึงจะใช้กับบัญชีจริงได้
+`--trade` ต้องแก้ `ALLOW_LIVE_ACCOUNT = True` ใน `bot/runner.py` เองก่อน ถึงจะใช้กับบัญชีจริงได้
 
 ---
 
@@ -206,7 +207,7 @@ python run.py --trade    # บน Demo เท่านั้น
 
 `ALLOW_LIVE_ACCOUNT = False` กันไว้แล้ว — เจอบัญชีจริงจะหยุดทันทีพร้อมบอกเหตุผล
 
-`run.py report` เตือนให้เองถ้า `trade_log.csv` ยังว่าง
+`run.py report` เตือนให้เองถ้า `data/trade_log.csv` ยังว่าง
 
 ### สองหลักการเวลาเก็บข้อมูล
 
@@ -236,7 +237,7 @@ Demo เสี่ยงเกินงบแล้วเทรดต่อพร
 `python run.py check` คำนวณเลขนี้กับบัญชีจริงให้ดู เป็นทางที่เร็วที่สุดในการตอบว่า
 "ทำไมบอทไม่เข้าไม้สักที"
 
-ค่าที่แก้ได้ใน `runner.py`: `RISK_PERCENT` (1.0), `SL_ATR_MULT` (1.5), `TP_ATR_MULT` (3.0),
+ค่าที่แก้ได้ใน `bot/runner.py`: `RISK_PERCENT` (1.0), `SL_ATR_MULT` (1.5), `TP_ATR_MULT` (3.0),
 `MAX_DAILY_LOSS_PERCENT` (3.0), `MAX_TRADES_PER_DAY` (5), `MAX_CONSECUTIVE_LOSSES` (3)
 
 ---
@@ -252,7 +253,7 @@ Demo เสี่ยงเกินงบแล้วเทรดต่อพร
 
 ใช้เฉพาะ**แท่งที่ปิดแล้ว** เข้าช้ากว่าราคาปัจจุบันเสมอ — ตั้งใจ ไม่งั้นสัญญาณพลิกกลางแท่ง
 
-ตัวกรองเปิด/ปิดได้ทีละตัวใน `strategy.py` (`USE_H1_TREND_FILTER`, `USE_ADX_FILTER`,
+ตัวกรองเปิด/ปิดได้ทีละตัวใน `bot/strategy.py` (`USE_H1_TREND_FILTER`, `USE_ADX_FILTER`,
 `USE_RSI_FILTER`, `USE_M5_CONFIRM`) พร้อมเกณฑ์ `ADX_MIN` (20), `MAX_SPREAD_POINTS` (50)
 
 หลังเปิดไม้: เลื่อน SL ไป breakeven ที่ 1R แล้วไล่ตาม ATR ที่ 1.5R
@@ -260,17 +261,32 @@ Demo เสี่ยงเกินงบแล้วเทรดต่อพร
 
 ---
 
+## โครงไฟล์
+
+```
+run.py        ประตูเดียว ทุกคำสั่งอยู่ใต้ไฟล์นี้
+bot/          ฝั่งที่ต่อ MT5 จริง — core, trade, runner, strategy, notify, menu
+analysis/     ฝั่งอ่านย้อนหลัง — backtest, outcomes, report, engine
+data/         ไฟล์ที่บอทเขียน (CSV ขึ้น git, log กับ state ไม่ขึ้น)
+tests/        เทส logic 228 ข้อ ไม่ต้องมี MT5
+```
+
+`analysis/` เรียกใช้ `bot/` ได้ แต่ `bot/` ห้ามเรียก `analysis/` — ลูปที่เทรดจริงต้องไม่พัง
+เพราะโมดูลรายงาน ชื่อไฟล์ข้อมูลทั้งหมดอยู่ใน `bot/paths.py` ที่เดียว
+
+---
+
 ## ไฟล์ที่บอทสร้าง
 
 | ไฟล์ | เนื้อหา | ขึ้น git |
 |---|---|---|
-| `market_training_data.csv` | สถานะตลาดเต็ม + คำตัดสิน + ช่องให้กรอกเอง | ใช่ |
-| `signal_log.csv` | สัญญาณของทุกแท่งที่ปิด | ใช่ |
-| `trade_log.csv` | ทุกครั้งที่ส่งคำสั่ง สำเร็จและไม่สำเร็จ | ใช่ |
-| `bot.log` | log ละเอียดทุกรอบ หมุนที่ 5MB × 5 ไฟล์ | ไม่ |
-| `bot_state.json` | แท่งล่าสุดที่ประมวลผล กัน restart ยิงซ้ำ | ไม่ |
+| `data/market_training_data.csv` | สถานะตลาดเต็ม + คำตัดสิน + ช่องให้กรอกเอง | ใช่ |
+| `data/signal_log.csv` | สัญญาณของทุกแท่งที่ปิด | ใช่ |
+| `data/trade_log.csv` | ทุกครั้งที่ส่งคำสั่ง สำเร็จและไม่สำเร็จ | ใช่ |
+| `data/bot.log` | log ละเอียดทุกรอบ หมุนที่ 5MB × 5 ไฟล์ | ไม่ |
+| `data/bot_state.json` | แท่งล่าสุดที่ประมวลผล กัน restart ยิงซ้ำ | ไม่ |
 
-`market_training_data.csv` มีคอลัมน์ท้ายว่างไว้ให้กรอกเอง — `your_decision` (BUY/SELL),
+`data/market_training_data.csv` มีคอลัมน์ท้ายว่างไว้ให้กรอกเอง — `your_decision` (BUY/SELL),
 `your_reason`, `trade_result` (WIN/LOSS) แล้วรัน `run.py review` จะให้คะแนน
 การตัดสินใจ**ของคุณ** แยกตาม BUY/SELL และตามเทรนด์ H1 (พิมพ์เล็กพิมพ์ใหญ่ไม่สำคัญ)
 คอลัมน์ `bot_decision` กับ `bot_blockers` อยู่แถวเดียวกันไว้ให้เทียบด้วยตาว่าบอทคิดยังไง
@@ -312,7 +328,7 @@ python run.py notify --check  # ข้อความไม่มา ใช้�
 - `QUIET_HOURS` ตั้งไว้เที่ยงคืน–เจ็ดโมง ส่งครบเหมือนเดิมแต่ไม่มีเสียง
 - `HOLD_DIGEST_CANDLES = 4` รวม HOLD สี่แท่ง (หนึ่งชั่วโมง) เป็นข้อความเดียว ตั้งเป็น 1 คือกลับไปส่งทุกแท่ง
 
-8 หมวด เปิด/ปิดแยกกันได้ใน `notify.py`: `lifecycle` `market` `signal` `entry` `manage`
+8 หมวด เปิด/ปิดแยกกันได้ใน `bot/notify.py`: `lifecycle` `market` `signal` `entry` `manage`
 `exit` `risk` `summary` — `SEND_HOLD` เปิดมาโดยตั้งใจ ข้อความทุกแท่งคือหลักฐานถูกที่สุดว่าท่อไม่ตัน
 เชื่อใจแล้วค่อยปิด
 

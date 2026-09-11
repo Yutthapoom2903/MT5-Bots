@@ -21,6 +21,11 @@ from datetime import datetime, timezone
 import MetaTrader5 as mt5
 import pandas as pd
 
+from bot.screen import (      # noqa: F401 — re-export ให้ runner ใช้ core.paint ได้เหมือนเดิม
+    BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, color_enabled, paint,
+)
+from bot import paths
+
 # ตำแหน่งแท่งใน DataFrame
 FORMING = -1     # แท่งที่กำลังก่อตัว — ห้ามใช้ตัดสินใจ
 CLOSED = -2      # แท่งที่ปิดล่าสุด
@@ -39,21 +44,13 @@ LOG_BACKUPS = 5
 # ---------- สีบนหน้าจอ ----------
 #
 # บอทพิมพ์ทุกรอบตลอดคืน จอเลยเป็นกำแพงตัวหนังสือ สีทำให้ WARNING/ERROR เด้งออกมา
-# ได้โดยไม่ต้องอ่านทุกบรรทัด ใช้ ANSI ล้วน ไม่เพิ่ม dependency (colorama/rich ลงได้
-# เครื่องเดียวจากสองเครื่อง เหมือนเหตุผลที่ไม่เอา TUI)
+# ได้โดยไม่ต้องอ่านทุกบรรทัด ตัวสีเองอยู่ใน bot/screen.py ที่เดียว ที่นี่ import มา
+# ใช้ต่อเพราะ runner.py เรียก core.paint / core.GREEN มาตั้งแต่ก่อนแยกไฟล์
 #
 # ห้ามให้รหัสสีลงไฟล์ — bot.log อ่านย้อนหลังด้วย report.py ซึ่งจับกลุ่มบรรทัด
 # ตามรูปแบบ รหัสสีแทรกอยู่จะทำให้บรรทัดที่เหมือนกันกลายเป็นคนละแบบ
 
-RESET = "\033[0m"
-DIM = "\033[2m"
-BOLD = "\033[1m"
-RED = "\033[31m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-CYAN = "\033[36m"
-
-# หน้าตาของแต่ละระดับบนจอ: (สี, สัญลักษณ์)
+# ระดับของ log บนจอ: (สี, สัญลักษณ์)
 LEVEL_STYLE = {
     "DEBUG": (DIM, "·"),
     "INFO": (CYAN, "▸"),
@@ -61,27 +58,6 @@ LEVEL_STYLE = {
     "ERROR": (RED, "✖"),
     "CRITICAL": (BOLD + RED, "✖"),
 }
-
-
-def color_enabled(stream=None):
-    """
-    จอนี้รับสีได้ไหม
-
-    ปิดเมื่อ NO_COLOR ถูกตั้ง (ธรรมเนียมของ no-color.org) หรือปลายทางไม่ใช่ terminal
-    เช่นตอน redirect ลงไฟล์หรือส่งต่อผ่าน pipe ซึ่งรหัสสีจะกลายเป็นขยะ
-    """
-    if os.getenv("NO_COLOR") is not None:
-        return False
-
-    stream = stream or sys.stdout
-    return bool(getattr(stream, "isatty", lambda: False)())
-
-
-def paint(text, *styles):
-    """ย้อมข้อความถ้าจอรับสีได้ ไม่ได้ก็คืนข้อความเดิม เรียกได้เสมอโดยไม่ต้องเช็คก่อน"""
-    if not styles or not color_enabled():
-        return text
-    return f"{''.join(styles)}{text}{RESET}"
 
 
 def _enable_windows_ansi():
@@ -160,11 +136,12 @@ def setup_logging(log_file=None, level=logging.INFO, console_level=logging.INFO)
     handlers = [console]
 
     if log_file:
+        paths.ensure_parent(log_file)
         rotating = logging.handlers.RotatingFileHandler(
             log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8",
         )
         rotating.setLevel(level)
-        # ไฟล์ไม่ผ่าน ConsoleFormatter เด็ดขาด รหัสสีลงไฟล์แล้ว report.py จับกลุ่มผิด
+        # ไฟล์ไม่ผ่าน ConsoleFormatter เด็ดขาด รหัสสีลงไฟล์แล้ว analysis/report.py จับกลุ่มผิด
         rotating.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
         ))
@@ -422,11 +399,12 @@ def append_csv(path, row):
 
     เดิมเขียน header เฉพาะตอนไฟล์ยังไม่มี พอเพิ่มคอลัมน์ (adx_14, m5_trend,
     bot_decision, bot_blockers) แถวใหม่จึงมี 26 ช่องขณะที่ header ในไฟล์ยังเป็น 22
-    pandas อ่านไฟล์แบบนั้นแล้วค่าเลื่อนคอลัมน์ยกไฟล์ — backtest_engine ที่อ่านเฉพาะ
+    pandas อ่านไฟล์แบบนั้นแล้วค่าเลื่อนคอลัมน์ยกไฟล์ — analysis/engine.py ที่อ่านเฉพาะ
     คอลัมน์ที่ติดป้ายเองจึงไปหยิบค่าของคอลัมน์อื่นมาให้คะแนน
     ตอนนี้ถ้า header ในไฟล์ไม่ตรงกับแถวที่จะเขียน จะจัดไฟล์ใหม่ให้ครบทุกคอลัมน์ก่อน
     """
     columns = list(row)
+    paths.ensure_parent(path)
 
     if not os.path.exists(path):
         pd.DataFrame([row]).to_csv(path, index=False)
@@ -470,6 +448,8 @@ def align_csv_columns(path, columns):
         rebuilt.append([record.get(name, "") for name in columns])
 
     # เขียนไฟล์ชั่วคราวก่อนแล้ว replace ด้วยเหตุผลเดียวกับ save_state
+    paths.ensure_parent(path)
+
     temp_path = f"{path}.tmp"
     with open(temp_path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)

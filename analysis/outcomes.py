@@ -18,7 +18,7 @@ market_training_data.csv เก็บ OHLC ของทุกแท่ง M15 �
 import numpy as np
 import pandas as pd
 
-import strategy
+from bot import strategy
 
 HORIZON = 8              # แท่ง M15 ที่มองไปข้างหน้า = 2 ชั่วโมง
 SL_ATR_MULT = 1.5        # ต้องตรงกับ runner.SL_ATR_MULT — มีเทสตรึงไว้

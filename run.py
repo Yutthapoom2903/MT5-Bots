@@ -27,6 +27,8 @@ import os
 import subprocess
 import sys
 
+from bot import paths      # ชื่อไฟล์ข้อมูลอย่างเดียว ไม่แตะ MT5
+
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ไม่ import MetaTrader5 ที่ระดับโมดูล เพราะคำสั่ง backtest และ test ต้องรันได้
@@ -40,9 +42,9 @@ def _print_header(title):
 def command_check(args):
     """ตรวจว่าทุกอย่างพร้อม และบอกตรงๆ ว่าทุนที่มีพอกับความเสี่ยงที่ตั้งไว้หรือไม่"""
     import MetaTrader5 as mt5
-    import mt5_core as core
-    import mt5_trade as trade
-    import runner
+    from bot import core
+    from bot import trade
+    from bot import runner
 
     account = core.connect()
     _print_header("การเชื่อมต่อ")
@@ -105,7 +107,7 @@ def command_check(args):
 
 def command_symbols(args):
     import MetaTrader5 as mt5
-    import mt5_core as core
+    from bot import core
 
     core.connect()
     keywords = tuple(word.upper() for word in (args.keywords or ["XAU", "GOLD", "EURUSD", "BTC"]))
@@ -121,9 +123,9 @@ def command_symbols(args):
 
 def command_signal(args):
     """คำตัดสินครั้งเดียวพร้อมเหตุผลครบทุกข้อ"""
-    import mt5_core as core
-    import runner
-    import strategy
+    from bot import core
+    from bot import runner
+    from bot import strategy
 
     core.connect()
     core.prepare_symbol(runner.SYMBOL)
@@ -149,7 +151,7 @@ def _run_loop(trade_enabled):
 
     บอทที่ตายเงียบคือบอทที่แย่ที่สุด โดยเฉพาะตอนถือไม้อยู่แล้วไม่มีใครขยับ SL ให้
     """
-    import runner
+    from bot import runner
 
     try:
         runner.run(trade_enabled=trade_enabled)
@@ -179,8 +181,8 @@ def command_notify(args):
 
     from dotenv import load_dotenv
 
-    import notify
-    import strategy
+    from bot import notify
+    from bot import strategy
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -288,7 +290,7 @@ def _sample_notifications(sender, strategy):
                           max_spread=strategy.MAX_SPREAD_POINTS)
 
     # HOLD ถูกรวมเป็นสรุปทุก HOLD_DIGEST_CANDLES แท่ง ป้อนให้ครบรอบจะได้เห็นของจริง
-    import notify
+    from bot import notify
 
     hold = strategy.evaluate(dict(context, m15_signal="HOLD"))
     for step in range(max(1, notify.HOLD_DIGEST_CANDLES)):
@@ -330,7 +332,7 @@ def _sample_notifications(sender, strategy):
 
 def command_report(args):
     """สรุปการทำงานจากไฟล์ที่บอทเขียนไว้ ไม่ต้องต่อ MT5"""
-    import report
+    from analysis import report
     print(report.build_report())
 
 
@@ -339,7 +341,7 @@ def command_menu(args):
 
     ไม่ได้ไปแทน `python run.py` เปล่าๆ ซึ่งยังต้องทำงานครบทุกขั้นเหมือนเดิม
     """
-    import menu
+    from bot import menu
     return menu.run(COMMANDS, args)
 
 
@@ -349,7 +351,7 @@ def command_outcomes(args):
     ออฟไลน์ล้วน อ่าน market_training_data.csv อย่างเดียว จึงรันบน WSL ได้
     """
     import pandas as pd
-    import outcomes
+    from analysis import outcomes
 
     if not os.path.exists(args.csv):
         print(f"ยังไม่มีไฟล์ข้อมูล: {args.csv}")
@@ -361,8 +363,8 @@ def command_outcomes(args):
 
 def command_sweep(args):
     """กวาดหลายชุดค่า ดูว่าผลลัพธ์ทนต่อการเปลี่ยนค่าหรือแค่ฟลุค"""
-    import backtest
-    import runner
+    from analysis import backtest
+    from bot import runner
 
     m15, h1, m5 = _load_history(args.months)
 
@@ -386,7 +388,7 @@ def command_walkforward(args):
     sweep บอกได้แค่ว่ากริดทนไหม แต่วัดบนข้อมูลชุดเดียวกับที่ใช้เลือกค่า คำสั่งนี้ตอบ
     คำถามที่ต่างออกไป: ค่าที่จูนมาแล้วยังดีอยู่ไหมกับข้อมูลที่มันไม่เคยเห็น
     """
-    import backtest
+    from analysis import backtest
 
     m15, h1, m5 = _load_history(args.months)
 
@@ -404,14 +406,14 @@ def command_walkforward(args):
 
 
 def command_review(args):
-    import backtest_engine
+    from analysis import engine as backtest_engine
     backtest_engine.run_backtest(args.csv)
 
 
 def _load_history(months):
     """ดึงข้อมูลย้อนหลังทุก timeframe ที่กลยุทธ์ใช้"""
-    import mt5_core as core
-    import runner
+    from bot import core
+    from bot import runner
 
     core.connect()
     core.prepare_symbol(runner.SYMBOL)
@@ -436,8 +438,8 @@ def _load_history(months):
 
 def command_backtest(args):
     """จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริงจาก MT5"""
-    import backtest
-    import runner
+    from analysis import backtest
+    from bot import runner
 
     m15, h1, m5 = _load_history(args.months)
 
@@ -510,7 +512,7 @@ def _try_phase(number, total, title, function, args):
     ขั้นตอนวิเคราะห์ (จำลองย้อนหลัง/กวาดค่า) ล้มได้ถ้าข้อมูลย้อนหลังไม่พอ
     ซึ่งไม่ควรทำให้การเฝ้าดูตลาดสดไม่ได้เริ่ม
     """
-    import mt5_core as core
+    from bot import core
 
     _phase(number, total, title)
 
@@ -527,8 +529,8 @@ def _try_phase(number, total, title, function, args):
 
 def _auto_symbol(args):
     """หาชื่อ Symbol ที่ broker ใช้จริงแล้วตั้งให้ทั้งโปรเจกต์ใช้ตัวเดียวกัน"""
-    import mt5_core as core
-    import runner
+    from bot import core
+    from bot import runner
 
     core.connect()
     resolved, candidates = core.resolve_symbol(runner.SYMBOL)
@@ -550,7 +552,7 @@ def _auto_symbol(args):
 
 def command_all(args):
     """คำสั่งเดียวจบ — หา Symbol ตรวจความพร้อม วิเคราะห์ย้อนหลัง แล้วเฝ้าดูสด"""
-    import runner
+    from bot import runner
 
     total = 4 if args.skip_backtest else 7
 
@@ -579,7 +581,7 @@ def command_all(args):
         print("โหมดเฝ้าดู ไม่มีการส่งคำสั่งซื้อขาย")
         print("อยากให้เทรดจริงใช้: python run.py --trade")
 
-    print("บันทึกทุกอย่างลง bot.log — เช้ามาสรุปด้วย: python run.py report")
+    print(f"บันทึกทุกอย่างลง {paths.LOG_FILE} — เช้ามาสรุปด้วย: python run.py report")
     print("กด Ctrl+C เพื่อหยุด\n")
 
     _run_loop(trade_enabled=args.trade)
@@ -595,7 +597,7 @@ def build_parser():
     parser.set_defaults(
         command=None, trade=False, months=6, spread=30.0,
         top=15, quick=False, skip_backtest=False, no_compare=False, folds=4,
-        csv="market_training_data.csv", keywords=None, dry=False, check=False,
+        csv=paths.FEATURE_LOG, keywords=None, dry=False, check=False,
         horizon=8,
     )
     parser.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
@@ -637,12 +639,12 @@ def build_parser():
 
     forward = subparsers.add_parser("outcomes",
                                     help="ตัวกรองแยกแท่งที่เทรนด์ไปต่อได้จริงไหม")
-    forward.add_argument("--csv", default="market_training_data.csv", help="ไฟล์ข้อมูล")
+    forward.add_argument("--csv", default=paths.FEATURE_LOG, help="ไฟล์ข้อมูล")
     forward.add_argument("--horizon", type=int, default=8,
                          help="จำนวนแท่ง M15 ที่มองไปข้างหน้า (ค่าเริ่มต้น 8 = 2 ชม.)")
 
     review = subparsers.add_parser("review", help="สรุปผลจากข้อมูลที่คุณติดป้ายเอง")
-    review.add_argument("csv", nargs="?", default="market_training_data.csv")
+    review.add_argument("csv", nargs="?", default=paths.FEATURE_LOG)
 
     sample = subparsers.add_parser("notify", help="ส่งตัวอย่างแจ้งเตือนครบทุกหมวด")
     sample.add_argument("--dry", action="store_true", help="พิมพ์ลงจอแทนการส่งจริง")
@@ -695,7 +697,7 @@ def main():
         return COMMANDS[command](args) or 0
 
     import MetaTrader5 as mt5
-    import mt5_core as core
+    from bot import core
 
     # .env ถือ MT5_TERMINAL_PATH ซึ่ง core.connect() ต้องใช้ตอนแพ็กเกจหา terminal
     # เองไม่เจอ อ่านตรงนี้ทีเดียวเพื่อให้ทุกคำสั่งเห็นเหมือนกัน ไม่ใช่เฉพาะคำสั่ง

@@ -16,10 +16,11 @@ from datetime import datetime, timedelta
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
 
-import mt5_core as core
-import mt5_trade as trade
-import notify
-import strategy
+from bot import core
+from bot import paths
+from bot import trade
+from bot import notify
+from bot import strategy
 
 # ---------- ตลาดที่เฝ้า ----------
 SYMBOL = "XAUUSD"
@@ -73,11 +74,13 @@ CLOSE_LOOKUP_ATTEMPTS = 10    # รอประวัติดีลของไ
 HEARTBEAT_EVERY_HOURS = 12    # แจ้ง Telegram เป็นระยะว่ายังทำงานอยู่ 0 = ปิด
 
 # ---------- ไฟล์ ----------
-SIGNAL_LOG = "signal_log.csv"
-FEATURE_LOG = "market_training_data.csv"
-TRADE_LOG = "trade_log.csv"
-STATE_FILE = "bot_state.json"
-LOG_FILE = "bot.log"
+# ที่อยู่จริงอยู่ใน bot/paths.py ที่เดียว — ชื่อพวกนี้คงไว้เพราะ config ของบอท
+# อ่านจากหัวไฟล์นี้มาตลอด และเทสหลายตัวสลับค่าเหล่านี้เป็น path ชั่วคราว
+SIGNAL_LOG = paths.SIGNAL_LOG
+FEATURE_LOG = paths.FEATURE_LOG
+TRADE_LOG = paths.TRADE_LOG
+STATE_FILE = paths.STATE_FILE
+LOG_FILE = paths.LOG_FILE
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")

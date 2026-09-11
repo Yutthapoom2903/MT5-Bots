@@ -17,7 +17,7 @@ were consolidated for exactly that reason.
 the thing in the way — it dispatches through `run.COMMANDS`, so a capability wired into
 `command_all()` and the parser needs one line in `menu.items()` and nothing else.
 `test_every_menu_entry_points_at_a_command_that_exists` catches a stale name. It is not
-a replacement for the bare invocation and must never become one. Everything in `menu.py`
+a replacement for the bare invocation and must never become one. Everything in `bot/menu.py`
 except `run()` is pure — `items()`, `render()`, `choose()`, `status_lines()` take values
 and return values, so the tests press keys without a terminal. No new dependency: a
 curses or textual TUI would install on one of the two machines and not the other.
@@ -31,23 +31,40 @@ defaults for every flag `command_all` reads, so the bare invocation works with n
 subcommand.
 
 ```
-run.py          CLI: menu | check | symbols | signal | watch | trade | backtest
-                     sweep | walkforward | report | review | outcomes | notify
-                     test | all
-runner.py       the one loop — fetch once per candle, then log + decide + optionally trade
-strategy.py     pure decision engine: context dict in, Decision out. No MT5 imports.
-notify.py       Telegram: categories, formatting, anti-spam. No MT5 imports either.
-mt5_core.py     connect, symbol setup, rates, indicators, the crossover rule, logging, state
-mt5_trade.py    broker-facing only: price/volume normalization, stop distance, filling
-                mode, risk sizing, order send/close. Imported by runner.py alone.
-outcomes.py     labels each logged candle with what the market did next, then measures
-                the filters against those labels. Pure, no MT5.
-backtest_engine.py  scores the hand-labelled columns in market_training_data.csv
-backtest.py     historical simulation — pure, mirrors the live rules
-menu.py         numbered menu over the same subcommands. Pure except run().
-report.py       offline digest of the CSVs and bot.log
-tests/          215 logic tests, no MT5 required
+run.py                  CLI: menu | check | symbols | signal | watch | trade
+                        backtest | sweep | walkforward | report | review
+                        outcomes | notify | test | all
+bot/                    the live side — talks to MT5, decides, sends orders
+    core.py             connect, symbol setup, rates, indicators, the crossover rule,
+                        logging, state
+    trade.py            broker-facing only: price/volume normalization, stop distance,
+                        filling mode, risk sizing, order send/close. Imported by runner alone.
+    runner.py           the one loop — fetch once per candle, then log + decide + optionally trade
+    strategy.py         pure decision engine: context dict in, Decision out. No MT5 imports.
+    notify.py           Telegram: categories, formatting, anti-spam. No MT5 imports either.
+    menu.py             numbered menu over the same subcommands. Pure except run().
+    screen.py           ANSI colour and display-width padding. Imported by both sides.
+    paths.py            where the data files live. The only place those names are written.
+analysis/               the offline side — reads what the bot wrote, never writes to it
+    backtest.py         historical simulation and walk-forward — pure, mirrors the live rules
+    outcomes.py         labels each logged candle with what the market did next, then
+                        measures the filters against those labels. Pure, no MT5.
+    engine.py           scores the hand-labelled columns in data/market_training_data.csv
+    report.py           offline digest of the CSVs and data/bot.log
+data/                   what the bot writes. CSVs are committed; log and state are not.
+tests/                  228 logic tests, no MT5 required
 ```
+
+The dependency arrow points one way: `analysis/` imports from `bot/` (indicators, the
+filters, the file names), and nothing in `bot/` may import from `analysis/` — the live loop
+must not be able to break because a report module does. `bot/__init__.py` and
+`analysis/__init__.py` stay empty of imports for the same reason `run.py` defers its MT5
+imports: `from bot import paths` has to work on a machine with no `MetaTrader5`, and it
+would not if the package `__init__` pulled in `core`.
+
+`bot/screen.py` is the one exception that both sides share, and it is deliberately tiny and
+dependency-free. `bot/core.py` re-exports its colours (`core.paint`, `core.GREEN`) because
+`runner.py` has called them that since before the split.
 
 ## Running
 
@@ -68,7 +85,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 215 logic tests, runs under WSL
+python run.py test         # 228 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)
@@ -88,7 +105,7 @@ reference a new `mt5.CONSTANT` in library code, add it to the stub or the suite 
 under WSL.
 
 **`run.py trade` places real orders.** It refuses to start on a non-demo account unless
-`ALLOW_LIVE_ACCOUNT` is `True` in `runner.py` — never flip that flag on the user's behalf,
+`ALLOW_LIVE_ACCOUNT` is `True` in `bot/runner.py` — never flip that flag on the user's behalf,
 and never run the command without explicit confirmation.
 
 ## Invariants
@@ -104,9 +121,9 @@ so it stays testable.
 
 **Every verdict carries its reasons.** `Decision.checks` records each filter's pass/fail
 and the numbers behind it; blockers land in `bot_blockers` in the feature CSV and in
-`bot.log`. A filter that silently returns a boolean is a regression.
+`data/bot.log`. A filter that silently returns a boolean is a regression.
 
-**The candle timestamp guard persists.** `bot_state.json` holds the last processed candle
+**The candle timestamp guard persists.** `data/bot_state.json` holds the last processed candle
 so a restart mid-candle cannot re-fire an order. It also holds `position_risk` (1R per
 ticket, since the live SL moves after entry), `day` / `day_start_balance`, and the last
 daily summary. Entries are pruned when their ticket closes.
@@ -136,7 +153,7 @@ inside the broker's minimum stop distance.
   `runner.execute()` refuses the trade unless `ALLOW_RISK_OVER_BUDGET`. Any new sizing path
   must keep that check.
 - `pick_filling_modes()` reads the symbol's `filling_mode` bitmask and retries down the list
-  on retcode 10030. Retcodes are numeric constants in `mt5_trade.py` because their names
+  on retcode 10030. Retcodes are numeric constants in `bot/trade.py` because their names
   vary across package versions.
 
 Over-budget behaviour differs by account type: a demo account logs a warning and proceeds
@@ -146,7 +163,7 @@ is the fastest way to answer "why is the bot not entering anything".
 
 ## Notifications
 
-`notify.py` is the only place that talks to Telegram. It mirrors `strategy.py`'s shape on
+`bot/notify.py` is the only place that talks to Telegram. It mirrors `bot/strategy.py`'s shape on
 purpose: pure formatting functions plus a registry with one switch per item, so a category
 can be turned off to measure its noise the way a filter can be turned off to measure its
 effect. It imports no MT5 and is fully covered by the offline suite.
@@ -167,7 +184,7 @@ orders of magnitude.
   key for that long. Market-closed uses the second one — a weekend would otherwise send a
   message every `MARKET_CLOSED_SLEEP`. Give paired events different keys, or the cooldown on
   one swallows the other (`market-closed` vs `market-open`).
-- **State is in memory, not `bot_state.json`.** A restart repeating one message is fine; a
+- **State is in memory, not `data/bot_state.json`.** A restart repeating one message is fine; a
   restart going silent because it wrongly believes it already sent is not.
 - **Failures never propagate.** `_post()` retries once, honours a 429 `retry_after`, and on
   400 re-sends with the tags stripped rather than losing the message.
@@ -234,7 +251,7 @@ runs under the test stub. Two rules keep its numbers honest:
 
 Stop progression reuses `mt5_trade.breakeven_level` / `trailing_level` / `better_stop`, so
 the simulation cannot drift from live behaviour. If you change a stop rule, change it in
-`mt5_trade.py` and both paths follow.
+`bot/trade.py` and both paths follow.
 
 **`backtest.signal_series()` is a vectorised copy of the crossover rule** — the one place
 the invariant is duplicated, because slicing the frame per bar made the loop O(n²) (a
@@ -259,7 +276,7 @@ block's first bar rather than `warmup` bars into it; `fold["first_entry"]` recor
 `walk_forward()` must keep reading warmup from `warmup_bars()` — two copies of that number
 silently shift where every window starts. A history too short to split returns `reason` and no
 folds instead of numbers from a block that is all warmup, and `MIN_TEST_TRADES` labels a thin
-out-of-sample record as noise the way `MIN_SAMPLE` does in `outcomes.py`.
+out-of-sample record as noise the way `MIN_SAMPLE` does in `analysis/outcomes.py`.
 
 Results are in R (risk multiples), not currency — independent of balance and lot size.
 `compare()` runs with and without filters; that delta is the point of the tool.
@@ -285,9 +302,9 @@ The bot is meant to run at home without a watcher, so the loop is defensive:
   and the message itself painted only at WARNING and above; `runner.verdict_line()` colours
   the verdict green/red/yellow/dim. Colour is ANSI written by hand (no colorama/rich, same
   reason there is no TUI) and turns itself off when `NO_COLOR` is set or stdout is not a
-  terminal. **The file handler keeps the old plain format** — `report.py` groups `bot.log`
+  terminal. **The file handler keeps the old plain format** — `analysis/report.py` groups `data/bot.log`
   lines by shape, so an escape code in the file splits identical lines into different rows.
-- `bot.log` records DEBUG (every cycle, every filter check with its numbers, position state)
+- `data/bot.log` records DEBUG (every cycle, every filter check with its numbers, position state)
   while the console stays at INFO. It rotates at 5MB x 5 backups. `run.py report` is the
   intended way to read all of it back — it groups repeated log lines by shape, so a
   thousand identical warnings collapse to one row with a count.
@@ -300,23 +317,23 @@ counted against the bot, while a shorter gap is a dropout inside a run and is. M
 uptime against 24 hours instead reported 29% for a night that actually captured 83% of the
 candles it was running for, which is the kind of number that gets a section ignored.
 
-`report.py` answers the daily questions in this order: **did it stay up while it was meant
+`analysis/report.py` answers the daily questions in this order: **did it stay up while it was meant
 to** (`summarise_coverage()`), **which hours does the data even cover** (`summarise_hours()`
 — one session a day is roughly 11 hours of 24, so every statistic below it describes that
 window and not the market), **what changed day to day** (`summarise_by_day()`, which stays hidden
 until there are two days to compare), and **how far each candle sat from the thresholds**
 (`summarise_filter_margins()` reads `ADX_MIN` / `MAX_SPREAD_POINTS` / the RSI bounds
-straight out of `strategy.py`, so the numbers cannot drift from the live filters). That
+straight out of `bot/strategy.py`, so the numbers cannot drift from the live filters). That
 last one is descriptive on purpose — a pass rate is what the market did, not an argument
 for moving a threshold; the sweep is where thresholds get judged.
 
 The report is read on a screen, so it lays itself out: `▌` section heads, a label column,
-right-aligned number columns, and `bar()` for every pass rate. `report.py` carries its own
-`paint()` because `mt5_core.py` imports `MetaTrader5` at module level and the report must
-run under WSL — same ANSI-by-hand rule, same `NO_COLOR` / not-a-terminal switch off.
-`width()` counts display columns, not characters, and tests `unicodedata.category()` rather
-than `combining()`: Thai vowels and tone marks are `Mn` but carry combining class 0, so
-`combining()` calls them spacing and every table drifted one column per vowel.
+right-aligned number columns, and `screen.bar()` for every pass rate. `screen.width()` counts
+display columns, not characters, and tests `unicodedata.category()` rather than
+`combining()`: Thai vowels and tone marks are `Mn` but carry combining class 0, so
+`combining()` calls them spacing and every Thai-labelled table drifted one column per vowel.
+Any new table — here, in `format_sweep()`, anywhere — pads through `screen.pad()` for that
+reason, never through `f"{value:>9}"`.
 
 `trade.summarize_deals()` is pure and takes a deal list so the breaker is testable; only
 `deals_today()` touches MT5.
@@ -324,13 +341,13 @@ than `combining()`: Thai vowels and tone marks are `Mn` but carry combining clas
 ## Data files
 
 CSVs are appended in place (`mode="a"`, header only when absent) and committed to git —
-accumulating data, not build output. `bot.log` and `bot_state.json` are gitignored.
+accumulating data, not build output. `data/bot.log` and `data/bot_state.json` are gitignored.
 
-- `signal_log.csv` — one row per closed candle.
-- `trade_log.csv` — one row per order attempt, successes and failures alike.
-- `market_training_data.csv` — full market state plus `bot_decision` / `bot_blockers`, with
+- `data/signal_log.csv` — one row per closed candle.
+- `data/trade_log.csv` — one row per order attempt, successes and failures alike.
+- `data/market_training_data.csv` — full market state plus `bot_decision` / `bot_blockers`, with
   `your_decision`, `your_reason`, `entry_price`, `stop_loss`, `take_profit`, `trade_result`
-  left blank for the user to fill in by hand. `backtest_engine.py` reads only the
+  left blank for the user to fill in by hand. `analysis/engine.py` reads only the
   hand-labelled columns — it scores the human, not the bot.
 
 Column sets have changed over time: rows before 2026-09-09 used a simple rolling mean for
@@ -347,8 +364,8 @@ must go through `report._numeric()` / the guard in `outcomes.numbers()` — `fra
 alone returns `None`, and `pd.to_numeric(None)` is a bare float with no `.dropna()`.
 
 `core.append_csv()` handles that drift. Writing the header only when the file was absent
-left `market_training_data.csv` with a 22-column header above 26-column rows, so pandas
-shifted every value in the file and `backtest_engine.py` scored the wrong columns. The
+left `data/market_training_data.csv` with a 22-column header above 26-column rows, so pandas
+shifted every value in the file and `analysis/engine.py` scored the wrong columns. The
 append now compares the file's header against the row's keys and calls
 `align_csv_columns()` to rewrite the file — old rows padded with blanks, rows already
 written under the newer schema re-mapped positionally — before appending. Adding a column
@@ -356,8 +373,8 @@ to a log row is therefore safe; renaming one still orphans the old column's data
 
 ## Measuring the filters against collected data
 
-`outcomes.py` answers the question the hand-labelled columns cannot answer for months:
-**does a filter actually separate anything?** `market_training_data.csv` already holds OHLC
+`analysis/outcomes.py` answers the question the hand-labelled columns cannot answer for months:
+**does a filter actually separate anything?** `data/market_training_data.csv` already holds OHLC
 for every closed M15 candle, so the rows after a candle *are* its future — no MT5, no
 waiting for a human to fill in `trade_result`.
 
@@ -366,7 +383,7 @@ accumulate at perhaps 60 a month; every candle gets a forward label, so those ac
 2,800 a month. Filters are what the bot spends almost all of its time doing, and this is the
 only path that measures them at the rate they actually run.
 
-- **Labels are in R, not currency** (`ATR × SL_ATR_MULT`), the same unit `backtest.py`
+- **Labels are in R, not currency** (`ATR × SL_ATR_MULT`), the same unit `analysis/backtest.py`
   reports, so a day with ATR 13 and a day with ATR 6 can sit in the same average.
   `outcomes.SL_ATR_MULT` must equal `runner.SL_ATR_MULT`;
   `test_the_forward_label_uses_the_same_stop_as_the_live_bot` pins it.
@@ -396,14 +413,16 @@ only path that measures them at the rate they actually run.
 
 Console output, log messages, docstrings, and comments are Thai; identifiers, config
 constants, and CSV column names are English. Config lives as UPPERCASE module-level
-constants at the top of `runner.py` (market, risk, files) and `strategy.py` (filter
-switches) — no config file. Strategy filters must stay individually toggleable so their
+constants at the top of `bot/runner.py` (market, risk, files) and `bot/strategy.py` (filter
+switches) — no config file. The file names among those are assigned from `bot/paths.py`,
+which is the single place a data file's location is written; they stay CWD-relative on
+purpose, because tests chdir into a temp directory and call the functions directly. Strategy filters must stay individually toggleable so their
 effect can be measured one at a time.
 
 Unrecoverable MT5 failures raise `core.MT5Error`; `run.py` catches it and puts
 `mt5.shutdown()` in a `finally`.
 
-Broker symbol names vary (`XAUUSD`, `XAUUSD.m`, `GOLD`…). `SYMBOL` in `runner.py` defaults
+Broker symbol names vary (`XAUUSD`, `XAUUSD.m`, `GOLD`…). `SYMBOL` in `bot/runner.py` defaults
 to `"XAUUSD"`, and `core.resolve_symbol()` falls back to a ranked search when the broker
 does not have it; `command_all` assigns the result to `runner.SYMBOL` for the session and
 prints the alternatives it rejected.
@@ -417,9 +436,9 @@ Candidates starting with the full requested name win first.
 
 - Never verified against a live MT5 terminal. Broker behaviour — retcodes, stop levels,
   filling modes — is unproven, and `python run.py` alone will never prove it: watch mode
-  writes `signal_log.csv` and `market_training_data.csv` on every closed candle but never
-  sends an order, so `trade_log.csv` stays empty. Only `run.py --trade` on a demo account
-  exercises that path. `report.py` says so while the file is missing.
+  writes `data/signal_log.csv` and `data/market_training_data.csv` on every closed candle but never
+  sends an order, so `data/trade_log.csv` stays empty. Only `run.py --trade` on a demo account
+  exercises that path. `analysis/report.py` says so while the file is missing.
 
 ## Closed
 

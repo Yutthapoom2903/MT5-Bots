@@ -21,8 +21,9 @@ simulate() เป็นฟังก์ชันบริสุทธิ์ ร�
 import numpy as np
 import pandas as pd
 
-import mt5_core as core
-import strategy
+from bot import core
+from bot import strategy
+from bot.screen import pad
 
 DEFAULTS = {
     "fast_ma": 20,
@@ -157,7 +158,7 @@ def _simulate_position(series, start, direction, entry, initial_risk, target, co
 
 def _updated_stop(is_buy, entry, price, atr, stop, initial_risk, config):
     """ขยับ stop ตามราคาปิดแท่งนี้ ใช้กติกาเดียวกับบอทจริง"""
-    import mt5_trade as trade
+    from bot import trade
     import MetaTrader5 as mt5
 
     position_type = mt5.POSITION_TYPE_BUY if is_buy else mt5.POSITION_TYPE_SELL
@@ -460,10 +461,12 @@ def format_sweep(rows, top=15):
     if not rows:
         return "ไม่มีผลลัพธ์"
 
+    # หัวตารางผ่าน pad() ไม่ใช่ f-string ปกติ — คำไทยมีสระซ้อนที่ len() นับแต่จอไม่กินที่
     lines = [
         "--- ผลการกวาดค่าพารามิเตอร์ ---",
-        f"{'SL':>5} {'TP':>5} {'ADX':>5} {'ไม้':>5} {'ชนะ%':>7} "
-        f"{'ต่อไม้':>9} {'รวม':>9} {'DD':>8} {'PF':>6}",
+        f"{pad('SL', 5, '>')} {pad('TP', 5, '>')} {pad('ADX', 5, '>')} "
+        f"{pad('ไม้', 5, '>')} {pad('ชนะ%', 7, '>')} {pad('ต่อไม้', 9, '>')} "
+        f"{pad('รวม', 9, '>')} {pad('DD', 8, '>')} {pad('PF', 6, '>')}",
     ]
 
     for row in rows[:top]:
@@ -645,8 +648,9 @@ def format_walk_forward(result, min_trades=MIN_TEST_TRADES):
     lines.append(f"แบ่ง {result['bars']} แท่งเป็น {len(folds) + 1} ช่วง — เลือกค่าจากช่วงก่อนหน้า")
     lines.append("แล้ววัดผลบนช่วงถัดไปที่ยังไม่เคยเห็น เทียบกับค่า default บนช่วงเดียวกัน")
     lines.append("")
-    lines.append(f"{'ช่วง':>4} {'ทดสอบถึง':>12} {'ค่าที่เลือก':>18} "
-                 f"{'ไม้':>5} {'จูน':>9} {'default':>9}")
+    lines.append(f"{pad('ช่วง', 4, '>')} {pad('ทดสอบถึง', 12, '>')} "
+                 f"{pad('ค่าที่เลือก', 18, '>')} {pad('ไม้', 5, '>')} "
+                 f"{pad('จูน', 9, '>')} {pad('default', 9, '>')}")
 
     for fold in folds:
         tuned = fold["tuned"]
@@ -659,7 +663,7 @@ def format_walk_forward(result, min_trades=MIN_TEST_TRADES):
 
         lines.append(
             f"{fold['number']:>4} {fold['test_to']:%Y-%m-%d} "
-            f"{_chosen_text(fold['chosen'], keys):>18} "
+            f"{pad(_chosen_text(fold['chosen'], keys), 18, '>')} "
             f"{tuned.get('trades', 0):>5} "
             f"{tuned.get('expectancy_r', 0):>+9.3f} {plain.get('expectancy_r', 0):>+9.3f}"
         )

@@ -9,107 +9,29 @@
 
 import os
 import re
-import sys
-import unicodedata
 
 import pandas as pd
 
-import strategy
+from bot import paths
+from bot import screen
+from bot import strategy
 
-SIGNAL_LOG = "signal_log.csv"
-FEATURE_LOG = "market_training_data.csv"
-TRADE_LOG = "trade_log.csv"
-BOT_LOG = "bot.log"
+# การแสดงผลทั้งหมดมาจาก bot/screen.py ที่เดียว — สีเดียวกับที่ logger ใช้ และ
+# ปิดตัวเองเหมือนกันเมื่อ NO_COLOR ถูกตั้งหรือปลายทางไม่ใช่ terminal
+from bot.screen import (
+    BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, bar, pad, paint, width,   # noqa: F401
+)
+
+SIGNAL_LOG = paths.SIGNAL_LOG
+FEATURE_LOG = paths.FEATURE_LOG
+TRADE_LOG = paths.TRADE_LOG
+BOT_LOG = paths.LOG_FILE
 
 CANDLE_MINUTES = 15    # บอทเขียนหนึ่งแถวต่อหนึ่งแท่ง M15 ที่ปิดแล้ว
 SESSION_BREAK_HOURS = 3.0   # ห่างเกินนี้ถือว่าคนละรอบที่รัน ไม่ใช่บอทดับกลางรอบ
 
 WIDTH = 74          # ความกว้างของเส้นคั่น พอดีกับ terminal 80 คอลัมน์
 LABEL_WIDTH = 14    # คอลัมน์ป้ายชื่อของบรรทัดแบบ "ป้าย: ค่า"
-BAR_WIDTH = 10
-
-# ---------- การแสดงผลบนจอ ----------
-#
-# รายงานนี้ยาวหลายสิบบรรทัด อ่านตอนเช้าหลังบอทรันทั้งคืน การจัดคอลัมน์กับสี
-# ทำให้กวาดตาหาตัวเลขที่ผิดปกติได้โดยไม่ต้องอ่านทุกบรรทัด
-#
-# ใช้ ANSI เขียนเองเหมือน mt5_core.py แต่คัดมาไว้ที่นี่ ไม่ได้ import core.paint
-# เพราะ mt5_core.py import MetaTrader5 ที่ระดับโมดูล ส่วน `run.py report` ต้องรันบน
-# WSL ที่ไม่มีแพ็กเกจนั้นได้
-
-RESET = "\033[0m"
-DIM = "\033[2m"
-BOLD = "\033[1m"
-RED = "\033[31m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-CYAN = "\033[36m"
-
-ANSI = re.compile(r"\033\[[0-9;]*m")
-
-
-def color_enabled(stream=None):
-    """จอนี้รับสีได้ไหม — ปิดเมื่อตั้ง NO_COLOR หรือปลายทางไม่ใช่ terminal (redirect/pipe)"""
-    if os.getenv("NO_COLOR") is not None:
-        return False
-
-    stream = stream or sys.stdout
-    return bool(getattr(stream, "isatty", lambda: False)())
-
-
-def paint(text, *styles):
-    """ย้อมข้อความถ้าจอรับสีได้ ไม่ได้ก็คืนข้อความเดิม เรียกได้เสมอโดยไม่ต้องเช็คก่อน"""
-    if not styles or not color_enabled():
-        return text
-
-    return f"{''.join(styles)}{text}{RESET}"
-
-
-def width(text):
-    """ความกว้างจริงบนจอ
-
-    len() ใช้จัดคอลัมน์ภาษาไทยไม่ได้ — สระบน/ล่างและวรรณยุกต์ซ้อนอยู่บนตัวก่อนหน้า
-    ไม่กินที่ แต่ len() นับเป็นตัวหนึ่ง ตารางเลยเบี้ยวทีละคอลัมน์ตามจำนวนสระในคำ
-    รหัสสีก็ไม่กินที่เหมือนกัน จึงถอดออกก่อนนับ
-
-    ดูจาก category ไม่ใช่ combining() — สระไทยอย่าง U+0E31 เป็น Mn (ไม่กินที่) แต่
-    combining class ของมันเป็น 0 ซึ่งทำให้ combining() ตอบว่าไม่ใช่ตัวซ้อน
-    """
-    plain = ANSI.sub("", text)
-    total = 0
-
-    for char in plain:
-        if unicodedata.category(char) in ("Mn", "Me", "Cf"):
-            continue
-        total += 2 if unicodedata.east_asian_width(char) in "WF" else 1
-
-    return total
-
-
-def pad(text, size, align="<"):
-    """เติมช่องว่างให้กว้างตามที่สั่ง โดยนับความกว้างบนจอ ไม่ใช่จำนวนตัวอักษร"""
-    space = max(0, size - width(text))
-
-    if align == ">":
-        return " " * space + text
-
-    return text + " " * space
-
-
-def bar(fraction, size=BAR_WIDTH):
-    """แถบสัดส่วน — เห็น 21% เป็นภาพเร็วกว่าอ่านตัวเลข"""
-    fraction = min(1.0, max(0.0, fraction))
-    filled = int(round(fraction * size))
-    return "█" * filled + "░" * (size - filled)
-
-
-def _rate_style(fraction, good=0.9, fair=0.5):
-    """สีตามสัดส่วน — เขียวคือครบ เหลืองคือพอใช้ แดงคือน้อยจนต้องดู"""
-    if fraction >= good:
-        return GREEN
-    if fraction >= fair:
-        return YELLOW
-    return RED
 
 
 def _read(path):
@@ -299,7 +221,7 @@ def summarise_coverage(lines, show=8):
     for number, (start, end, count, missing) in enumerate(sessions[-show:], hidden + 1):
         hours = (end - start) / pd.Timedelta(hours=1)
         expected = count + missing
-        drawn = paint(bar(count / expected), _rate_style(count / expected))
+        drawn = paint(bar(count / expected), screen.rate_style(count / expected))
         note = paint(f"ขาดกลางรอบ {missing} แท่ง", RED) if missing else paint("ครบ", GREEN)
 
         lines.append(
@@ -316,7 +238,7 @@ def summarise_coverage(lines, show=8):
     if dropped:
         kept = held / (held + dropped)
         lines.append(
-            f"  {paint(f'{kept:.0%}', BOLD, _rate_style(kept))} ของแท่งที่ควรมีในรอบที่รัน — "
+            f"  {paint(f'{kept:.0%}', BOLD, screen.rate_style(kept))} ของแท่งที่ควรมีในรอบที่รัน — "
             f"ขาดกลางรอบรวม {dropped} แท่ง จาก {held + dropped}"
         )
         _note(lines, "เฉพาะพวกนี้ที่ควรตามหาสาเหตุ")
@@ -425,7 +347,7 @@ def summarise_filter_margins(lines):
 
     def rule(label, passed, total, detail):
         share = passed / total
-        drawn = paint(bar(share), _rate_style(share))
+        drawn = paint(bar(share), screen.rate_style(share))
         lines.append(f"  {pad(label, 20)}{drawn}  ผ่าน {passed}/{total} ({share:.0%})")
         lines.append(paint(f"    {detail}", DIM))
 
@@ -573,7 +495,7 @@ def build_report():
     lines = [
         paint("━" * WIDTH, DIM),
         paint("  สรุปการทำงานของบอท", BOLD),
-        paint("  อ่านจาก market_training_data.csv · trade_log.csv · bot.log", DIM),
+        paint(f"  อ่านจาก {FEATURE_LOG} · {TRADE_LOG} · {BOT_LOG}", DIM),
         paint("━" * WIDTH, DIM),
     ]
 

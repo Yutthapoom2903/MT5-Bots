@@ -294,6 +294,14 @@ straight out of `strategy.py`, so the numbers cannot drift from the live filters
 last one is descriptive on purpose — a pass rate is what the market did, not an argument
 for moving a threshold; the sweep is where thresholds get judged.
 
+The report is read on a screen, so it lays itself out: `▌` section heads, a label column,
+right-aligned number columns, and `bar()` for every pass rate. `report.py` carries its own
+`paint()` because `mt5_core.py` imports `MetaTrader5` at module level and the report must
+run under WSL — same ANSI-by-hand rule, same `NO_COLOR` / not-a-terminal switch off.
+`width()` counts display columns, not characters, and tests `unicodedata.category()` rather
+than `combining()`: Thai vowels and tone marks are `Mn` but carry combining class 0, so
+`combining()` calls them spacing and every table drifted one column per vowel.
+
 `trade.summarize_deals()` is pure and takes a deal list so the breaker is testable; only
 `deals_today()` touches MT5.
 

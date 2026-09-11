@@ -923,6 +923,41 @@ def test_a_day_with_no_adx_prints_a_dash_not_nan():
     assert "-" in text
 
 
+def test_a_thai_label_is_padded_by_what_it_takes_on_screen_not_by_len():
+    """สระบน/ล่างและวรรณยุกต์ซ้อนอยู่บนตัวก่อนหน้า ไม่กินที่ — len() นับเลยทำตารางเบี้ยว"""
+    import report
+
+    assert report.width("วัน") == 2        # ว + ั(ซ้อน) + น
+    assert len("วัน") == 3
+    assert report.width(report.pad("วัน", 8)) == 8
+    assert report.width(report.pad("ADX", 8)) == 8
+
+
+def test_the_report_has_no_colour_codes_when_colour_is_turned_off():
+    """redirect ลงไฟล์หรือ pipe ต่อ ต้องไม่มีรหัสสีปน ไม่งั้นอ่านย้อนหลังเป็นขยะ"""
+    import tempfile
+    import report
+
+    original = os.getcwd()
+    try:
+        os.chdir(tempfile.mkdtemp())
+        with EnvVar("NO_COLOR", "1"):
+            text = report.build_report()
+    finally:
+        os.chdir(original)
+
+    assert "\033[" not in text
+
+
+def test_the_hour_strip_marks_only_the_hours_that_have_data():
+    import report
+
+    strip = report.hour_strip([0, 23])
+
+    assert strip.count("█") == 2
+    assert strip.startswith("█") and strip.endswith("█")
+
+
 # ---------- ป้ายผลลัพธ์ล่วงหน้า ----------
 
 def _forward_frame(times=None, **columns):

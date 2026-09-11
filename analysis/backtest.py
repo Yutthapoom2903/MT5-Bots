@@ -21,8 +21,9 @@ simulate() เป็นฟังก์ชันบริสุทธิ์ ร�
 import numpy as np
 import pandas as pd
 
-import mt5_core as core
-import strategy
+from bot import core
+from bot import strategy
+from bot.screen import pad
 
 DEFAULTS = {
     "fast_ma": 20,
@@ -157,7 +158,7 @@ def _simulate_position(series, start, direction, entry, initial_risk, target, co
 
 def _updated_stop(is_buy, entry, price, atr, stop, initial_risk, config):
     """ขยับ stop ตามราคาปิดแท่งนี้ ใช้กติกาเดียวกับบอทจริง"""
-    import mt5_trade as trade
+    from bot import trade
     import MetaTrader5 as mt5
 
     position_type = mt5.POSITION_TYPE_BUY if is_buy else mt5.POSITION_TYPE_SELL
@@ -186,6 +187,15 @@ def _updated_stop(is_buy, entry, price, atr, stop, initial_risk, config):
 
 # ---------- ลูปจำลอง ----------
 
+def warmup_bars(config):
+    """แท่งแรกๆ ที่ indicator ยังไม่นิ่ง ห้ามนับเป็นช่วงที่เทรดได้
+
+    walk_forward() ใช้ค่าเดียวกันนี้เติมหน้าช่วงทดสอบ ถ้าสองที่คิดคนละแบบ
+    ไม้แรกของแต่ละช่วงจะเลื่อน แล้วผลนอกช่วงฝึกจะเทียบกับช่วงอื่นไม่ได้
+    """
+    return config["slow_ma"] + max(config["rsi_period"], config["adx_period"]) + 5
+
+
 def simulate(m15=None, h1=None, m5=None, config=None, prepared=None):
     """
     เดินทีละแท่งตั้งแต่ต้นจนจบ ใช้ข้อมูลถึงแท่งปัจจุบันเท่านั้น
@@ -197,7 +207,7 @@ def simulate(m15=None, h1=None, m5=None, config=None, prepared=None):
     bars = prepared if prepared is not None else prepare(m15.copy(), h1, m5, config)
 
     spread = config["spread_points"] * config["point"]
-    warmup = config["slow_ma"] + max(config["rsi_period"], config["adx_period"]) + 5
+    warmup = warmup_bars(config)
 
     series = {
         name: bars[name].to_numpy()
@@ -394,7 +404,7 @@ DEFAULT_GRID = {
 }
 
 
-def sweep(m15, h1=None, m5=None, base=None, grid=None, progress=None):
+def sweep(m15=None, h1=None, m5=None, base=None, grid=None, progress=None, prepared=None):
     """
     รันจำลองหลายชุดค่าแล้วเรียงตามคาดหวังต่อไม้
 
@@ -411,7 +421,9 @@ def sweep(m15, h1=None, m5=None, base=None, grid=None, progress=None):
     combinations = list(product(*(grid[key] for key in keys)))
 
     # คำนวณ indicator ครั้งเดียวแล้วใช้ซ้ำทุกชุดค่า — ค่าที่กวาดไม่กระทบ indicator
-    prepared = prepare(m15.copy(), h1, m5, base)
+    # walk_forward() ส่ง prepared ที่หั่นเป็นช่วงแล้วเข้ามา จะได้ไม่คำนวณซ้ำทุก fold
+    if prepared is None:
+        prepared = prepare(m15.copy(), h1, m5, base)
 
     original_adx = strategy.ADX_MIN
     rows = []
@@ -449,10 +461,12 @@ def format_sweep(rows, top=15):
     if not rows:
         return "ไม่มีผลลัพธ์"
 
+    # หัวตารางผ่าน pad() ไม่ใช่ f-string ปกติ — คำไทยมีสระซ้อนที่ len() นับแต่จอไม่กินที่
     lines = [
         "--- ผลการกวาดค่าพารามิเตอร์ ---",
-        f"{'SL':>5} {'TP':>5} {'ADX':>5} {'ไม้':>5} {'ชนะ%':>7} "
-        f"{'ต่อไม้':>9} {'รวม':>9} {'DD':>8} {'PF':>6}",
+        f"{pad('SL', 5, '>')} {pad('TP', 5, '>')} {pad('ADX', 5, '>')} "
+        f"{pad('ไม้', 5, '>')} {pad('ชนะ%', 7, '>')} {pad('ต่อไม้', 9, '>')} "
+        f"{pad('รวม', 9, '>')} {pad('DD', 8, '>')} {pad('PF', 6, '>')}",
     ]
 
     for row in rows[:top]:
@@ -475,3 +489,232 @@ def format_sweep(rows, top=15):
         lines.append("บวกเป็นย่านกว้าง สัญญาณว่ามีขอบจริง เลือกค่ากลางย่านจะทนกว่าค่าที่ดีที่สุด")
 
     return "\n".join(lines)
+
+
+# ---------- เดินหน้าทีละช่วง ----------
+#
+# sweep() ตอบได้แค่ว่ากริดทั้งชุดทนไหม แต่มันวัดผลบนข้อมูลชุดเดียวกับที่ใช้เลือกค่า
+# ตัวเลขที่ได้จึงเป็นของ "ค่าที่เข้ากับอดีตชุดนี้ที่สุด" เสมอ ไม่ได้แปลว่าพรุ่งนี้จะดีด้วย
+#
+# ตรงนี้แบ่งเวลาเป็นช่วง เลือกค่าจากช่วงก่อนหน้าเท่านั้น แล้ววัดบนช่วงถัดไปที่ยังไม่เคยเห็น
+# และวัดค่า default บนช่วงเดียวกันซ้ำอีกรอบ เพราะคำถามจริงไม่ใช่ "จูนแล้วกำไรไหม"
+# แต่คือ "จูนแล้วดีกว่าไม่จูนไหม"
+
+WALK_FORWARD_FOLDS = 4
+MIN_TRAIN_TRADES = 8      # ชุดค่าที่ได้ไม้น้อยกว่านี้ในช่วงฝึก ไม่มีสิทธิ์ถูกเลือก
+MIN_TEST_TRADES = 30      # ไม้นอกช่วงฝึกรวมน้อยกว่านี้ ถือว่ายังสรุปอะไรไม่ได้
+
+
+def fold_bounds(total, folds, warmup):
+    """ขอบของแต่ละ fold เป็น (ท้ายช่วงฝึก, ท้ายช่วงทดสอบ)
+
+    แบ่งเป็น folds+1 ช่วงเท่าๆ กัน ช่วงแรกไว้ฝึกอย่างเดียว ที่เหลือเป็นช่วงทดสอบทีละช่วง
+    หน้าต่างฝึกขยายไปเรื่อยๆ (ช่วง 1 ถึง i) เหมือนคนจริงที่จูนใหม่จากทุกอย่างที่มีถึงวันนี้
+    แล้วเอาค่าที่ได้ไปใช้กับช่วงถัดไป
+
+    คืนลิสต์ว่างถ้าข้อมูลสั้นเกินจะแบ่ง — ดีกว่าคืนตัวเลขจากช่วงที่มีแค่แท่งอุ่นเครื่อง
+    """
+    block = total // (folds + 1)
+
+    if folds < 1 or block <= warmup + 20:
+        return []
+
+    return [(number * block, total if number == folds else (number + 1) * block)
+            for number in range(1, folds + 1)]
+
+
+def _run_fold(config, adx_min, prepared):
+    """จำลองหนึ่งช่วงด้วยค่าชุดหนึ่ง — ผู้เรียกต้องคืนค่า strategy.ADX_MIN เองใน finally"""
+    strategy.ADX_MIN = adx_min
+    return simulate(config=config, prepared=prepared)
+
+
+def walk_forward(m15=None, h1=None, m5=None, base=None, grid=None,
+                 folds=WALK_FORWARD_FOLDS, min_train_trades=MIN_TRAIN_TRADES,
+                 prepared=None, progress=None):
+    """จูนค่าจากอดีต แล้ววัดผลบนช่วงที่ยังไม่เคยเห็น
+
+    indicator คำนวณครั้งเดียวจากทั้งไฟล์ได้โดยไม่ลักหน้า เพราะทุกตัวเป็น rolling
+    ที่ใช้เฉพาะแท่งถึงแท่งนั้น (MA, Wilder RSI/ATR/ADX) ค่าที่แท่ง i ไม่เคยเห็นแท่ง i+1
+    ส่วนการ "เลือกค่า" ซึ่งเป็นที่ที่อนาคตรั่วได้จริง ถูกกันไว้ในช่วงฝึกเท่านั้น
+    """
+    grid = grid or DEFAULT_GRID
+    base = {**DEFAULTS, **(base or {})}
+    bars = prepared if prepared is not None else prepare(m15.copy(), h1, m5, base)
+
+    warmup = warmup_bars(base)
+    bounds = fold_bounds(len(bars), folds, warmup)
+
+    result = {
+        "bars": len(bars),
+        "folds": [],
+        "grid_keys": list(grid),
+        "tuned": {"trades": 0},
+        "baseline": {"trades": 0},
+        "reason": None,
+    }
+
+    if not bounds:
+        result["reason"] = (f"ข้อมูล {len(bars)} แท่ง แบ่งเป็น {folds + 1} ช่วงไม่ได้ "
+                            f"ต้องการช่วงละมากกว่า {warmup + 20} แท่ง "
+                            f"(รวมอย่างน้อย {(warmup + 21) * (folds + 1)} แท่ง)")
+        return result
+
+    original_adx = strategy.ADX_MIN
+    tuned_trades = []
+    baseline_trades = []
+
+    try:
+        for number, (train_end, test_end) in enumerate(bounds, start=1):
+            if progress:
+                progress(number, len(bounds))
+
+            train = bars.iloc[:train_end]
+            # เติมแท่งอุ่นเครื่องไว้หน้าช่วงทดสอบ ไม้แรกจะได้เริ่มที่ต้นช่วงพอดี
+            # ไม่ใช่หลังจากนั้นอีก warmup แท่ง แต่ก็ไม่เข้าไม้ในช่วงฝึกด้วย
+            test = bars.iloc[train_end - warmup:test_end]
+
+            fold = {
+                "number": number,
+                "train_bars": train_end,
+                "test_bars": test_end - train_end,
+                "test_from": bars["time"].iloc[train_end],
+                "test_to": bars["time"].iloc[test_end - 1],
+                "chosen": None,
+                "train": {"trades": 0},
+                "tuned": {"trades": 0},
+                "baseline": {"trades": 0},
+                "first_entry": None,
+                "skipped": None,
+            }
+
+            plain = _run_fold(base, original_adx, test)
+            fold["baseline"] = metrics(plain)
+            baseline_trades += plain["trades"]
+
+            rows = sweep(base=base, grid=grid, prepared=train)
+            eligible = [row for row in rows if row["trades"] >= min_train_trades]
+
+            if not eligible:
+                fold["skipped"] = f"ไม่มีชุดค่าไหนได้ถึง {min_train_trades} ไม้ในช่วงฝึก"
+                result["folds"].append(fold)
+                continue
+
+            best = eligible[0]
+            chosen = {key: best[key] for key in grid}
+
+            fold["chosen"] = chosen
+            fold["train"] = {key: best[key]
+                             for key in ("trades", "expectancy_r", "total_r", "win_rate")}
+
+            tuned = _run_fold(
+                {**base, **{key: value for key, value in chosen.items() if key != "adx_min"}},
+                chosen.get("adx_min", original_adx),
+                test,
+            )
+            fold["tuned"] = metrics(tuned)
+            # ไม้แรกของช่วง — พิสูจน์ว่าแท่งอุ่นเครื่องที่เติมไว้หน้าช่วงไม่ได้ถูกเทรด
+            fold["first_entry"] = tuned["trades"][0]["entry_time"] if tuned["trades"] else None
+            tuned_trades += tuned["trades"]
+
+            result["folds"].append(fold)
+    finally:
+        strategy.ADX_MIN = original_adx
+
+    result["tuned"] = metrics({"trades": tuned_trades})
+    result["baseline"] = metrics({"trades": baseline_trades})
+    return result
+
+
+def _chosen_text(chosen, keys):
+    if not chosen:
+        return "-"
+
+    short = {"sl_atr_mult": "SL", "tp_atr_mult": "TP", "adx_min": "ADX"}
+    return " ".join(f"{short.get(key, key)}{chosen[key]:g}" for key in keys)
+
+
+def format_walk_forward(result, min_trades=MIN_TEST_TRADES):
+    """ตารางผลนอกช่วงฝึก พร้อมคำตัดสินว่าการจูนช่วยจริงไหม"""
+    lines = ["--- เดินหน้าทีละช่วง (walk-forward) ---"]
+
+    if result["reason"]:
+        lines.append(result["reason"])
+        return "\n".join(lines)
+
+    folds = result["folds"]
+    keys = result["grid_keys"]
+
+    lines.append(f"แบ่ง {result['bars']} แท่งเป็น {len(folds) + 1} ช่วง — เลือกค่าจากช่วงก่อนหน้า")
+    lines.append("แล้ววัดผลบนช่วงถัดไปที่ยังไม่เคยเห็น เทียบกับค่า default บนช่วงเดียวกัน")
+    lines.append("")
+    lines.append(f"{pad('ช่วง', 4, '>')} {pad('ทดสอบถึง', 12, '>')} "
+                 f"{pad('ค่าที่เลือก', 18, '>')} {pad('ไม้', 5, '>')} "
+                 f"{pad('จูน', 9, '>')} {pad('default', 9, '>')}")
+
+    for fold in folds:
+        tuned = fold["tuned"]
+        plain = fold["baseline"]
+
+        if fold["skipped"]:
+            lines.append(f"{fold['number']:>4} {fold['test_to']:%Y-%m-%d} "
+                         f"ข้ามช่วงนี้: {fold['skipped']}")
+            continue
+
+        lines.append(
+            f"{fold['number']:>4} {fold['test_to']:%Y-%m-%d} "
+            f"{pad(_chosen_text(fold['chosen'], keys), 18, '>')} "
+            f"{tuned.get('trades', 0):>5} "
+            f"{tuned.get('expectancy_r', 0):>+9.3f} {plain.get('expectancy_r', 0):>+9.3f}"
+        )
+
+    tuned = result["tuned"]
+    plain = result["baseline"]
+
+    lines.append("")
+    lines.append("รวมทุกช่วงที่ไม่เคยเห็น (นับเฉพาะไม้นอกช่วงฝึก):")
+    lines.append(f"  ค่าที่จูนเอง : {tuned.get('trades', 0):>4} ไม้  "
+                 f"{tuned.get('expectancy_r', 0):+.3f}R/ไม้  รวม {tuned.get('total_r', 0):+.2f}R")
+    lines.append(f"  ค่า default  : {plain.get('trades', 0):>4} ไม้  "
+                 f"{plain.get('expectancy_r', 0):+.3f}R/ไม้  รวม {plain.get('total_r', 0):+.2f}R")
+    lines.append("")
+    lines += _walk_forward_verdict(result, min_trades)
+
+    return "\n".join(lines)
+
+
+def _walk_forward_verdict(result, min_trades):
+    """บอกตรงๆ ว่าเชื่อผลนี้ได้แค่ไหน — ไม่มีไม้พอก็ต้องบอกว่าไม่มีไม้พอ"""
+    tuned = result["tuned"]
+    plain = result["baseline"]
+    picked = [tuple(sorted(fold["chosen"].items())) for fold in result["folds"] if fold["chosen"]]
+
+    if not picked:
+        return ["ทุกช่วงเลือกค่าไม่ได้เลย — ข้อมูลฝึกยังมีไม้ไม่พอให้เลือกอะไร"]
+
+    lines = []
+
+    if not tuned.get("trades"):
+        lines.append("ค่าที่จูนแล้วไม่เข้าไม้เลยในช่วงที่ไม่เคยเห็น — ยังไม่มีอะไรให้สรุป")
+        return lines
+
+    delta = tuned.get("expectancy_r", 0.0) - plain.get("expectancy_r", 0.0)
+
+    if tuned["trades"] < min_trades:
+        lines.append(f"ไม้นอกช่วงฝึกรวมแค่ {tuned['trades']} ไม้ (เกณฑ์ {min_trades}) — "
+                     "ผลต่างขนาดนี้ยังเป็น noise อ่านไว้เฉยๆ อย่าเพิ่งเอาไปเปลี่ยนค่า")
+    elif delta <= 0:
+        lines.append(f"จูนแล้วไม่ดีขึ้นนอกช่วงฝึก ({delta:+.3f}R/ไม้) — ใช้ค่า default ต่อไป")
+        lines.append("ค่าที่ชนะบน sweep คือค่าที่เข้ากับอดีตชุดนั้น ไม่ใช่ค่าที่ทำเงินต่อไปได้")
+    else:
+        lines.append(f"จูนแล้วดีขึ้น {delta:+.3f}R/ไม้ นอกช่วงฝึก")
+
+    unique = len(set(picked))
+    if unique == 1:
+        lines.append(f"ทุกช่วงเลือกค่าชุดเดียวกัน ({_chosen_text(dict(picked[0]), result['grid_keys'])}) "
+                     "— สัญญาณว่าค่านี้นิ่งจริง ไม่ใช่ฟลุคของช่วงใดช่วงหนึ่ง")
+    elif unique >= max(2, len(picked) * 0.75):
+        lines.append(f"ค่าที่ชนะเปลี่ยนเกือบทุกช่วง ({unique} ชุดจาก {len(picked)} ช่วง) — "
+                     "แปลว่ากำลังจับ noise ไม่ใช่ขอบจริง")
+
+    return lines

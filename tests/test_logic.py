@@ -26,13 +26,15 @@ except ImportError:
 import pandas as pd
 import MetaTrader5 as mt5
 
-import mt5_core as core
-import mt5_trade as trade
-import notify
-import strategy
-import backtest
-import outcomes
-import runner
+from bot import core
+from bot import paths
+from bot import screen
+from bot import trade
+from bot import notify
+from bot import strategy
+from analysis import backtest
+from analysis import outcomes
+from bot import runner
 
 
 # ---------- ตัวช่วย ----------
@@ -741,11 +743,138 @@ def test_sweep_report_calls_out_a_strategy_with_no_edge():
     assert "ไม่มีชุดไหนเป็นบวก" in backtest.format_sweep(rows)
 
 
+def test_the_data_folder_is_created_before_the_first_write():
+    """clone ใหม่ยังไม่มี data/ ถ้าไม่สร้างให้ก่อน แท่งแรกของคืนแรกจะเขียนไม่ลง"""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        target = os.path.join(folder, "data", "signal_log.csv")
+
+        core.append_csv(target, {"candle_time": "1", "close": 10.0})
+        core.save_state(os.path.join(folder, "data", "bot_state.json"), {"last": "1"})
+
+        assert os.path.exists(target)
+        assert core.load_state(os.path.join(folder, "data", "bot_state.json")) == {"last": "1"}
+
+
+# ---------- เดินหน้าทีละช่วง ----------
+
+def _long_market():
+    """ตลาดยาวพอจะแบ่งเป็นหลายช่วงได้จริง"""
+    return _trending_market(cycles=25, length=120)
+
+
+def test_the_training_window_never_touches_the_window_it_is_scored_on():
+    """ค่าที่เลือกต้องมาจากอดีตล้วน ถ้าช่วงฝึกกินเข้าไปในช่วงทดสอบ ตัวเลขที่ได้คือการโกง"""
+    bounds = backtest.fold_bounds(total=1000, folds=4, warmup=60)
+
+    assert len(bounds) == 4
+
+    for (train_end, test_end), (next_train_end, _) in zip(bounds, bounds[1:]):
+        assert train_end < test_end            # ช่วงทดสอบอยู่หลังช่วงฝึกเสมอ
+        assert next_train_end == test_end      # ช่วงถัดไปฝึกได้ถึงแค่ที่ทดสอบไปแล้ว
+
+
+def test_a_history_too_short_to_split_says_so_instead_of_returning_numbers():
+    """ข้อมูลสั้นแล้วยังแบ่ง จะได้ช่วงที่มีแต่แท่งอุ่นเครื่อง แล้วรายงานตัวเลขที่ไม่มีความหมาย"""
+    assert backtest.fold_bounds(total=200, folds=4, warmup=60) == []
+
+    result = backtest.walk_forward(_trending_market(cycles=1, length=60),
+                                   None, None, {"use_filters": False})
+
+    assert result["reason"] is not None
+    assert result["folds"] == []
+    assert result["reason"] in backtest.format_walk_forward(result)
+
+
+def test_walk_forward_does_not_trade_the_warmup_bars_it_prepends():
+    """ช่วงทดสอบมีแท่งก่อนหน้านำมาให้ indicator นิ่ง แต่ห้ามเข้าไม้ในแท่งพวกนั้น"""
+    result = backtest.walk_forward(_long_market(), None, None,
+                                   {"use_filters": False}, folds=3)
+
+    scored = [fold for fold in result["folds"] if fold["first_entry"] is not None]
+
+    assert scored
+    for fold in scored:
+        assert fold["first_entry"] >= fold["test_from"]
+
+
+def test_walk_forward_scores_the_default_settings_on_the_same_window():
+    """คำถามคือ 'จูนแล้วดีกว่าไม่จูนไหม' ถ้าไม่วัดค่า default บนช่วงเดียวกันก็ตอบไม่ได้"""
+    result = backtest.walk_forward(_long_market(), None, None,
+                                   {"use_filters": False}, folds=3)
+
+    assert result["baseline"]["trades"] > 0
+    assert all("baseline" in fold for fold in result["folds"])
+
+
+def test_walk_forward_restores_the_threshold_it_tunes():
+    before = strategy.ADX_MIN
+
+    backtest.walk_forward(_long_market(), None, None, {"use_filters": False}, folds=3)
+    assert strategy.ADX_MIN == before
+
+    try:
+        backtest.walk_forward(None, None, None, {}, folds=3)
+    except Exception:
+        pass
+
+    assert strategy.ADX_MIN == before
+
+
+def _walk_result(tuned_r, baseline_r, trades, picks):
+    """ผลลัพธ์สำเร็จรูปสำหรับเทสคำตัดสิน ไม่ต้องจำลองจริง"""
+    return {
+        "bars": 5000,
+        "grid_keys": ["sl_atr_mult"],
+        "reason": None,
+        "folds": [{"number": number, "chosen": {"sl_atr_mult": pick}, "skipped": None,
+                   "test_from": pd.Timestamp("2026-01-01"), "test_to": pd.Timestamp("2026-02-01"),
+                   "train_bars": 100, "test_bars": 100, "first_entry": None,
+                   "train": {"trades": 10}, "tuned": {"trades": 10, "expectancy_r": tuned_r},
+                   "baseline": {"trades": 10, "expectancy_r": baseline_r}}
+                  for number, pick in enumerate(picks, start=1)],
+        "tuned": {"trades": trades, "expectancy_r": tuned_r, "total_r": tuned_r * trades},
+        "baseline": {"trades": trades, "expectancy_r": baseline_r,
+                     "total_r": baseline_r * trades},
+    }
+
+
+def test_a_tuned_result_that_beats_default_on_too_few_trades_is_called_noise():
+    text = backtest.format_walk_forward(
+        _walk_result(tuned_r=0.5, baseline_r=0.1, trades=12, picks=[1.0, 1.0]))
+
+    assert "noise" in text
+    assert "อย่าเพิ่งเอาไปเปลี่ยนค่า" in text
+
+
+def test_the_verdict_says_tuning_did_not_help_when_the_defaults_did_better():
+    text = backtest.format_walk_forward(
+        _walk_result(tuned_r=0.05, baseline_r=0.20, trades=200, picks=[1.0, 1.0]))
+
+    assert "ไม่ดีขึ้นนอกช่วงฝึก" in text
+    assert "ใช้ค่า default ต่อไป" in text
+
+
+def test_parameters_that_change_every_window_are_called_out_as_noise():
+    text = backtest.format_walk_forward(
+        _walk_result(tuned_r=0.4, baseline_r=0.1, trades=200, picks=[1.0, 1.5, 2.0, 1.0]))
+
+    assert "เปลี่ยนเกือบทุกช่วง" in text
+
+
+def test_one_setting_winning_every_window_is_called_steady():
+    text = backtest.format_walk_forward(
+        _walk_result(tuned_r=0.4, baseline_r=0.1, trades=200, picks=[1.5, 1.5, 1.5]))
+
+    assert "นิ่งจริง" in text
+
+
 # ---------- รายงานสรุป ----------
 
 def test_report_survives_a_directory_with_no_files():
     import tempfile
-    import report
+    from analysis import report
 
     original = os.getcwd()
     try:
@@ -760,14 +889,15 @@ def test_report_survives_a_directory_with_no_files():
 
 def test_report_groups_repeated_log_problems():
     import tempfile
-    import report
+    from analysis import report
 
     directory = tempfile.mkdtemp()
     original = os.getcwd()
 
     try:
         os.chdir(directory)
-        with open("bot.log", "w", encoding="utf-8") as handle:
+        os.makedirs(os.path.dirname(report.BOT_LOG), exist_ok=True)
+        with open(report.BOT_LOG, "w", encoding="utf-8") as handle:
             for number in range(4):
                 handle.write(f"2026-09-09 10:0{number}:00 [WARNING] spread 8{number}.0 กว้างเกิน 50\n")
             handle.write("2026-09-09 10:05:00 [INFO] ปกติ\n")
@@ -784,17 +914,21 @@ def test_report_groups_repeated_log_problems():
 
 
 def _feature_file(rows):
-    """เขียน market_training_data.csv ชั่วคราวแล้วคืน path ของโฟลเดอร์"""
+    """เขียนไฟล์ข้อมูลชั่วคราวไว้ที่เดียวกับที่บอทเขียนจริง แล้วคืน path ของโฟลเดอร์"""
     import tempfile
 
+    from bot import paths
+
     directory = tempfile.mkdtemp()
-    frame = pd.DataFrame(rows)
-    frame.to_csv(os.path.join(directory, "market_training_data.csv"), index=False)
+    target = os.path.join(directory, paths.FEATURE_LOG)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+
+    pd.DataFrame(rows).to_csv(target, index=False)
     return directory
 
 
 def _report_in(directory, function):
-    import report
+    from analysis import report
 
     lines = []
     original = os.getcwd()
@@ -846,7 +980,7 @@ def test_two_evenings_apart_are_two_sessions_not_one_long_outage():
         "2026-09-10 19:00:00", "2026-09-10 19:15:00",
     ]))
 
-    import report
+    from analysis import report
     sessions = report.split_sessions(times)
 
     assert len(sessions) == 2
@@ -861,7 +995,7 @@ def test_a_short_dropout_stays_inside_the_same_session():
         "2026-09-09 20:30:00", "2026-09-09 20:45:00",
     ]))
 
-    import report
+    from analysis import report
     sessions = report.split_sessions(times)
 
     assert len(sessions) == 1
@@ -921,6 +1055,41 @@ def test_a_day_with_no_adx_prints_a_dash_not_nan():
 
     assert "nan" not in text
     assert "-" in text
+
+
+def test_a_thai_label_is_padded_by_what_it_takes_on_screen_not_by_len():
+    """สระบน/ล่างและวรรณยุกต์ซ้อนอยู่บนตัวก่อนหน้า ไม่กินที่ — len() นับเลยทำตารางเบี้ยว"""
+    from analysis import report
+
+    assert report.width("วัน") == 2        # ว + ั(ซ้อน) + น
+    assert len("วัน") == 3
+    assert report.width(report.pad("วัน", 8)) == 8
+    assert report.width(report.pad("ADX", 8)) == 8
+
+
+def test_the_report_has_no_colour_codes_when_colour_is_turned_off():
+    """redirect ลงไฟล์หรือ pipe ต่อ ต้องไม่มีรหัสสีปน ไม่งั้นอ่านย้อนหลังเป็นขยะ"""
+    import tempfile
+    from analysis import report
+
+    original = os.getcwd()
+    try:
+        os.chdir(tempfile.mkdtemp())
+        with EnvVar("NO_COLOR", "1"):
+            text = report.build_report()
+    finally:
+        os.chdir(original)
+
+    assert "\033[" not in text
+
+
+def test_the_hour_strip_marks_only_the_hours_that_have_data():
+    from analysis import report
+
+    strip = report.hour_strip([0, 23])
+
+    assert strip.count("█") == 2
+    assert strip.startswith("█") and strip.endswith("█")
 
 
 # ---------- ป้ายผลลัพธ์ล่วงหน้า ----------
@@ -999,7 +1168,7 @@ def test_a_candle_with_no_atr_is_left_unlabelled():
 
 def test_the_forward_label_uses_the_same_stop_as_the_live_bot():
     # ป้ายวัดเป็น R ถ้า SL_ATR_MULT สองที่หลุดจากกัน R ที่รายงานจะไม่ใช่ R ของไม้จริง
-    import runner
+    from bot import runner
     assert outcomes.SL_ATR_MULT == runner.SL_ATR_MULT
 
 
@@ -1065,7 +1234,7 @@ def test_a_column_the_old_rows_never_had_does_not_crash_the_report():
         ["2026-09-09 19:00:00", "2026-09-09 19:15:00", "2026-09-10 19:00:00"],
     ))
 
-    import report
+    from analysis import report
 
     original = os.getcwd()
     try:
@@ -1090,7 +1259,7 @@ def test_the_report_says_the_order_path_has_never_been_proven():
 
 def test_every_logged_candle_records_the_brokers_gmt_offset():
     """เวลาในแท่งเป็นเวลาเซิร์ฟเวอร์ ถ้าไม่เก็บ offset ไว้ด้วย ชั่วโมงในไฟล์ตีความไม่ได้"""
-    import runner
+    from bot import runner
 
     written = {}
     original = runner.core.append_csv
@@ -1123,7 +1292,7 @@ def _review(rows):
     """รัน backtest_engine กับ CSV ชั่วคราวแล้วคืนสิ่งที่มันพิมพ์"""
     import contextlib
     import tempfile
-    import backtest_engine
+    from analysis import engine as backtest_engine
 
     path = os.path.join(tempfile.mkdtemp(), "hand.csv")
     pd.DataFrame(rows).to_csv(path, index=False)
@@ -1205,7 +1374,7 @@ class FakeMenu:
 
 def _menu_run(fake, overrides=None):
     import argparse
-    import menu
+    from bot import menu
 
     original = menu._mt5_available
     menu._mt5_available = lambda: fake.mt5_available
@@ -1221,7 +1390,7 @@ def _menu_run(fake, overrides=None):
 
 def test_every_menu_entry_points_at_a_command_that_exists():
     # เมนูเก็บชื่อคำสั่งเป็นสตริง พิมพ์ผิดจะรู้ตอนกดเท่านั้น ถ้าไม่มีเทสตัวนี้
-    import menu
+    from bot import menu
     import run
 
     for item in menu.items():
@@ -1229,12 +1398,12 @@ def test_every_menu_entry_points_at_a_command_that_exists():
 
 
 def test_the_menu_never_offers_itself():
-    import menu
+    from bot import menu
     assert "menu" not in {item.command for item in menu.items()}
 
 
 def test_entries_needing_mt5_are_marked_when_the_package_is_missing():
-    import menu
+    from bot import menu
 
     locked = menu.render(mt5_available=False)
     open_ = menu.render(mt5_available=True)
@@ -1244,14 +1413,14 @@ def test_entries_needing_mt5_are_marked_when_the_package_is_missing():
 
 
 def test_quit_is_accepted_in_the_obvious_spellings():
-    import menu
+    from bot import menu
 
     for word in ("q", "Q", " quit ", "exit", "0"):
         assert menu.choose(word) == "quit", word
 
 
 def test_an_unknown_choice_is_rejected_rather_than_guessed():
-    import menu
+    from bot import menu
 
     assert menu.choose("99") is None
     assert menu.choose("") is None
@@ -1259,7 +1428,7 @@ def test_an_unknown_choice_is_rejected_rather_than_guessed():
 
 
 def test_the_demo_entry_trades_and_the_watch_entry_does_not():
-    import menu
+    from bot import menu
 
     picks = {item.key: item for item in menu.items()}
 
@@ -1268,7 +1437,7 @@ def test_the_demo_entry_trades_and_the_watch_entry_does_not():
 
 
 def test_the_status_says_the_order_path_is_unproven_while_no_trade_log_exists():
-    import menu
+    from bot import menu
 
     assert "ยังไม่เคยส่งคำสั่งจริง" in " ".join(
         menu.status_lines(mt5_available=True, candles=39, has_trades=False))
@@ -1302,7 +1471,7 @@ def test_an_offline_command_returns_to_the_menu_instead_of_exiting():
 
 def test_a_command_that_raises_does_not_take_the_menu_down_with_it():
     import argparse
-    import menu
+    from bot import menu
 
     original = menu._mt5_available
     menu._mt5_available = lambda: False
@@ -2142,7 +2311,7 @@ class ClosedPositionHarness:
     """
 
     def __init__(self, lookups):
-        import runner
+        from bot import runner
 
         self.runner = runner
         self.lookups = lookups      # ผลที่ closing_deals จะคืนทีละครั้ง
@@ -2214,7 +2383,7 @@ def test_a_history_that_lands_late_is_still_reported():
 
 
 def test_the_bot_stops_waiting_for_a_history_that_never_lands():
-    import runner
+    from bot import runner
 
     state = {"position_meta": {"111": {"signal": "SELL"}}}
 
@@ -2323,12 +2492,12 @@ class ForcedColour:
     """
 
     def __enter__(self):
-        self.original = core.color_enabled
-        core.color_enabled = lambda stream=None: True
+        self.original = screen.color_enabled
+        screen.color_enabled = lambda stream=None: True
         return self
 
     def __exit__(self, *error):
-        core.color_enabled = self.original
+        screen.color_enabled = self.original
 
 
 def _record(level, message):

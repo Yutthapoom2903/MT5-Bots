@@ -1,0 +1,2 @@
+logged_at,candle_time,symbol,signal,lots,intended_entry,filled_price,sl,tp,atr,adx,h1_trend,spread_points,risk_amount,status,ticket
+2026-09-12 03:30:17,2026-09-11 23:15:00,XAUUSD,SELL,0.01,4348.28,,4361.02,4322.8,8.49,25.99,DOWNTREND,33.0,12.74,retcode 10027: AutoTrading disabled by client,

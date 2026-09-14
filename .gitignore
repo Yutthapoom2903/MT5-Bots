@@ -7,6 +7,9 @@ data/bot_state.json.tmp
 data/bot.log
 data/bot.log.*
 
+# ปฏิทินข่าวที่โหลดมาแคชไว้ — โหลดใหม่ได้เสมอ ไม่ใช่ข้อมูลที่บอทสร้าง
+data/news_calendar.json
+
 # Python
 __pycache__/
 *.py[cod]

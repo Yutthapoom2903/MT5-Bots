@@ -29,6 +29,14 @@ FORWARD_COLUMNS = ("fwd_up_r", "fwd_down_r", "fwd_net_r", "fwd_trend_r")
 
 DIRECTIONS = {"UPTREND": 1.0, "DOWNTREND": -1.0}
 
+# ตัวชี้วัดที่บันทึกไว้แต่ยังไม่มีตัวกรองไหนอ่าน — วัดก่อน แล้วค่อยตัดสินว่าควรเป็นตัวกรองไหม
+EXPLORATORY = (
+    ("atr_percentile", "ความผันผวนเทียบกับตัวเอง (atr_percentile)"),
+    ("ma_distance_atr", "ราคายืดห่าง MA กี่ ATR (ma_distance_atr)"),
+    ("volume_ratio", "tick volume เทียบค่าเฉลี่ย (volume_ratio)"),
+    ("body_ratio", "ตัวแท่งกินกี่ส่วนของช่วง (body_ratio)"),
+)
+
 
 def _usable_rows(times, horizon, minutes=CANDLE_MINUTES):
     """แถวที่มีแท่งถัดไปครบ horizon แท่งติดกันจริง ไม่มีช่องขาดคั่น
@@ -152,6 +160,99 @@ def split_by_agreement(frame, measure="fwd_trend_r"):
     }
 
 
+def add_derived_columns(frame):
+    """เติมตัวชี้วัดที่คำนวณย้อนหลังได้จากคอลัมน์ที่ไฟล์มีอยู่แล้ว (แก้ frame ในที่)
+
+    บอทเพิ่งเริ่มบันทึก ma_distance_atr กับ body_ratio แต่ close, ma_50, atr_14,
+    candle_body และ candle_range อยู่ในไฟล์มาตลอด สองตัวนี้จึงวัดกับข้อมูลเก่าได้เลย
+    ไม่ต้องรอสะสมใหม่อีกเดือน — เหตุผลเดียวกับที่ไฟล์นี้ติดป้ายอนาคตเองแทนที่จะรอคนกรอก
+
+    atr_percentile กับ volume_ratio เติมย้อนหลังแบบนี้ไม่ได้: ตัวแรกต้องใช้ ATR
+    ต่อเนื่องย้อนหลัง 96 แท่ง ซึ่งคร่อมช่วงที่บอทดับ ส่วน tick_volume ไม่เคยถูกบันทึก
+    เดาแทนคือการสร้างข้อมูลขึ้นมาเอง จึงปล่อยว่างไว้ให้เห็นว่ายังไม่มี
+    """
+    if "ma_distance_atr" not in frame and _has(frame, "close", "ma_50", "atr_14"):
+        atr = pd.to_numeric(frame["atr_14"], errors="coerce")
+        frame["ma_distance_atr"] = (
+            pd.to_numeric(frame["close"], errors="coerce")
+            - pd.to_numeric(frame["ma_50"], errors="coerce")
+        ) / atr.replace(0, np.nan)
+
+    if "body_ratio" not in frame and _has(frame, "candle_body", "candle_range"):
+        span = pd.to_numeric(frame["candle_range"], errors="coerce")
+        frame["body_ratio"] = (
+            pd.to_numeric(frame["candle_body"], errors="coerce") / span.replace(0, np.nan)
+        )
+
+    return frame
+
+
+def _has(frame, *columns):
+    """ไฟล์มีครบทุกคอลัมน์ที่ต้องใช้ไหม
+
+    ต้องเช็คชื่อคอลัมน์ ไม่ใช่เช็คผลของ to_numeric: frame.get() ที่ไม่เจอคืน None
+    แล้ว pd.to_numeric(None) ให้ float ตัวเดียวที่ไม่ใช่ None และไม่มีเมธอดของ Series
+    เป็นกับดักเดียวกับที่ report._numeric() มีไว้กัน
+    """
+    return all(column in frame for column in columns)
+
+
+def split_by_median(frame, column, measure="fwd_trend_r"):
+    """แบ่งที่ค่ากลางของคอลัมน์เอง ใช้กับตัวชี้วัดที่ยังไม่มีเกณฑ์ตั้งไว้
+
+    ตัวกรองที่ใช้งานอยู่มีเกณฑ์ให้แบ่ง (ADX_MIN, MAX_SPREAD_POINTS) แต่ตัวชี้วัดที่
+    เพิ่งเริ่มเก็บยังไม่มี คำถามตอนนี้จึงเป็น "มันแยกอะไรได้บ้างไหม" ไม่ใช่ "เกณฑ์ควรเป็นเท่าไหร่"
+    ค่ากลางแบ่งสองฝั่งให้เท่ากันโดยไม่ต้องเดาเกณฑ์ ถ้าแบ่งตรงนี้ยังไม่ต่าง
+    การไปหาเกณฑ์ที่ "ใช่" ก็คือการขุดหาเสียงรบกวน
+    """
+    if column not in frame or measure not in frame:
+        return None
+
+    values = pd.to_numeric(frame[column], errors="coerce")
+    outcome = pd.to_numeric(frame[measure], errors="coerce")
+    known = values.notna() & outcome.notna()
+
+    if not known.any():
+        return None
+
+    middle = values[known].median()
+
+    return {
+        "passed": _stats(outcome[known & (values >= middle)]),
+        "blocked": _stats(outcome[known & (values < middle)]),
+        "threshold": middle,
+    }
+
+
+def split_by_fvg(frame, measure="fwd_trend_r"):
+    """FVG ที่ค้างอยู่สวนกับเทรนด์ H1 ไหม — วัดตัวกรองตามที่มันทำงานจริง
+
+    ฝั่ง "ผ่าน" รวมแท่งที่ไม่มี FVG ค้างอยู่ (NONE) ไว้ด้วย เพราะ _check_fvg ปล่อยผ่าน
+    แท่งพวกนั้นจริงๆ  ถ้าแยก NONE ออกไป ตัวเลขที่ได้จะเป็นของตัวกรองสมมติที่บังคับ
+    ให้ต้องมี FVG หนุน ซึ่งไม่ใช่ตัวที่เขียนไว้ใน strategy.py
+
+    อ่านคอลัมน์ fvg_state ที่บอทบันทึกไว้ ไม่คำนวณใหม่จาก OHLC — ไฟล์นี้ไม่ import
+    core (ซึ่งลาก MetaTrader5 มาด้วย) และมันอ่าน adx_14 แบบเดียวกันนี้อยู่แล้ว
+    แถวที่เก็บก่อนจะมีคอลัมน์นี้จึงไม่มีให้วัด ต้องรอข้อมูลใหม่สะสม
+    """
+    if "fvg_state" not in frame or "h1_trend" not in frame or measure not in frame:
+        return None
+
+    outcome = pd.to_numeric(frame[measure], errors="coerce")
+    state = frame["fvg_state"].fillna("NONE")
+    known = outcome.notna() & frame["h1_trend"].notna()
+
+    opposes = (
+        ((state == "BEAR") & (frame["h1_trend"] == "UPTREND"))
+        | ((state == "BULL") & (frame["h1_trend"] == "DOWNTREND"))
+    )
+
+    return {
+        "passed": _stats(outcome[known & ~opposes]),
+        "blocked": _stats(outcome[known & opposes]),
+    }
+
+
 def _side_line(label, stats):
     if stats is None:
         return f"  {label:<8} ไม่มีแท่งฝั่งนี้เลย"
@@ -191,7 +292,7 @@ def format_split(title, split, min_sample=MIN_SAMPLE):
 
 def analyse(frame, horizon=HORIZON, sl_mult=SL_ATR_MULT, min_sample=MIN_SAMPLE):
     """รายงานทั้งชุด — คืนเป็น list ของบรรทัด เพื่อให้เทสอ่านได้โดยไม่ต้องจับ stdout"""
-    labelled = add_forward_outcomes(frame, horizon, sl_mult)
+    labelled = add_derived_columns(add_forward_outcomes(frame, horizon, sl_mult))
     known = labelled["fwd_net_r"].notna().sum()
 
     lines = [
@@ -236,6 +337,21 @@ def analyse(frame, horizon=HORIZON, sl_mult=SL_ATR_MULT, min_sample=MIN_SAMPLE):
         split_by_agreement(labelled),
         min_sample,
     )
+    lines.append("")
+    lines += format_split(
+        "FVG ไม่สวนเทรนด์ H1 (USE_FVG_FILTER)",
+        split_by_fvg(labelled),
+        min_sample,
+    )
+
+    lines.append("")
+    lines.append("ตัวชี้วัดที่ยังไม่ได้เป็นตัวกรอง — แบ่งที่ค่ากลางของตัวเอง เพื่อดูว่ามันแยกอะไรได้บ้างไหม")
+
+    for column, title in EXPLORATORY:
+        split = split_by_median(labelled, column)
+        threshold = f" (ค่ากลาง {split['threshold']:.2f})" if split else ""
+        lines.append("")
+        lines += format_split(f"{title}{threshold}", split, min_sample)
 
     lines.append("")
     lines.append("ตัวเลขนี้คือการเคลื่อนไหวของตลาดดิบๆ ไม่ใช่กำไรของไม้ — ไม่มี spread")

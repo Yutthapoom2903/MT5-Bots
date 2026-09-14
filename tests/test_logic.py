@@ -32,6 +32,7 @@ from bot import screen
 from bot import trade
 from bot import notify
 from bot import strategy
+from bot import news
 from analysis import backtest
 from analysis import outcomes
 from bot import runner
@@ -290,6 +291,7 @@ def _passing_context(signal="BUY"):
         "rsi": 55.0,
         "spread_points": 20.0,
         "server_hour": 14,
+        "gmt_offset": 0,        # เซิร์ฟเวอร์ = UTC ทำให้ 14:00 อยู่ในหน้าต่างพอดี
     }
 
 
@@ -368,13 +370,658 @@ def test_wide_spread_blocks_entry():
 
 
 def test_session_filter_blocks_outside_hours_when_enabled():
+    """หน้าต่างเขียนเป็น UTC แต่แท่งราคาเป็นเวลาเซิร์ฟเวอร์ — ต้องแปลงก่อนเทียบเสมอ
+
+    ใช้ broker GMT+3 ซึ่งเป็นค่าจริงที่เก็บอยู่ใน market_training_data.csv
+    เวอร์ชันก่อนหน้าเทียบชั่วโมงเซิร์ฟเวอร์กับตัวเลขที่คนพิมพ์ไว้ตรงๆ ผลคือหน้าต่าง
+    จริงเลื่อนไปสามชั่วโมงโดยไม่มีอะไรฟ้อง เทสนี้ตรึงการแปลงไว้
+    """
     saved = _with_filters(USE_SESSION_FILTER=True)
     try:
         context = _passing_context("BUY")
-        context["server_hour"] = 3
+        context["gmt_offset"] = 3
+
+        # เซิร์ฟเวอร์ 14:00 = 11:00 UTC — ยังเป็นช่วงเอเชีย/ลอนดอนต้นๆ ที่ตัดออก
+        context["server_hour"] = 14
         assert not strategy.evaluate(context).enter
 
-        context["server_hour"] = 14
+        # เซิร์ฟเวอร์ 17:00 = 14:00 UTC — London/NY ซ้อนกัน
+        context["server_hour"] = 17
+        assert strategy.evaluate(context).enter
+    finally:
+        _restore(saved)
+
+
+def test_the_session_window_converts_from_utc_to_broker_time():
+    assert strategy.server_hours_for(range(13, 21), 0) == set(range(13, 21))
+    assert strategy.server_hours_for(range(13, 21), 3) == set(range(16, 24))
+
+    # หน้าต่างที่ข้ามเที่ยงคืนต้องไม่กลายเป็นชั่วโมงที่ 24 หรือหายไปเฉยๆ
+    assert strategy.server_hours_for(range(22, 24), 3) == {1, 2}
+
+
+def test_the_session_filter_refuses_when_the_broker_offset_is_unknown():
+    """เปิดสวิตช์ไว้แล้วแปลงเวลาไม่ได้ = ไม่รู้ว่าตอนนี้ชั่วโมงอะไร จึงต้องไม่เดาแล้วเข้าไม้"""
+    saved = _with_filters(USE_SESSION_FILTER=True)
+    try:
+        context = _passing_context("BUY")
+        context["gmt_offset"] = None
+        decision = strategy.evaluate(context)
+
+        assert not decision.enter
+        assert any("offset" in check.detail for check in decision.blockers)
+    finally:
+        _restore(saved)
+
+
+# ---------- ตัวกรองข่าว ----------
+
+def _event(hour, minute=0, title="Non-Farm Employment Change"):
+    from datetime import datetime, timezone
+    return {
+        "time": datetime(2026, 9, 16, hour, minute, tzinfo=timezone.utc),
+        "title": title, "currency": "USD", "impact": "High",
+    }
+
+
+def _utc(hour, minute=0):
+    from datetime import datetime, timezone
+    return datetime(2026, 9, 16, hour, minute, tzinfo=timezone.utc)
+
+
+def test_news_blocks_entry_inside_the_window():
+    saved = _with_filters(USE_NEWS_FILTER=True)
+    try:
+        context = _passing_context("BUY")
+        context["news_event"] = "USD Non-Farm Employment Change 12:30 UTC"
+        decision = strategy.evaluate(context)
+
+        assert not decision.enter
+        assert any("ข่าว" in check.name for check in decision.blockers)
+    finally:
+        _restore(saved)
+
+
+def test_a_calendar_that_could_not_load_does_not_block_trading():
+    """ปฏิทินโหลดไม่ได้ต้องปล่อยผ่าน ไม่ใช่หยุดเทรดทั้งคืนเงียบๆ ตอนคนนอนอยู่"""
+    saved = _with_filters(USE_NEWS_FILTER=True)
+    try:
+        context = _passing_context("BUY")
+        context["news_event"] = ""
+        assert strategy.evaluate(context).enter
+
+        del context["news_event"]
+        assert strategy.evaluate(context).enter
+    finally:
+        _restore(saved)
+
+
+def test_the_window_covers_both_sides_of_the_release():
+    events = [_event(12, 30)]
+
+    assert news.blocking_event(events, _utc(12, 5)) is not None     # ก่อน 25 นาที
+    assert news.blocking_event(events, _utc(12, 30)) is not None    # ตรงเวลา
+    assert news.blocking_event(events, _utc(12, 55)) is not None    # หลัง 25 นาที
+    assert news.blocking_event(events, _utc(11, 55)) is None        # ก่อน 35 นาที
+    assert news.blocking_event(events, _utc(13, 5)) is None         # หลัง 35 นาที
+
+
+def test_only_the_watched_currency_and_impact_become_events():
+    payload = [
+        {"title": "NFP", "country": "USD", "impact": "High",
+         "date": "2026-09-16T08:30:00-04:00"},
+        {"title": "Retail Sales", "country": "USD", "impact": "Medium",
+         "date": "2026-09-16T08:30:00-04:00"},
+        {"title": "ECB Press Conference", "country": "EUR", "impact": "High",
+         "date": "2026-09-16T08:45:00-04:00"},
+    ]
+
+    events = news.parse_events(payload)
+    assert [event["title"] for event in events] == ["NFP"]
+
+
+def test_the_feed_time_is_converted_to_utc():
+    """ฟีดส่งเวลามาพร้อม offset ของนิวยอร์ก ไม่แปลงก็จะบล็อกผิดไปสี่ชั่วโมง"""
+    events = news.parse_events([
+        {"title": "NFP", "country": "USD", "impact": "High",
+         "date": "2026-09-16T08:30:00-04:00"},
+    ])
+
+    assert events[0]["time"] == _utc(12, 30)
+
+
+def test_a_row_that_cannot_be_read_does_not_lose_the_whole_calendar():
+    events = news.parse_events([
+        {"title": "ขยะ", "country": "USD", "impact": "High", "date": "ไม่ใช่เวลา"},
+        {"title": "NFP", "country": "USD", "impact": "High",
+         "date": "2026-09-16T08:30:00-04:00"},
+        "ไม่ใช่ dict ด้วยซ้ำ",
+    ])
+
+    assert [event["title"] for event in events] == ["NFP"]
+
+
+def test_events_come_back_in_time_order():
+    payload = [
+        {"title": "สอง", "country": "USD", "impact": "High",
+         "date": "2026-09-16T14:00:00-04:00"},
+        {"title": "หนึ่ง", "country": "USD", "impact": "High",
+         "date": "2026-09-16T08:30:00-04:00"},
+    ]
+
+    assert [event["title"] for event in news.parse_events(payload)] == ["หนึ่ง", "สอง"]
+
+
+def test_a_broken_cache_file_is_treated_as_no_cache():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "news.json")
+
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{ ไฟล์นี้เขียนค้างไว้")
+
+        assert news.read_cache(path) == ([], None)
+        assert news.read_cache(os.path.join(folder, "ไม่มีไฟล์นี้.json")) == ([], None)
+
+
+def test_what_was_written_can_be_read_back():
+    import tempfile
+
+    payload = [{"title": "NFP", "country": "USD", "impact": "High",
+                "date": "2026-09-16T08:30:00-04:00"}]
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "news.json")
+        assert news.write_cache(payload, _utc(9), path)
+
+        events, fetched_at = news.read_cache(path)
+        assert [event["title"] for event in events] == ["NFP"]
+        assert fetched_at == _utc(9)
+
+
+class _Feed:
+    """แทน news.download() ตอนเทส — นับจำนวนครั้งที่ถูกเรียกด้วย"""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    def __call__(self, url=None, timeout=None):
+        self.calls += 1
+        return self.payload
+
+
+def _with_feed(feed):
+    """สลับ news.download ชั่วคราวแล้วคืนตัวเดิมเสมอ — ไม่เขียนทับด้วยค่าที่เดาเอา"""
+    original = news.download
+    news.download = feed
+    return original
+
+
+def test_the_calendar_falls_back_to_cache_when_the_download_fails():
+    import tempfile
+
+    payload = [{"title": "NFP", "country": "USD", "impact": "High",
+                "date": "2026-09-16T08:30:00-04:00"}]
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "news.json")
+        news.write_cache(payload, _utc(0), path)
+
+        original = _with_feed(_Feed(None))      # ฟีดล่ม
+        try:
+            calendar = news.Calendar(path=path)
+            assert calendar.refresh(now=_utc(12))
+            assert calendar.blocking(_utc(12, 30)) is not None
+        finally:
+            news.download = original
+
+
+def test_a_fresh_cache_is_not_downloaded_again():
+    import tempfile
+
+    payload = [{"title": "NFP", "country": "USD", "impact": "High",
+                "date": "2026-09-16T08:30:00-04:00"}]
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "news.json")
+        news.write_cache(payload, _utc(12), path)
+
+        feed = _Feed(payload)
+        original = _with_feed(feed)
+        try:
+            calendar = news.Calendar(path=path)
+            calendar.refresh(now=_utc(13))      # แคชเพิ่งโหลดไปชั่วโมงเดียว
+            assert feed.calls == 0
+        finally:
+            news.download = original
+
+
+def test_the_feed_is_not_hammered_when_every_download_fails():
+    """ฟีดจำกัดไว้ 2 ครั้งต่อ 5 นาที ลูปเดินทุก 30 วินาที ถ้ายิงทุกรอบคือโดนบล็อกแน่"""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        feed = _Feed(None)
+        original = _with_feed(feed)
+        try:
+            calendar = news.Calendar(path=os.path.join(folder, "news.json"))
+
+            calendar.refresh(now=_utc(12, 0))
+            calendar.refresh(now=_utc(12, 5))     # 5 นาที ยังไม่ถึงขีด ห้ามยิงซ้ำ
+            assert feed.calls == 1
+
+            calendar.refresh(now=_utc(12, 20))    # พ้น MIN_REFRESH_SECONDS แล้วค่อยลองใหม่
+            assert feed.calls == 2
+        finally:
+            news.download = original
+
+
+def test_a_missing_calendar_warns_once_not_every_cycle():
+    """ลูปเดินทุก 30 วินาที เตือนทุกรอบคือท่วม data/bot.log โดยไม่บอกอะไรเพิ่ม"""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        original = _with_feed(_Feed(None))
+        try:
+            calendar = news.Calendar(path=os.path.join(folder, "news.json"))
+
+            assert calendar.blocking(_utc(12, 0)) is None
+            assert calendar.warned
+
+            calendar.blocking(_utc(12, 1))      # ยังไม่มีข้อมูล แต่ต้องไม่เตือนซ้ำ
+            assert calendar.warned
+        finally:
+            news.download = original
+
+
+def test_stale_data_is_reloaded():
+    assert news.is_stale(None, _utc(12))
+    assert news.is_stale(_utc(0), _utc(12), hours=6)
+    assert not news.is_stale(_utc(11), _utc(12), hours=6)
+
+
+# ---------- ตัวกรองดัชนีดอลลาร์ ----------
+
+def test_a_rising_dollar_blocks_a_gold_buy():
+    saved = _with_filters(USE_DXY_FILTER=True)
+    try:
+        context = _passing_context("BUY")
+        context["dxy_trend"] = "UPTREND"
+        assert not strategy.evaluate(context).enter
+
+        context["dxy_trend"] = "DOWNTREND"
+        assert strategy.evaluate(context).enter
+    finally:
+        _restore(saved)
+
+
+def test_a_falling_dollar_blocks_a_gold_sell():
+    saved = _with_filters(USE_DXY_FILTER=True)
+    try:
+        context = _passing_context("SELL")
+        context["dxy_trend"] = "DOWNTREND"
+        assert not strategy.evaluate(context).enter
+
+        context["dxy_trend"] = "UPTREND"
+        assert strategy.evaluate(context).enter
+    finally:
+        _restore(saved)
+
+
+# ---------- ตัวชี้วัดที่บันทึกไว้วัดผล ----------
+
+def _indicator_frame(volumes=None, n=120):
+    import numpy as np
+    frame = pd.DataFrame({
+        "open": np.linspace(100, 120, n),
+        "close": np.linspace(101, 121, n),
+        "high": np.linspace(102, 122, n),
+        "low": np.linspace(99, 119, n),
+        "tick_volume": volumes if volumes is not None else [100] * n,
+    })
+    frame["atr"] = core.calculate_atr(frame, 14)
+    core.add_moving_averages(frame, 20, 50)
+    return frame
+
+
+def test_the_volume_ratio_reads_the_closed_candle_not_the_forming_one():
+    """แท่งที่ยังไม่ปิดมี tick ไม่ครบเสมอ อ่านมันคือได้ค่าที่ต่ำผิดทุกครั้ง"""
+    frame = _indicator_frame(volumes=[100] * 118 + [300, 1])
+
+    assert core.volume_ratio(frame) > 2.0     # 300 ของแท่งที่ปิดแล้ว ไม่ใช่ 1
+
+
+def test_a_quiet_candle_scores_below_one():
+    frame = _indicator_frame(volumes=[100] * 118 + [20, 100])
+    assert core.volume_ratio(frame) < 1.0
+
+
+def test_the_atr_percentile_is_high_when_volatility_is_at_its_own_top():
+    frame = _indicator_frame()
+    assert core.atr_percentile(frame) == 100.0
+
+
+def test_price_above_the_slow_ma_gives_a_positive_distance():
+    """ขาขึ้น close อยู่เหนือ MA ของตัวเอง ขาลงอยู่ใต้ — เลื่อนราคาทั้งเส้นไม่นับ
+    เพราะ MA เลื่อนตามไปเท่ากัน ต้องกลับทิศเทรนด์จริงๆ"""
+    import numpy as np
+
+    up = _indicator_frame()
+    assert core.ma_distance_atr(up) > 0
+
+    down = _indicator_frame()
+    for column, start, stop in (("open", 120, 100), ("close", 121, 101),
+                                ("high", 122, 102), ("low", 119, 99)):
+        down[column] = np.linspace(start, stop, len(down))
+    down["atr"] = core.calculate_atr(down, 14)
+    core.add_moving_averages(down, 20, 50)
+
+    assert core.ma_distance_atr(down) < 0
+
+
+def test_the_body_ratio_spans_a_doji_and_a_full_candle():
+    full = pd.DataFrame({"open": [10, 10], "close": [20, 20],
+                         "high": [20, 20], "low": [10, 10]})
+    assert core.body_ratio(full) == 1.0
+
+    doji = pd.DataFrame({"open": [15, 15], "close": [15, 15],
+                         "high": [20, 20], "low": [10, 10]})
+    assert core.body_ratio(doji) == 0.0
+
+
+def test_an_indicator_with_nothing_to_read_returns_none_not_a_crash():
+    for call in (core.atr_percentile, core.ma_distance_atr,
+                 core.volume_ratio, core.body_ratio):
+        assert call(None) is None
+        assert call(pd.DataFrame()) is None
+
+
+def test_a_flat_candle_does_not_divide_by_zero():
+    flat = pd.DataFrame({"open": [10, 10], "close": [10, 10],
+                         "high": [10, 10], "low": [10, 10]})
+    assert core.body_ratio(flat) is None
+
+
+def test_the_median_split_needs_no_configured_threshold():
+    frame = pd.DataFrame({
+        "volume_ratio": [0.5, 0.7, 1.4, 1.8],
+        "fwd_trend_r": [-1.0, -1.0, 2.0, 2.0],
+    })
+
+    split = outcomes.split_by_median(frame, "volume_ratio")
+    assert split["passed"]["count"] == 2
+    assert split["blocked"]["count"] == 2
+    assert split["passed"]["mean"] > split["blocked"]["mean"]
+
+
+def test_the_median_split_says_nothing_when_the_column_is_missing():
+    frame = pd.DataFrame({"fwd_trend_r": [1.0, 2.0]})
+    assert outcomes.split_by_median(frame, "volume_ratio") is None
+
+
+def test_old_rows_get_the_two_indicators_that_can_be_rebuilt_from_the_file():
+    """คอลัมน์เก่ามีพอจะคำนวณสองตัวนี้ย้อนหลัง ไม่ต้องรอเก็บใหม่อีกเดือน"""
+    frame = pd.DataFrame({
+        "close": [4400.0], "ma_50": [4390.0], "atr_14": [10.0],
+        "candle_body": [3.0], "candle_range": [6.0],
+    })
+
+    outcomes.add_derived_columns(frame)
+
+    assert frame["ma_distance_atr"].iloc[0] == 1.0
+    assert frame["body_ratio"].iloc[0] == 0.5
+
+    # เดาย้อนหลังไม่ได้ก็ต้องไม่เดา
+    assert "volume_ratio" not in frame
+    assert "atr_percentile" not in frame
+
+
+def test_what_the_bot_logged_is_not_overwritten_by_the_rebuild():
+    frame = pd.DataFrame({
+        "close": [4400.0], "ma_50": [4390.0], "atr_14": [10.0],
+        "ma_distance_atr": [99.0],
+    })
+
+    outcomes.add_derived_columns(frame)
+    assert frame["ma_distance_atr"].iloc[0] == 99.0
+
+
+# ---------- Fair Value Gap ----------
+
+def _gap_frame(highs, lows):
+    return pd.DataFrame({"high": highs, "low": lows,
+                         "open": lows, "close": highs})
+
+
+def test_a_three_candle_gap_is_found_in_both_directions():
+    # low[2]=110 ยังสูงกว่า high[0]=100 แท่งกลางจึงทิ้งช่องไว้
+    up = _gap_frame([100, 120, 130], [90, 105, 110])
+    assert list(core.fvg_series(up))[-1] == "BULL"
+
+    down = _gap_frame([130, 115, 100], [120, 95, 90])
+    assert list(core.fvg_series(down))[-1] == "BEAR"
+
+
+def test_overlapping_candles_leave_no_gap():
+    """แท่งที่ทับกันคือตลาดเดินปกติ ไม่ใช่ช่องว่าง"""
+    flat = _gap_frame([100, 102, 104], [90, 92, 94])
+    assert set(core.fvg_series(flat)) == {"NONE"}
+
+
+def test_a_gap_stops_counting_once_price_fills_it():
+    filled = _gap_frame([100, 120, 130, 131, 132], [90, 105, 110, 120, 95])
+    states = list(core.fvg_series(filled))
+
+    assert states[2] == "BULL"
+    assert states[3] == "BULL"
+    assert states[4] == "NONE"      # low 95 ทะลุขอบล่าง 100 ลงไป ช่องเต็มแล้ว
+
+
+def test_a_gap_expires_after_the_lookback():
+    highs = [100, 120, 130] + [131] * 8
+    lows = [90, 105, 110] + [121] * 8
+    frame = _gap_frame(highs, lows)
+
+    assert list(core.fvg_series(frame, lookback=3))[-1] == "NONE"
+    assert list(core.fvg_series(frame, lookback=20))[-1] == "BULL"
+
+
+def test_the_fvg_state_never_reads_the_forming_candle():
+    """แท่งที่ยังไม่ปิดทำให้ช่องเกิดแล้วหายกลางแท่ง — บั๊กเดียวกับที่ CLOSED มีไว้กัน"""
+    frame = _gap_frame([100, 120, 130, 131, 132], [90, 105, 110, 120, 95])
+
+    # แท่งสุดท้าย (FORMING) เติมช่องเต็ม แต่มันยังไม่ปิด จึงต้องไม่มีผลต่อคำตัดสิน
+    assert list(core.fvg_series(frame))[-1] == "NONE"
+    assert core.fvg_state(frame) == "BULL"
+
+
+def test_too_few_candles_is_not_a_gap():
+    assert core.fvg_state(_gap_frame([100, 120], [90, 105])) == "NONE"
+    assert core.fvg_state(None) == "NONE"
+    assert list(core.fvg_series(_gap_frame([100], [90]))) == ["NONE"]
+
+
+def test_the_newer_gap_wins_when_both_sides_are_open():
+    # ช่องขาขึ้นเกิดที่แท่ง 2 แล้วช่องขาลงเกิดทีหลังโดยที่ช่องแรกยังไม่ถูกเติม
+    frame = _gap_frame([100, 120, 130, 129, 108], [90, 105, 110, 109, 101])
+    assert list(core.fvg_series(frame))[-1] == "BEAR"
+
+
+def test_an_opposing_gap_blocks_the_trade():
+    saved = _with_filters(USE_FVG_FILTER=True)
+    try:
+        context = _passing_context("BUY")
+        context["fvg_state"] = "BEAR"
+        assert not strategy.evaluate(context).enter
+
+        context["fvg_state"] = "BULL"
+        assert strategy.evaluate(context).enter
+    finally:
+        _restore(saved)
+
+
+def test_no_gap_at_all_lets_the_trade_through():
+    """ตัวกรองขอแค่ 'ไม่สวน' ไม่ได้บังคับว่าต้องมี FVG หนุน"""
+    saved = _with_filters(USE_FVG_FILTER=True)
+    try:
+        context = _passing_context("BUY")
+        context["fvg_state"] = "NONE"
+        assert strategy.evaluate(context).enter
+
+        del context["fvg_state"]
+        assert strategy.evaluate(context).enter
+    finally:
+        _restore(saved)
+
+
+def test_the_outcomes_split_counts_a_missing_gap_as_passing():
+    """ต้องวัดตัวกรองตามที่มันทำงานจริง — NONE ผ่าน จึงต้องอยู่ฝั่งผ่าน"""
+    frame = pd.DataFrame({
+        "h1_trend": ["UPTREND"] * 4,
+        "fvg_state": ["NONE", "BULL", "BEAR", "NONE"],
+        "fwd_trend_r": [1.0, 1.0, -5.0, 1.0],
+    })
+
+    split = outcomes.split_by_fvg(frame)
+    assert split["passed"]["count"] == 3
+    assert split["blocked"]["count"] == 1
+
+
+# ---------- วัดตัวกรองทีละตัว ----------
+
+def test_the_filter_scan_restores_every_switch_it_flips():
+    saved = _with_filters(USE_ADX_FILTER=False, USE_FVG_FILTER=True)
+    try:
+        backtest.filter_scan(_long_market(), None, None, {"spread_points": 30.0})
+
+        assert strategy.USE_ADX_FILTER is False
+        assert strategy.USE_FVG_FILTER is True
+    finally:
+        _restore(saved)
+
+
+def test_the_filter_scan_says_add_for_a_switch_that_ships_off():
+    """ตัวที่เปิดอยู่ถามว่า 'ปิดแล้วเป็นไง' ตัวที่ปิดอยู่ถามว่า 'เพิ่มแล้วเป็นไง'"""
+    saved = _with_filters(USE_ADX_FILTER=True, USE_FVG_FILTER=False)
+    try:
+        rows = backtest.filter_scan(_long_market(), None, None, {"spread_points": 30.0})
+        actions = {row["label"]: row["action"] for row in rows[1:]}
+
+        assert actions["ADX"] == "ปิด"
+        assert actions["FVG"] == "เพิ่ม"
+        assert rows[0]["action"] == ""
+    finally:
+        _restore(saved)
+
+
+def test_the_filter_scan_does_not_crown_a_winner_from_four_trades():
+    rows = [
+        {"label": "ค่าตั้งต้นตอนนี้", "action": "", "trades": 200,
+         "expectancy_r": 0.05, "total_r": 10.0, "win_rate": 40.0},
+        {"label": "FVG", "action": "เพิ่ม", "trades": 4, "delta_r": 0.9,
+         "expectancy_r": 0.95, "total_r": 3.8, "win_rate": 75.0},
+    ]
+
+    text = backtest.format_filter_scan(rows)
+    assert "ไม้น้อยเกินจะสรุป" in text
+    assert "ดีขึ้น" not in text
+
+
+def test_the_filter_scan_still_says_to_confirm_a_real_improvement():
+    rows = [
+        {"label": "ค่าตั้งต้นตอนนี้", "action": "", "trades": 200,
+         "expectancy_r": 0.05, "total_r": 10.0, "win_rate": 40.0},
+        {"label": "FVG", "action": "เพิ่ม", "trades": 120, "delta_r": 0.12,
+         "expectancy_r": 0.17, "total_r": 20.4, "win_rate": 47.0},
+    ]
+
+    text = backtest.format_filter_scan(rows)
+    assert "เพิ่ม FVG ดีขึ้น" in text
+    assert "walkforward" in text
+
+
+# ---------- กวาดหน้าต่างเวลา ----------
+
+def test_the_session_scan_restores_both_switches_it_touches():
+    """บทเรียนเดียวกับ SwitchedTo — ต้องคืนค่าที่ *เคยเป็น* ไม่ใช่ค่า default ที่เขียนตายไว้"""
+    saved = _with_filters(USE_SESSION_FILTER=True, SESSION_UTC_HOURS=range(1, 5))
+    try:
+        backtest.session_scan(_long_market(), None, None, {"use_filters": False})
+
+        assert strategy.USE_SESSION_FILTER is True
+        assert strategy.SESSION_UTC_HOURS == range(1, 5)
+    finally:
+        _restore(saved)
+
+
+def test_the_session_scan_compares_every_window_against_no_limit_at_all():
+    """ปิดตัวกรองอื่นให้หมด เหลือ session ตัวเดียว ไม้ที่หายไปจึงเป็นผลของมันล้วนๆ"""
+    saved = _with_filters(USE_H1_TREND_FILTER=False, USE_ADX_FILTER=False,
+                          USE_RSI_FILTER=False, USE_M5_CONFIRM=False,
+                          USE_NEWS_FILTER=False)
+    try:
+        rows = backtest.session_scan(
+            _long_market(), None, None,
+            {"use_filters": True, "spread_points": 30.0, "gmt_offset": 0})
+
+        assert len(rows) == len(backtest.SESSION_WINDOWS)
+        assert rows[0]["hours"] == "ทั้งวัน"
+        assert rows[0]["trades"] > 0        # ไม่งั้นข้อที่เหลือผ่านเพราะศูนย์เท่ากับศูนย์
+
+        # หน้าต่างที่แคบกว่าต้องได้ไม้น้อยกว่า ไม่งั้นแปลว่าตัวกรองไม่ได้ทำงานจริง
+        narrow = next(row for row in rows if row["hours"] == "13-16 UTC")
+        assert narrow["trades"] < rows[0]["trades"]
+    finally:
+        _restore(saved)
+
+
+def test_a_thin_window_is_labelled_instead_of_being_reported_as_a_winner():
+    rows = [
+        {"label": "ไม่จำกัดชั่วโมง", "hours": "ทั้งวัน", "trades": 200,
+         "expectancy_r": 0.05, "total_r": 10.0, "win_rate": 40.0},
+        {"label": "แคบมาก", "hours": "13-14 UTC", "trades": 4,
+         "expectancy_r": 0.90, "total_r": 3.6, "win_rate": 75.0},
+    ]
+
+    text = backtest.format_session_scan(rows)
+
+    assert "ไม้น้อยเกินจะสรุป" in text
+    # 0.90R จากสี่ไม้ต้องไม่ถูกประกาศเป็นผู้ชนะ ต่อให้มันอยู่บนสุดของตาราง
+    assert "ดีที่สุดคือ" not in text
+    assert "น้อยเกินจะเทียบ" in text
+
+
+def test_a_window_that_beats_the_baseline_still_says_to_confirm_it():
+    rows = [
+        {"label": "ไม่จำกัดชั่วโมง", "hours": "ทั้งวัน", "trades": 200,
+         "expectancy_r": 0.05, "total_r": 10.0, "win_rate": 40.0},
+        {"label": "London/NY ซ้อนกัน", "hours": "13-16 UTC", "trades": 90,
+         "expectancy_r": 0.22, "total_r": 19.8, "win_rate": 48.0},
+    ]
+
+    text = backtest.format_session_scan(rows)
+    assert "walk_forward" in text
+
+
+def test_no_window_beating_the_baseline_says_to_leave_the_filter_off():
+    rows = [
+        {"label": "ไม่จำกัดชั่วโมง", "hours": "ทั้งวัน", "trades": 200,
+         "expectancy_r": 0.20, "total_r": 40.0, "win_rate": 50.0},
+        {"label": "London/NY ซ้อนกัน", "hours": "13-16 UTC", "trades": 90,
+         "expectancy_r": 0.05, "total_r": 4.5, "win_rate": 41.0},
+    ]
+
+    assert "False" in backtest.format_session_scan(rows)
+
+
+def test_a_broker_without_a_dollar_index_still_trades():
+    """ไม่มีข้อมูลไม่ใช่เหตุผลที่จะไม่เข้าไม้ — ต่างจาก session ที่ผู้ใช้สั่งให้จำกัดเอง"""
+    saved = _with_filters(USE_DXY_FILTER=True)
+    try:
+        context = _passing_context("BUY")
+        context["dxy_trend"] = "UNKNOWN"
         assert strategy.evaluate(context).enter
     finally:
         _restore(saved)

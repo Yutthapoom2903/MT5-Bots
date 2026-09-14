@@ -11,7 +11,7 @@ feature log -> ให้ strategy ตัดสินใจ -> ส่งคำส
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
@@ -20,6 +20,7 @@ from bot import core
 from bot import paths
 from bot import trade
 from bot import notify
+from bot import news
 from bot import strategy
 
 # ---------- ตลาดที่เฝ้า ----------
@@ -38,6 +39,14 @@ BARS_M15 = 300
 BARS_H1 = 150
 BARS_M5 = 200
 CHECK_EVERY_SECONDS = 30
+
+# ดัชนีดอลลาร์ใช้เป็นบริบทประกอบ ไม่ใช่ตัวตัดสิน — broker หลายเจ้าไม่มีให้ดึงเลย
+# ชื่อก็ไม่ตรงกันอีก (USDX, DXY, USDIDX, US Dollar Index) จึงค้นแบบเดียวกับที่ทำกับทอง
+# หาไม่เจอคือปกติ ไม่ใช่ error — dxy_trend เป็น UNKNOWN แล้ว _check_dxy ปล่อยผ่าน
+DXY_SYMBOL = "USDX"
+DXY_KEYWORDS = ("USDX", "DXY", "USDIDX", "DOLLARIDX", "USDOLLAR")
+DXY_TIMEFRAME = mt5.TIMEFRAME_H1
+BARS_DXY = 150
 
 # ---------- การบริหารความเสี่ยง ----------
 ALLOW_LIVE_ACCOUNT = False    # ต้องแก้เป็น True เองก่อนใช้กับบัญชีจริง
@@ -96,6 +105,66 @@ NOTIFIER = notify.Notifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, logging.getLogger()
 # ใช้บอกอายุการทำงานใน heartbeat — เพิ่ง restart กับรันมาสามวันคนละเรื่องกัน
 STARTED_AT = time.time()
 
+# ตัวเดียวทั้งโปรเจกต์เหมือน NOTIFIER เพราะมันจำว่าโหลดปฏิทินครั้งล่าสุดเมื่อไหร่
+# ถ้าสร้างใหม่ทุกรอบ มันจะยิงขอฟีดทุก 30 วินาทีแล้วโดนฝั่งโน้นบล็อก
+CALENDAR = news.Calendar()
+
+# ชื่อ symbol ดัชนีดอลลาร์ที่ broker นี้ใช้จริง หาให้ครั้งเดียวตอนเริ่ม
+# False = หาแล้วไม่เจอ ต่างจาก None = ยังไม่ได้หา จะได้ไม่ไปค้นซ้ำทุกแท่ง
+RESOLVED_DXY = None
+
+
+# ---------- บริบทจากนอกกราฟทอง ----------
+
+def _dxy_trend():
+    """
+    เทรนด์ H1 ของดัชนีดอลลาร์ — "UNKNOWN" เมื่อ broker ไม่มีให้ดึง
+
+    หาชื่อครั้งเดียวแล้วจำไว้ เพราะ symbols_get() ดึงรายชื่อทั้งโบรกมานับพันตัว
+    ไม่ใช่ของที่ควรทำทุก 15 นาที  ทุกความล้มเหลวกลายเป็น UNKNOWN ไม่ใช่ exception —
+    นี่เป็นข้อมูลเสริม ลูปเทรดต้องไม่ล้มเพราะดัชนีที่โบรกไม่ได้ขายด้วยซ้ำ
+    """
+    global RESOLVED_DXY
+
+    if RESOLVED_DXY is False:
+        return "UNKNOWN"
+
+    if RESOLVED_DXY is None:
+        try:
+            RESOLVED_DXY, _ = core.resolve_symbol(DXY_SYMBOL, DXY_KEYWORDS)
+        except Exception as error:      # core.MT5Error และอะไรก็ตามที่โผล่มา
+            logger.info("ไม่มี symbol ดัชนีดอลลาร์ที่ broker นี้ (%s) — ข้ามตัวกรอง DXY", error)
+            RESOLVED_DXY = False
+            return "UNKNOWN"
+
+        logger.info("ดัชนีดอลลาร์ใช้ symbol: %s", RESOLVED_DXY)
+
+    try:
+        rates = core.get_rates(RESOLVED_DXY, DXY_TIMEFRAME, BARS_DXY, SLOW_MA + 3)
+    except Exception as error:
+        logger.debug("ดึงราคา %s ไม่ได้: %s", RESOLVED_DXY, error)
+        return "UNKNOWN"
+
+    if rates is None:
+        return "UNKNOWN"
+
+    core.add_moving_averages(rates, FAST_MA, SLOW_MA)
+    return core.ma_trend(rates)
+
+
+def _news_block():
+    """ข้อความบอกข่าวที่ครอบเวลานี้อยู่ หรือ "" ถ้าเทรดได้ — ไม่โยน error ออกไปไหน"""
+    if not strategy.USE_NEWS_FILTER:
+        return ""
+
+    try:
+        event = CALENDAR.blocking(datetime.now(timezone.utc))
+    except Exception as error:
+        logger.warning("ตรวจปฏิทินข่าวไม่สำเร็จ จึงถือว่าไม่มีข่าว: %s", error)
+        return ""
+
+    return news.describe(event)
+
 
 # ---------- รวบรวมข้อมูลตลาด ----------
 
@@ -144,11 +213,23 @@ def build_context():
 
         "h1_trend": core.ma_trend(h1),
         "m5_trend": core.ma_trend(m5),
+        "fvg_state": core.fvg_state(m15),
+
+        # กลุ่มนี้บันทึกอย่างเดียว ไม่มีตัวกรองไหนอ่าน — ดูหมายเหตุใน core.py
+        "atr_percentile": core.atr_percentile(m15),
+        "ma_distance_atr": core.ma_distance_atr(m15),
+        "volume_ratio": core.volume_ratio(m15),
+        "body_ratio": core.body_ratio(m15),
         "spread_points": core.spread_points(SYMBOL),
 
         # เวลาในแท่งเป็นเวลาเซิร์ฟเวอร์ broker ซึ่งขยับตาม DST ปีละสองครั้ง
         # ไม่บันทึกไว้ตอนเก็บ แถวเก่ากับแถวใหม่จะอยู่คนละกรอบเวลาโดยไม่มีใครรู้
         "gmt_offset": core.broker_gmt_offset(SYMBOL),
+
+        # สองอันนี้มาจากนอกกราฟทอง จึงดึงตรงนี้ที่เดียวเหมือนทุกอย่างใน context
+        # strategy.evaluate() จะได้ยังเป็นฟังก์ชันบริสุทธิ์ ไม่ต้องต่อเน็ตและไม่ต้องต่อ MT5
+        "news_event": _news_block(),
+        "dxy_trend": _dxy_trend() if strategy.USE_DXY_FILTER else "UNKNOWN",
     }
 
     return context, candle
@@ -189,6 +270,13 @@ def log_features(context, candle, decision):
 
         "h1_trend": context["h1_trend"],
         "m5_trend": context["m5_trend"],
+        "dxy_trend": context.get("dxy_trend", "UNKNOWN"),
+        "fvg_state": context.get("fvg_state", "NONE"),
+        "atr_percentile": context.get("atr_percentile"),
+        "ma_distance_atr": context.get("ma_distance_atr"),
+        "volume_ratio": context.get("volume_ratio"),
+        "body_ratio": context.get("body_ratio"),
+        "news_event": context.get("news_event", ""),
         "spread_points": context["spread_points"],
         "candle_range": round(float(candle["high"] - candle["low"]), 2),
         "candle_body": round(abs(float(candle["close"] - candle["open"])), 2),
@@ -850,7 +938,18 @@ def run(trade_enabled=False):
 
     offset = core.broker_gmt_offset(SYMBOL)
     if offset is not None:
-        logger.info("เวลาเซิร์ฟเวอร์ broker = GMT%+d (ใช้ตั้ง SESSION_HOURS)", offset)
+        logger.info("เวลาเซิร์ฟเวอร์ broker = GMT%+d (ใช้แปลง SESSION_UTC_HOURS)", offset)
+
+        if strategy.USE_SESSION_FILTER:
+            hours = sorted(strategy.server_hours_for(strategy.SESSION_UTC_HOURS, offset))
+            logger.info("ชั่วโมงที่อนุญาต = %s (เวลาเซิร์ฟเวอร์)",
+                        ", ".join(f"{hour:02d}" for hour in hours))
+
+    # โหลดปฏิทินไว้ตั้งแต่ต้น จะได้รู้ตอนนี้ว่าโหลดไม่ได้ ไม่ใช่ไปรู้ตอนข่าวออกแล้ว
+    if strategy.USE_NEWS_FILTER:
+        CALENDAR.refresh()
+        for line in news.status_lines(CALENDAR):
+            logger.info("%s", line)
 
     logger.info(
         "แจ้งเตือน Telegram: %s",

@@ -18,6 +18,7 @@
     python run.py report       สรุปว่าบอททำอะไรไปบ้าง จากไฟล์ที่มันเขียนไว้
     python run.py review       สรุปผลจากข้อมูลที่คุณติดป้ายกำกับไว้เอง
     python run.py outcomes     ตัวกรองแยกแท่งที่เทรนด์ไปต่อได้จริงไหม จากข้อมูลที่เก็บเอง
+    python run.py news         ข่าวแรงที่กำลังบล็อกการเข้าไม้ และคืนนี้มีอะไรรออยู่
     python run.py notify       ส่งตัวอย่างแจ้งเตือนครบทุกหมวดเข้า Telegram
     python run.py test         รันเทส logic (ไม่ต้องต่อ MT5)
 """
@@ -63,7 +64,7 @@ def command_check(args):
 
     offset = core.broker_gmt_offset(runner.SYMBOL)
     if offset is not None:
-        print(f"เวลาเซิร์ฟเวอร์ broker: GMT{offset:+d} (ใช้ตั้ง SESSION_HOURS ใน strategy.py)")
+        print(f"เวลาเซิร์ฟเวอร์ broker: GMT{offset:+d} — SESSION_UTC_HOURS แปลงเป็นชั่วโมงนี้ให้เอง)")
 
     context, _ = runner.build_context()
     if context is None:
@@ -361,6 +362,24 @@ def command_outcomes(args):
     print("\n".join(outcomes.analyse(frame, horizon=args.horizon)))
 
 
+def command_news(args):
+    """ปฏิทินข่าวแรง — ตอนนี้ติดข่าวอยู่ไหม และคืนนี้มีอะไรรออยู่
+
+    ออฟไลน์จาก MT5 (ใช้แค่เน็ต) จึงรันบน WSL ได้
+    ตอบคำถาม "ทำไมบอทไม่เข้าไม้" ที่คำตอบคือ "เพราะอีกยี่สิบนาที FOMC"
+    """
+    from bot import news
+    from bot import strategy
+
+    calendar = news.Calendar()
+    calendar.refresh(force=args.refresh)
+
+    if not strategy.USE_NEWS_FILTER:
+        print("USE_NEWS_FILTER ปิดอยู่ — ข้างล่างนี้เป็นข้อมูลอย่างเดียว บอทไม่ได้ใช้กรอง\n")
+
+    print("\n".join(news.status_lines(calendar)))
+
+
 def command_sweep(args):
     """กวาดหลายชุดค่า ดูว่าผลลัพธ์ทนต่อการเปลี่ยนค่าหรือแค่ฟลุค"""
     from analysis import backtest
@@ -377,9 +396,22 @@ def command_sweep(args):
         total *= len(values)
     print(f"กำลังกวาด {total} ชุดค่า ...\n")
 
-    rows = backtest.sweep(m15, h1, m5, {"spread_points": args.spread}, grid)
+    # เวลาบนแท่งเป็นเวลาเซิร์ฟเวอร์ ส่วนหน้าต่าง session เขียนเป็น UTC — ต่างกันกี่ชั่วโมง
+    # ถามจาก broker เอา ไม่ให้ backtest ใช้ค่าเริ่มต้นที่อาจไม่ตรงกับโบรกเจ้านี้
+    from bot import core
+    offset = core.broker_gmt_offset(runner.SYMBOL)
+    base = {"spread_points": args.spread}
+    if offset is not None:
+        base["gmt_offset"] = offset
+
+    rows = backtest.sweep(m15, h1, m5, base, grid)
     print(backtest.format_sweep(rows, top=args.top))
     print("\nอย่าหยิบค่าที่ดีที่สุดไปใช้ตรงๆ ค่าที่อยู่กลางย่านที่กำไรทั้งย่านทนกว่ามาก")
+
+    # คำถามคนละข้อกับกริดข้างบน จึงวัดแยกทีละหน้าต่างแทนที่จะคูณเข้าไปในกริด
+    print()
+    print(backtest.format_session_scan(
+        backtest.session_scan(m15, h1, m5, base), offset))
 
 
 def command_walkforward(args):
@@ -466,6 +498,12 @@ def command_backtest(args):
     print(backtest.format_report(with_filters, "ใส่ตัวกรองหลาย timeframe"))
     print()
     _print_verdict(backtest.metrics(without), backtest.metrics(with_filters))
+
+    # "ตัวกรองรวมกันช่วยไหม" กับ "ตัวไหนช่วย" เป็นคนละคำถาม อันหลังคือเหตุผลที่
+    # สวิตช์ทุกตัวแยกจากกันตั้งแต่แรก และเป็นที่เดียวที่ตอบได้ว่าควรเพิ่มตัวใหม่หรือไม่
+    print()
+    print(backtest.format_filter_scan(
+        backtest.filter_scan(m15, h1, m5, overrides)))
 
 
 def _print_verdict(plain, filtered):
@@ -554,7 +592,7 @@ def command_all(args):
     """คำสั่งเดียวจบ — หา Symbol ตรวจความพร้อม วิเคราะห์ย้อนหลัง แล้วเฝ้าดูสด"""
     from bot import runner
 
-    total = 4 if args.skip_backtest else 7
+    total = 5 if args.skip_backtest else 8
 
     _phase(1, total, "หา Symbol ที่ broker ใช้")
     _auto_symbol(args)
@@ -565,15 +603,18 @@ def command_all(args):
     _try_phase(3, total, "ตัวกรองแยกอะไรได้จริงไหม จากข้อมูลที่เก็บมาเอง",
                command_outcomes, args)
 
-    step = 4
+    # โหลดปฏิทินตั้งแต่ตอนนี้ จะได้เห็นก่อนนอนว่าคืนนี้มีข่าวอะไร ไม่ใช่ไปงงตอนบอทไม่เข้าไม้
+    _try_phase(4, total, "ข่าวแรงคืนนี้", command_news, args)
+
+    step = 5
     if not args.skip_backtest:
-        _try_phase(4, total, "จำลองย้อนหลัง — กลยุทธ์นี้เคยทำเงินได้ไหม",
+        _try_phase(5, total, "จำลองย้อนหลัง — กลยุทธ์นี้เคยทำเงินได้ไหม",
                    command_backtest, args)
-        _try_phase(5, total, "กวาดค่า — ผลทนต่อการเปลี่ยนค่าหรือแค่ฟลุค",
+        _try_phase(6, total, "กวาดค่า — ผลทนต่อการเปลี่ยนค่าหรือแค่ฟลุค",
                    command_sweep, args)
-        _try_phase(6, total, "จูนแล้วยังดีกับช่วงที่ไม่เคยเห็นไหม",
+        _try_phase(7, total, "จูนแล้วยังดีกับช่วงที่ไม่เคยเห็นไหม",
                    command_walkforward, args)
-        step = 7
+        step = 8
 
     _phase(step, total, "เทรดสด" if args.trade else "เฝ้าดูตลาดสด (ไม่ส่งคำสั่ง)")
 
@@ -598,7 +639,7 @@ def build_parser():
         command=None, trade=False, months=6, spread=30.0,
         top=15, quick=False, skip_backtest=False, no_compare=False, folds=4,
         csv=paths.FEATURE_LOG, keywords=None, dry=False, check=False,
-        horizon=8,
+        horizon=8, refresh=False,
     )
     parser.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
     parser.add_argument("--skip-backtest", action="store_true",
@@ -643,6 +684,10 @@ def build_parser():
     forward.add_argument("--horizon", type=int, default=8,
                          help="จำนวนแท่ง M15 ที่มองไปข้างหน้า (ค่าเริ่มต้น 8 = 2 ชม.)")
 
+    calendar = subparsers.add_parser("news", help="ข่าวแรงที่กำลังบล็อกการเข้าไม้อยู่")
+    calendar.add_argument("--refresh", action="store_true",
+                          help="โหลดปฏิทินใหม่ทันที ไม่รอให้แคชหมดอายุ")
+
     review = subparsers.add_parser("review", help="สรุปผลจากข้อมูลที่คุณติดป้ายเอง")
     review.add_argument("csv", nargs="?", default=paths.FEATURE_LOG)
 
@@ -677,6 +722,7 @@ COMMANDS = {
     "report": command_report,
     "review": command_review,
     "outcomes": command_outcomes,
+    "news": command_news,
     "notify": command_notify,
     "test": command_test,
     "all": command_all,
@@ -684,7 +730,7 @@ COMMANDS = {
 
 # คำสั่งที่ไม่ต้องต่อ MT5 จึงไม่ต้อง shutdown
 # menu ต่อ MT5 เองเมื่อผู้ใช้เลือกข้อที่ต้องใช้ ไม่ให้ main() ต่อไว้ล่วงหน้า
-OFFLINE_COMMANDS = {"review", "report", "outcomes", "test", "notify", "menu"}
+OFFLINE_COMMANDS = {"review", "report", "outcomes", "news", "test", "notify", "menu"}
 
 
 def main():

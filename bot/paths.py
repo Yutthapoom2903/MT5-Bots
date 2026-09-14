@@ -18,6 +18,7 @@ FEATURE_LOG = os.path.join(DATA_DIR, "market_training_data.csv")
 TRADE_LOG = os.path.join(DATA_DIR, "trade_log.csv")
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
 LOG_FILE = os.path.join(DATA_DIR, "bot.log")
+NEWS_CACHE = os.path.join(DATA_DIR, "news_calendar.json")
 
 
 def ensure_parent(path):

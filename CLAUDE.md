@@ -33,15 +33,16 @@ subcommand.
 ```
 run.py                  CLI: menu | check | symbols | signal | watch | trade
                         backtest | sweep | walkforward | report | review
-                        outcomes | notify | test | all
+                        outcomes | news | notify | test | all
 bot/                    the live side — talks to MT5, decides, sends orders
-    core.py             connect, symbol setup, rates, indicators, the crossover rule,
-                        logging, state
+    core.py             connect, symbol setup, rates, indicators (incl. FVG and the
+                        logged-only ones), the crossover rule, logging, state
     trade.py            broker-facing only: price/volume normalization, stop distance,
                         filling mode, risk sizing, order send/close. Imported by runner alone.
     runner.py           the one loop — fetch once per candle, then log + decide + optionally trade
     strategy.py         pure decision engine: context dict in, Decision out. No MT5 imports.
     notify.py           Telegram: categories, formatting, anti-spam. No MT5 imports either.
+    news.py             economic calendar: fetch, cache, news windows. No MT5 imports.
     menu.py             numbered menu over the same subcommands. Pure except run().
     screen.py           ANSI colour and display-width padding. Imported by both sides.
     paths.py            where the data files live. The only place those names are written.
@@ -238,6 +239,86 @@ the next commit. Any switch flipped in a test must be restored to what it *was*,
 hardcoded default; `SwitchedTo` exists because a `finally` that wrote `False` back masked
 this very change to the default.
 
+## News and outside context
+
+Two filters read things that are not on the gold chart. Both are computed in
+`runner.build_context()` and arrive in the context dict as plain values, so
+`strategy.evaluate()` stays pure — no network, no MT5, still testable offline.
+
+**`bot/news.py` blocks entries around high-impact releases.** This is not a prediction.
+At FOMC/CPI/NFP the spread blows out and price spikes both ways before picking one;
+`MAX_SPREAD_POINTS` can only react *after* the spread widens, so it cannot avoid the
+event itself. The window is `MINUTES_BEFORE`/`MINUTES_AFTER` around each event, and it
+blocks new entries only — stop management, trailing and exits keep running.
+
+- **The MT5 Python package has no calendar API.** MQL5 has `CalendarValueHistory()`; the
+  Python integration does not expose it. So the events come over HTTP from ForexFactory's
+  free weekly JSON feed. This is the second thing on the live side that talks to the
+  network, after `notify.py`, and it is held to the same rule: every failure becomes a log
+  line, never an exception that reaches the loop.
+- **Everything is UTC inside the module.** The feed sends ISO timestamps with a New York
+  offset; `parse_events()` converts at the boundary. The runner asks with
+  `datetime.now(timezone.utc)` — deliberately *not* the candle's server timestamp, because
+  the question is "is an order right now landing in a news window", and a conversion that
+  is not needed is a DST bug waiting to happen.
+- **Fail-open, on purpose.** Download fails → use the cache (the feed covers a whole week,
+  so yesterday's copy is still right). No cache at all → let the trade through and log a
+  WARNING. A dropped home connection must not silently stop the bot all night while the
+  user is asleep; the things that actually cap losses are the SL and the circuit breaker,
+  and this filter is not one of them.
+- **The feed allows 2 downloads per 5 minutes.** The loop ticks every 30 seconds, so
+  `Calendar` is a single module-level instance (like `NOTIFIER`) that remembers when it
+  last fetched. `REFRESH_HOURS` gates the normal path and `MIN_REFRESH_SECONDS` gates the
+  retry path — without the second one, a feed that is down gets hammered every cycle.
+- `run.py news` answers "why is the bot not entering anything" when the answer is
+  "because FOMC is in twenty minutes", and `command_all` runs it before the live loop so
+  the night's events are visible before going to bed.
+
+**`USE_DXY_FILTER` asks only that the dollar is not opposing the trade**, the way
+`USE_M5_CONFIRM` does. Gold and the dollar index move inversely, and the dollar is the
+one predictor of gold returns that research finds stable rather than episodic. It ships
+**off** — unproven here, and unlike the news filter it cannot be justified mechanically.
+Many brokers do not carry a dollar index at all and the name varies (`USDX`, `DXY`,
+`USDIDX`), so `_dxy_trend()` resolves it once through `core.resolve_symbol()`, caches
+`False` on failure so it does not re-scan every candle, and returns `"UNKNOWN"` — which
+the filter passes. Absent data is not a reason to skip a trade. The session filter is the
+opposite case and fails *closed* when the offset is unknown, because there the user
+explicitly asked for hours to be restricted.
+
+## Indicators, and the rule for adding one
+
+Indicators are cheap; evidence that one separates anything is not. So anything new lands
+in the CSV first and in the decision path only after `analysis/outcomes.py` and
+`backtest.filter_scan()` have had something to say about it. The switches in
+`bot/strategy.py` exist so each can be measured alone — that is the whole point of keeping
+them individually toggleable.
+
+**`USE_FVG_FILTER` (Fair Value Gap) ships off.** An FVG is the three-candle imbalance from
+ICT/SMC: the middle candle runs far enough that candles 1 and 3 do not overlap, leaving a
+gap. There is no research behind it the way there is behind ADX or RSI, but unlike most of
+that school it is precisely definable, so this repo can settle the question with data
+instead of argument. `core.fvg_series()` walks the frame once (O(n), same reason as
+`backtest.signal_series()`), tracking the newest live gap on each side; a gap dies when
+price fully closes it or when it ages past `FVG_LOOKBACK`. Both of those are definitional
+choices, not facts — the strict fill rule is used because a touch rule kills gaps almost
+immediately. `core.fvg_state()` drops the forming candle before reading, because a gap that
+appears and vanishes mid-candle is the same bug `CLOSED` exists to prevent. It *is* fully
+backtestable (pure OHLC), which is why `filter_scan` can judge it and news/DXY cannot.
+
+**Four indicators are logged and read by nothing.** `atr_percentile`, `ma_distance_atr`,
+`volume_ratio`, `body_ratio` — all unitless, so a day at ATR 13 and a day at ATR 6 sit in
+the same average, the same reason results are reported in R. `outcomes.analyse()` splits
+each at its own median, because the question at this stage is "does it separate anything at
+all", not "what should the threshold be"; hunting for the threshold that works before the
+split at the median shows anything is how noise gets mined. `add_derived_columns()`
+backfills `ma_distance_atr` and `body_ratio` onto old rows from `close`/`ma_50`/`atr_14`
+and `candle_body`/`candle_range`, so they measure against the whole file instead of waiting
+a month. The other two cannot be rebuilt — `atr_percentile` needs 96 contiguous bars of ATR
+that straddle the gaps where the bot was down, and `tick_volume` was never logged — so they
+stay empty rather than guessed. Any code touching these columns goes through `_has()` /
+`report._numeric()`: `frame.get()` on a missing column returns `None` and
+`pd.to_numeric(None)` is a bare float with no Series methods.
+
 ## Backtesting
 
 `backtest.simulate()` is pure — DataFrames in, results out — and must stay that way so it
@@ -258,6 +339,29 @@ the invariant is duplicated, because slicing the frame per bar made the loop O(n
 27-combo sweep took 166s; it now takes 0.3s). `test_vectorised_signal_matches_the_live_rule`
 compares it against `core.crossover_signal()` bar by bar. Never edit it without running
 that test. The inner position loop takes numpy arrays, not DataFrames, for the same reason.
+
+`simulate()` cannot model two of the filters and says so in its docstring: the news feed
+only carries the current week, so historical news windows cannot be reconstructed, and DXY
+history is not fetched. Both pass through, which makes backtest numbers those of the
+strategy *before* those two filters, not of the whole bot.
+
+`filter_scan()` answers "which filter is doing the work", which `compare()` cannot — that
+one only weighs all filters against a bare crossover. It flips each switch in
+`SCANNABLE_FILTERS` one at a time against a fixed baseline: a filter that ships on gets
+turned off to show what it contributes, one that ships off gets turned on to show what
+adding it would do. Those are the same question from two sides, and both need the same
+baseline to mean anything. News and DXY are absent from the list because they cannot be
+simulated; the session window has `session_scan()` because its question is "which window",
+not "on or off". Every flipped switch is restored to what it *was*.
+
+`session_scan()` is the separate answer to "does restricting hours help", run at the bottom
+of `run.py sweep`. It is deliberately not a `DEFAULT_GRID` axis — that would multiply every
+combination in the grid to answer a question that is measured better one window at a time,
+the same way every other filter is measured. It compares each candidate window against no
+restriction at all, and `MIN_TEST_TRADES` labels a window that only looks good because it
+left four trades. Both `USE_SESSION_FILTER` and `SESSION_UTC_HOURS` are restored to what
+they *were* in a `finally` — the `SwitchedTo` lesson, which applies to any switch a test or
+a scan flips.
 
 `sweep()` prepares indicators once and reuses them, and restores `strategy.ADX_MIN` in a
 `finally`. Its point is robustness, not optimisation — a grid that is profitable only in one
@@ -352,7 +456,14 @@ accumulating data, not build output. `data/bot.log` and `data/bot_state.json` ar
 
 Column sets have changed over time: rows before 2026-09-09 used a simple rolling mean for
 RSI/ATR (now Wilder) and lack `adx_14`, `m5_trend`, `bot_decision`, `bot_blockers`. Rows
-before 2026-09-10 lack `broker_gmt_offset`.
+before 2026-09-10 lack `broker_gmt_offset`. Rows before 2026-09-14 lack `dxy_trend`,
+`news_event`, `fvg_state`, `atr_percentile`, `ma_distance_atr`, `volume_ratio` and
+`body_ratio` — `core.append_csv()` rewrites the file to absorb them, as it does for any
+added column, and `outcomes.add_derived_columns()` rebuilds the two that the older columns
+already contain.
+
+`data/news_calendar.json` is the cached calendar feed, gitignored: it is refetchable, not
+something the bot produced.
 
 `candle_time` is **broker server time**, which is usually GMT+2/+3 and shifts with DST —
 and brokers are documented to handle those transitions inconsistently. Every row therefore
@@ -405,9 +516,14 @@ only path that measures them at the rate they actually run.
 - **Multiple symbols.** Every risk limit, the circuit breaker, and the state file are
   single-symbol. Adding symbols multiplies exposure and needs per-symbol config and
   correlation handling; it should wait until the single-symbol version has a proven record.
-- **Session filter is off by default.** `SESSION_HOURS` is broker server time, which is
-  usually GMT+2/+3 and shifts with DST. `core.broker_gmt_offset()` reports it (shown by
-  `run.py check` and at startup); do not enable the filter without setting hours from that.
+- **Session filter is off by default** — but it is now *correctly* off rather than
+  unusable. `SESSION_UTC_HOURS` is written in UTC and `strategy.server_hours_for()`
+  converts it with `core.broker_gmt_offset()` at decision time, so the window no longer
+  shifts when the broker moves or DST rolls. It used to be `SESSION_HOURS = range(9, 22)`
+  in raw broker time, which on the GMT+3 broker in `data/` meant UTC 6–18: most of it the
+  Asian session where gold barely moves, and it cut off the end of New York. Turn it on
+  only after `run.py sweep` (the session scan at the bottom) and `walkforward` say the
+  restriction beats not restricting — a window that wins by leaving ten trades has not won.
 
 ## Conventions
 

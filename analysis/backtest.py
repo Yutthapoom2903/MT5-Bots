@@ -45,6 +45,13 @@ DEFAULTS = {
     "spread_points": 30.0,
     "point": 0.01,
 
+    # เวลาบนแท่งจาก MT5 เป็นเวลาเซิร์ฟเวอร์ broker ส่วน strategy.SESSION_UTC_HOURS
+    # เขียนเป็น UTC ตัวเลขนี้คือตัวเชื่อมสองอันนั้น ผู้เรียกที่ต่อ MT5 อยู่ส่ง
+    # core.broker_gmt_offset() เข้ามา ส่วน simulate() ยังเป็นฟังก์ชันบริสุทธิ์เหมือนเดิม
+    # ค่าเริ่มต้น 3 คือค่าที่พบจริงในข้อมูลที่เก็บมา และมีผลก็ต่อเมื่อเปิด USE_SESSION_FILTER
+    "gmt_offset": 3,
+    "fvg_lookback": core.FVG_LOOKBACK,
+
     "use_filters": True,
 }
 
@@ -117,6 +124,9 @@ def prepare(m15, h1, m5, config):
         m15["m5_trend"] = _align(m5, m15["time"], pd.Timedelta(minutes=10))
     else:
         m15["m5_trend"] = "UNKNOWN"
+
+    # FVG คำนวณจาก OHLC ล้วน จึงจำลองย้อนหลังได้จริง ต่างจากข่าวกับ DXY
+    m15["fvg"] = core.fvg_series(m15, config["fvg_lookback"])
 
     m15["signal"] = signal_series(m15)
     return m15
@@ -202,6 +212,12 @@ def simulate(m15=None, h1=None, m5=None, config=None, prepared=None):
 
     เข้าไม้ที่ราคาเปิดของแท่งถัดไป ซึ่งตรงกับพฤติกรรมจริง: บอทเห็นแท่งปิดแล้วยิงคำสั่ง
     ส่ง prepared เข้ามาได้ถ้าคำนวณ indicator ไว้แล้ว ใช้ตอนกวาดค่าเพื่อไม่คำนวณซ้ำ
+
+    FVG จำลองได้เต็มที่ (คำนวณจาก OHLC ล้วน) sweep กับ walk_forward จึงตัดสินมันได้
+    สองตัวกรองที่จำลองไม่ได้และจงใจปล่อยผ่านตรงนี้:
+        ข่าว — ฟีดที่ใช้มีแค่ข้อมูลสัปดาห์ปัจจุบัน ย้อนหลังไปประกอบหน้าต่างข่าวไม่ได้
+        DXY  — ไม่ได้ดึงราคาดัชนีดอลลาร์ย้อนหลังมาด้วย
+    ผลที่ออกมาจึงเป็นของกลยุทธ์ "ก่อนหักสองตัวนี้" ไม่ใช่ของบอทตัวเต็ม
     """
     config = {**DEFAULTS, **(config or {})}
     bars = prepared if prepared is not None else prepare(m15.copy(), h1, m5, config)
@@ -216,6 +232,7 @@ def simulate(m15=None, h1=None, m5=None, config=None, prepared=None):
     signals = bars["signal"].to_numpy()
     h1_trend = bars["h1_trend"].to_numpy()
     m5_trend = bars["m5_trend"].to_numpy()
+    fvg = bars["fvg"].to_numpy()
     times = bars["time"].to_numpy()
     hours = bars["time"].dt.hour.to_numpy()
 
@@ -237,10 +254,12 @@ def simulate(m15=None, h1=None, m5=None, config=None, prepared=None):
                 "m15_signal": signal,
                 "h1_trend": h1_trend[index],
                 "m5_trend": m5_trend[index],
+                "fvg_state": fvg[index],
                 "adx": series["adx"][index],
                 "rsi": series["rsi"][index],
                 "spread_points": config["spread_points"],
                 "server_hour": int(hours[index]),
+                "gmt_offset": config["gmt_offset"],
                 "fast_ma": config["fast_ma"],
                 "slow_ma": config["slow_ma"],
             })
@@ -395,6 +414,120 @@ def compare(m15, h1, m5, config=None):
     return with_filters, without
 
 
+# ตัวกรองที่สลับเปิด/ปิดแล้ววัดได้จริงในการจำลอง เรียงตามลำดับที่มันทำงานใน strategy.py
+# ข่าวกับ DXY ไม่อยู่ในนี้เพราะจำลองย้อนหลังไม่ได้ (ดู docstring ของ simulate())
+# ช่วงเวลามี session_scan() ของตัวเองเพราะคำถามคือ "หน้าต่างไหน" ไม่ใช่ "เปิดหรือปิด"
+SCANNABLE_FILTERS = (
+    ("USE_H1_TREND_FILTER", "เทรนด์ H1"),
+    ("USE_ADX_FILTER", "ADX"),
+    ("USE_RSI_FILTER", "RSI"),
+    ("USE_M5_CONFIRM", "M5 ยืนยัน"),
+    ("USE_FVG_FILTER", "FVG"),
+)
+
+
+def filter_scan(m15=None, h1=None, m5=None, base=None, filters=None, prepared=None):
+    """
+    สลับตัวกรองทีละตัวแล้ววัดว่ามันเปลี่ยนผลไปเท่าไหร่
+
+    นี่คือเหตุผลที่สวิตช์ทุกตัวแยกจากกัน: ตัวที่เปิดอยู่จะถูกปิดเพื่อดูว่ามัน *ให้* อะไร
+    ตัวที่ปิดอยู่จะถูกเปิดเพื่อดูว่าการเพิ่มมันเข้ามา *จะ* ให้อะไร คำถามสองข้อนี้คือ
+    คำถามเดียวกันมองจากคนละด้าน และทั้งคู่ตอบได้ก็ต่อเมื่อเทียบกับค่าตั้งต้นชุดเดียวกัน
+
+    คืนแถวแรกเป็นค่าตั้งต้น (สวิตช์ตามที่ตั้งไว้ตอนนี้) แถวที่เหลือคือผลของการสลับทีละตัว
+    """
+    filters = SCANNABLE_FILTERS if filters is None else filters
+    base = {**DEFAULTS, **(base or {}), "use_filters": True}
+
+    if prepared is None:
+        prepared = prepare(m15.copy(), h1, m5, base)
+
+    # คืนค่าที่เคยเป็นทุกตัว ไม่ใช่ค่าที่เขียนตายไว้ — บทเรียนเดียวกับ SwitchedTo
+    original = {name: getattr(strategy, name) for name, _ in filters}
+    rows = []
+
+    try:
+        baseline = metrics(simulate(config=base, prepared=prepared))
+        rows.append({"label": "ค่าตั้งต้นตอนนี้", "action": "", **_scan_stats(baseline)})
+
+        for name, label in filters:
+            was = original[name]
+            setattr(strategy, name, not was)
+
+            try:
+                stats = metrics(simulate(config=base, prepared=prepared))
+            finally:
+                setattr(strategy, name, was)
+
+            rows.append({
+                "label": label,
+                "action": "ปิด" if was else "เพิ่ม",
+                **_scan_stats(stats),
+                "delta_r": stats.get("expectancy_r", 0.0) - baseline.get("expectancy_r", 0.0),
+            })
+    finally:
+        for name, value in original.items():
+            setattr(strategy, name, value)
+
+    return rows
+
+
+def _scan_stats(stats):
+    return {
+        "trades": stats.get("trades", 0),
+        "expectancy_r": stats.get("expectancy_r", 0.0),
+        "total_r": stats.get("total_r", 0.0),
+        "win_rate": stats.get("win_rate", 0.0),
+    }
+
+
+def format_filter_scan(rows, min_trades=None):
+    """ตารางผลของการสลับตัวกรองทีละตัว พร้อมบอกว่าแถวไหนยังสรุปไม่ได้"""
+    if not rows:
+        return "ไม่มีผลลัพธ์"
+
+    min_trades = MIN_TEST_TRADES if min_trades is None else min_trades
+
+    lines = [
+        "--- ตัวกรองแต่ละตัวให้อะไรบ้าง (สลับทีละตัว) ---",
+        f"{pad('ตัวกรอง', 16)} {pad('ทำอะไร', 7)} {pad('ไม้', 5, '>')} "
+        f"{pad('ชนะ%', 7, '>')} {pad('ต่อไม้', 9, '>')} {pad('ต่างจากเดิม', 12, '>')}",
+    ]
+
+    baseline = rows[0]
+    lines.append(
+        f"{pad(baseline['label'], 16)} {pad('', 7)} {baseline['trades']:>5} "
+        f"{baseline['win_rate']:>6.1f}% {baseline['expectancy_r']:>+9.3f} {pad('—', 12, '>')}"
+    )
+
+    for row in rows[1:]:
+        thin = "  (ไม้น้อยเกินจะสรุป)" if row["trades"] < min_trades else ""
+        lines.append(
+            f"{pad(row['label'], 16)} {pad(row['action'], 7)} {row['trades']:>5} "
+            f"{row['win_rate']:>6.1f}% {row['expectancy_r']:>+9.3f} "
+            f"{row['delta_r']:>+12.3f}{thin}"
+        )
+
+    lines.append("")
+    lines.append("'ต่างจากเดิม' คือผลของการสลับตัวนั้น บวกแปลว่าการสลับดีกว่าค่าที่ตั้งไว้ตอนนี้")
+
+    solid = [row for row in rows[1:] if row["trades"] >= min_trades]
+    helpful = [row for row in solid if row["delta_r"] > 0]
+
+    if not solid:
+        lines.append("ทุกแถวไม้น้อยเกินจะเทียบ — ขยายช่วงข้อมูลด้วย --months")
+    elif not helpful:
+        lines.append("ไม่มีการสลับไหนดีกว่าค่าที่ตั้งไว้ตอนนี้ — ปล่อยสวิตช์ไว้อย่างเดิม")
+    else:
+        for row in sorted(helpful, key=lambda item: item["delta_r"], reverse=True):
+            lines.append(
+                f"  {row['action']} {row['label']} ดีขึ้น {row['delta_r']:+.3f}R ต่อไม้"
+            )
+        lines.append("ข้อมูลชุดเดียวยังไม่ใช่ข้อสรุป — ยืนยันด้วย walkforward ก่อนสลับจริง")
+
+    return "\n".join(lines)
+
+
 # ---------- กวาดหาค่าพารามิเตอร์ ----------
 
 DEFAULT_GRID = {
@@ -454,6 +587,117 @@ def sweep(m15=None, h1=None, m5=None, base=None, grid=None, progress=None, prepa
         strategy.ADX_MIN = original_adx
 
     return sorted(rows, key=lambda row: row["expectancy_r"], reverse=True)
+
+
+# ช่วงเวลาที่เอามาเทียบกัน เขียนเป็น UTC เหมือน strategy.SESSION_UTC_HOURS
+# ไม่ยัดรวมใน DEFAULT_GRID เพราะมันจะคูณจำนวนชุดค่าทั้งกริด ทั้งที่คำถามคือ
+# "จำกัดชั่วโมงแล้วดีขึ้นไหม" ซึ่งวัดทีละตัวได้ตรงกว่า ตามที่ทำกับตัวกรองอื่น
+SESSION_WINDOWS = (
+    ("ไม่จำกัดชั่วโมง", None),
+    ("London/NY ซ้อนกัน", range(13, 17)),
+    ("New York ทั้งช่วง", range(12, 21)),
+    ("ค่าที่ตั้งไว้ตอนนี้", range(13, 21)),
+    ("London + New York", range(7, 21)),
+    ("London อย่างเดียว", range(8, 17)),
+)
+
+
+def session_scan(m15=None, h1=None, m5=None, base=None, windows=None, prepared=None):
+    """
+    เทียบผลของแต่ละหน้าต่างเวลากับผลตอนไม่จำกัดชั่วโมงเลย
+
+    คำถามที่ตอบคือ "การตัดชั่วโมงทิ้งช่วยหรือแค่ทำให้ไม้น้อยลง" ไม่ใช่ "ชั่วโมงไหนดีที่สุด"
+    หน้าต่างที่ชนะเพราะเหลือไม้สิบไม้ไม่ได้ชนะ มันแค่สุ่มน้อยลง MIN_TEST_TRADES
+    จึงติดป้ายให้เอง แทนที่จะปล่อยให้ตัวเลขบนสุดของตารางดูน่าเชื่อ
+
+    ต้องรู้ gmt_offset ของ broker ถึงจะเทียบได้ ใส่มาทาง base["gmt_offset"]
+    """
+    windows = SESSION_WINDOWS if windows is None else windows
+    base = {**DEFAULTS, **(base or {})}
+
+    if prepared is None:
+        prepared = prepare(m15.copy(), h1, m5, base)
+
+    # คืนค่าที่ *เคยเป็น* ไม่ใช่ค่า default ที่เขียนตายไว้ — สวิตช์ที่ถูกปิดไว้ชั่วคราว
+    # แล้วโดนเขียนทับด้วย True ตอนจบ คือบั๊กที่หาไม่เจอจนกว่าเทสตัวถัดไปจะพัง
+    original_switch = strategy.USE_SESSION_FILTER
+    original_hours = strategy.SESSION_UTC_HOURS
+    rows = []
+
+    try:
+        for label, window in windows:
+            strategy.USE_SESSION_FILTER = window is not None
+
+            if window is not None:
+                strategy.SESSION_UTC_HOURS = window
+
+            stats = metrics(simulate(config=base, prepared=prepared))
+            rows.append({
+                "label": label,
+                "hours": "ทั้งวัน" if window is None
+                         else f"{window.start:02d}-{window.stop - 1:02d} UTC",
+                "trades": stats.get("trades", 0),
+                "expectancy_r": stats.get("expectancy_r", 0.0),
+                "total_r": stats.get("total_r", 0.0),
+                "win_rate": stats.get("win_rate", 0.0),
+            })
+    finally:
+        strategy.USE_SESSION_FILTER = original_switch
+        strategy.SESSION_UTC_HOURS = original_hours
+
+    return rows
+
+
+def format_session_scan(rows, offset=None):
+    """ตารางเทียบหน้าต่างเวลา พร้อมบอกว่าอันไหนยังสรุปไม่ได้"""
+    if not rows:
+        return "ไม่มีผลลัพธ์"
+
+    lines = ["--- จำกัดชั่วโมงเทรดแล้วดีขึ้นไหม ---"]
+
+    if offset is not None:
+        lines.append(f"broker อยู่ GMT{offset:+d} — ชั่วโมง UTC ข้างล่างถูกแปลงให้ตอนใช้งานจริง")
+
+    lines.append(
+        f"{pad('หน้าต่าง', 20)} {pad('ชั่วโมง', 10)} {pad('ไม้', 5, '>')} "
+        f"{pad('ชนะ%', 7, '>')} {pad('ต่อไม้', 9, '>')} {pad('รวม', 9, '>')}"
+    )
+
+    baseline = next((row for row in rows if row["hours"] == "ทั้งวัน"), None)
+
+    for row in rows:
+        thin = "  (ไม้น้อยเกินจะสรุป)" if row["trades"] < MIN_TEST_TRADES else ""
+        lines.append(
+            f"{pad(row['label'], 20)} {pad(row['hours'], 10)} {row['trades']:>5} "
+            f"{row['win_rate']:>6.1f}% {row['expectancy_r']:>+9.3f} "
+            f"{row['total_r']:>+9.2f}{thin}"
+        )
+
+    lines.append("")
+
+    if baseline is None:
+        return "\n".join(lines)
+
+    solid = [row for row in rows
+             if row["hours"] != "ทั้งวัน" and row["trades"] >= MIN_TEST_TRADES]
+    better = [row for row in solid if row["expectancy_r"] > baseline["expectancy_r"]]
+
+    if not solid:
+        lines.append("ทุกหน้าต่างเหลือไม้น้อยเกินจะเทียบ — เก็บข้อมูลเพิ่มก่อน")
+    elif not better:
+        lines.append("ไม่มีหน้าต่างไหนดีกว่าการไม่จำกัดชั่วโมงเลย ปล่อย USE_SESSION_FILTER "
+                     "ไว้ที่ False ต่อไป")
+    else:
+        best = max(better, key=lambda row: row["expectancy_r"])
+        lines.append(
+            f"ดีที่สุดคือ {best['label']} ({best['hours']}) "
+            f"{best['expectancy_r']:+.3f}R ต่อไม้ เทียบกับ {baseline['expectancy_r']:+.3f}R "
+            f"ตอนไม่จำกัด"
+        )
+        lines.append("ตัวเลขนี้มาจากข้อมูลชุดเดียว ยังไม่ใช่ข้อสรุป — "
+                     "ยืนยันด้วย walk_forward ก่อนเปิดใช้จริง")
+
+    return "\n".join(lines)
 
 
 def format_sweep(rows, top=15):

@@ -365,7 +365,7 @@ def broker_gmt_offset(symbol):
     """
     ส่วนต่างเวลาเซิร์ฟเวอร์ broker กับ UTC เป็นชั่วโมง
 
-    จำเป็นสำหรับตั้ง SESSION_HOURS ให้ถูก เพราะเวลาในแท่งราคาเป็นเวลาเซิร์ฟเวอร์
+    จำเป็นสำหรับ strategy.server_hours_for() เพราะเวลาในแท่งราคาเป็นเวลาเซิร์ฟเวอร์
     ไม่ใช่เวลาไทยและไม่ใช่ UTC  broker ส่วนใหญ่อยู่ GMT+2/+3 และขยับตาม DST ด้วย
     คืน None ถ้าดึงราคาไม่ได้
     """
@@ -513,6 +513,167 @@ def calculate_adx(df, period=14):
     dx = 100 * (plus_di - minus_di).abs() / di_sum
 
     return dx.ewm(alpha=alpha, adjust=False).mean()
+
+
+# ---------- ตัวชี้วัดเสริม บันทึกอย่างเดียว ยังไม่ผูกกับการตัดสินใจ ----------
+#
+# ทุกตัวในกลุ่มนี้ไม่มีสวิตช์ใน strategy.py โดยตั้งใจ  indicator เพิ่มง่ายมาก
+# ส่วนที่หายากคือหลักฐานว่ามันแยกอะไรได้ ของพวกนี้จึงลงไปอยู่ใน CSV ก่อน
+# ให้ analysis/outcomes.py วัดด้วยแท่ง 2,800 แท่งต่อเดือน แล้วค่อยตัดสินว่า
+# ตัวไหนคู่ควรกับการเป็นตัวกรอง — ไม่ใช่เพิ่มเข้าไปในเส้นทางตัดสินใจแล้วหวังว่าจะดี
+#
+# ทุกตัวไม่มีหน่วย (เป็นอัตราส่วนหรือเปอร์เซ็นไทล์) วันที่ ATR 13 กับวันที่ ATR 6
+# จึงเทียบกันได้ ด้วยเหตุผลเดียวกับที่ backtest กับ outcomes รายงานเป็น R
+
+VOLATILITY_WINDOW = 96   # แท่ง M15 = 24 ชั่วโมง
+
+
+def _closed_value(df, column):
+    """ค่าคอลัมน์หนึ่งบนแท่งที่ปิดล่าสุด — None ถ้าไม่มีหรือเป็น NaN"""
+    if df is None or len(df) < abs(CLOSED) or column not in df:
+        return None
+
+    value = df.iloc[CLOSED][column]
+    return None if pd.isna(value) else float(value)
+
+
+def atr_percentile(df, window=VOLATILITY_WINDOW):
+    """ATR ตอนนี้อยู่เปอร์เซ็นไทล์ที่เท่าไหร่ของตัวเองใน window ที่ผ่านมา (0-100)
+
+    ATR ดิบบอกว่าตลาดกว้างแค่ไหน แต่ไม่บอกว่ากว้าง *ผิดปกติ* ไหม  วันที่เงียบทั้งวัน
+    กับวันที่กำลังจะระเบิดมี ATR เท่ากันได้ ตัวนี้แยกสองอย่างนั้นออกจากกัน
+    """
+    if df is None or "atr" not in df or len(df) < abs(CLOSED):
+        return None
+
+    history = df["atr"].iloc[:FORMING].dropna()
+
+    if len(history) < 2:
+        return None
+
+    current = history.iloc[-1]
+    recent = history.iloc[-window:]
+
+    return round(float((recent <= current).mean()) * 100, 1)
+
+
+def ma_distance_atr(df):
+    """ราคาห่างจาก ma_slow กี่เท่าของ ATR — บวกคืออยู่เหนือ
+
+    วัดการยืดของราคาแบบไม่มีหน่วย ต่างจาก RSI ที่ค่า 70 ในเทรนด์แรงแทบไม่ได้บอกอะไร
+    """
+    close = _closed_value(df, "close")
+    slow = _closed_value(df, "ma_slow")
+    atr = _closed_value(df, "atr")
+
+    if close is None or slow is None or not atr:
+        return None
+
+    return round((close - slow) / atr, 2)
+
+
+def volume_ratio(df, window=VOLATILITY_WINDOW):
+    """tick_volume ของแท่งที่ปิดล่าสุด เทียบกับค่าเฉลี่ยของตัวเอง — 1.0 คือปกติ
+
+    ทองสปอตไม่มีวอลุ่มจริงจากโบรก มีแต่จำนวน tick ซึ่งเป็นตัวแทนของ "คนสนใจแค่ไหน"
+    ไม่ใช่ "มีเงินเข้าเท่าไหร่" — ใช้เทียบกับตัวเองได้ แต่อย่าตีความเป็นวอลุ่มสถาบัน
+    """
+    if df is None or "tick_volume" not in df or len(df) < abs(CLOSED):
+        return None
+
+    history = df["tick_volume"].iloc[:FORMING].dropna()
+
+    if len(history) < 2:
+        return None
+
+    average = history.iloc[-window:].mean()
+
+    if not average:
+        return None
+
+    return round(float(history.iloc[-1] / average), 2)
+
+
+def body_ratio(df):
+    """ตัวแท่งกินกี่ส่วนของช่วงทั้งแท่ง — 1.0 คือแท่งเต็มไม่มีไส้ 0.0 คือ doji
+
+    แท่งที่ปิดใกล้ปลายทางบอกว่าฝั่งนั้นคุมได้จริง ส่วนแท่งไส้ยาวคือฝั่งนั้นโดนตีกลับ
+    """
+    high = _closed_value(df, "high")
+    low = _closed_value(df, "low")
+    open_ = _closed_value(df, "open")
+    close = _closed_value(df, "close")
+
+    if None in (high, low, open_, close) or high == low:
+        return None
+
+    return round(abs(close - open_) / (high - low), 2)
+
+
+# ---------- Fair Value Gap ----------
+
+# กี่แท่งที่ยังนับว่าช่องนั้น "สด" อยู่ — 20 แท่ง M15 = 5 ชั่วโมง
+# ไม่มีตัวเลขมาตรฐานสำหรับเรื่องนี้ เป็นค่าที่ตั้งขึ้นแล้วให้ข้อมูลเป็นคนตัดสิน
+FVG_LOOKBACK = 20
+
+
+def fvg_series(frame, lookback=FVG_LOOKBACK):
+    """
+    ทิศของ Fair Value Gap ที่ยังไม่ถูกเติม ณ แต่ละแท่ง — BULL / BEAR / NONE
+
+    FVG คือช่องว่างจากสามแท่ง: แท่งกลางวิ่งแรงจนแท่งแรกกับแท่งที่สามไม่ทับกันเลย
+        ขาขึ้น  low[i] > high[i-2]   ช่องอยู่ระหว่าง high[i-2] ถึง low[i]
+        ขาลง    high[i] < low[i-2]   ช่องอยู่ระหว่าง high[i] ถึง low[i-2]
+
+    ช่องตายเมื่อราคากลับมาเติมจนเต็ม หรือเมื่อเก่าเกิน lookback แท่ง
+    "เต็ม" ใช้แบบเข้มคือราคาต้องทะลุผ่านทั้งช่อง ไม่ใช่แค่แตะขอบ — เกณฑ์แตะขอบ
+    ทำให้ช่องตายเกือบทันทีจนวัดอะไรไม่ได้ ทั้งสองเกณฑ์เป็นเรื่องนิยาม ไม่ใช่ข้อเท็จจริง
+
+    เดินรอบเดียว O(n) ไม่ใช่สแกนย้อนหลังทุกแท่ง ด้วยเหตุผลเดียวกับ signal_series()
+    ในฝั่ง backtest: การหั่น frame ทีละแท่งทำให้ลูปกลายเป็น O(n²)
+    """
+    if frame is None or len(frame) < 3:
+        return pd.Series(["NONE"] * (0 if frame is None else len(frame)),
+                         index=None if frame is None else frame.index, dtype=object)
+
+    high = frame["high"].to_numpy(dtype=float)
+    low = frame["low"].to_numpy(dtype=float)
+    states = ["NONE"] * len(frame)
+
+    bull = None      # (ขอบล่าง, ขอบบน, แท่งที่เกิด)
+    bear = None
+
+    for index in range(len(frame)):
+        # ตรวจว่าช่องที่ค้างอยู่ตายหรือยัง ก่อนจะมองหาช่องใหม่ของแท่งนี้
+        if bull is not None and (low[index] <= bull[0] or index - bull[2] > lookback):
+            bull = None
+        if bear is not None and (high[index] >= bear[1] or index - bear[2] > lookback):
+            bear = None
+
+        if index >= 2:
+            if low[index] > high[index - 2]:
+                bull = (high[index - 2], low[index], index)
+            elif high[index] < low[index - 2]:
+                bear = (high[index], low[index - 2], index)
+
+        # ทั้งสองฝั่งค้างพร้อมกันได้ ให้ช่องที่เกิดทีหลังเป็นตัวแทน
+        if bull is not None and (bear is None or bull[2] >= bear[2]):
+            states[index] = "BULL"
+        elif bear is not None:
+            states[index] = "BEAR"
+
+    return pd.Series(states, index=frame.index, dtype=object)
+
+
+def fvg_state(df, lookback=FVG_LOOKBACK):
+    """FVG ที่ยังค้างอยู่ ณ แท่งที่ปิดล่าสุด — ตัดแท่งที่กำลังก่อตัวทิ้งก่อนเสมอ
+
+    แท่ง FORMING ทำให้ช่องเกิดแล้วหายกลางแท่ง ซึ่งเป็นบั๊กเดียวกับที่ CLOSED มีไว้กัน
+    """
+    if df is None or len(df) < abs(PREVIOUS) + 1:
+        return "NONE"
+
+    return fvg_series(df.iloc[:FORMING], lookback).iloc[-1]
 
 
 def ma_trend(df):

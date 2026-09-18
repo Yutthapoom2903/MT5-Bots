@@ -652,6 +652,17 @@ class Notifier:
             f"{escape(symbol)} — ลูปทำงานต่อตามปกติ",
         ], key="connection")
 
+    def algo_trading_disabled(self, symbol):
+        self.send("lifecycle", "Algo Trading ปิดอยู่ที่ terminal", [
+            f"{escape(symbol)} — เข้าไม้/ขยับ SL ทุกอย่างจะโดนตีกลับ (retcode 10027)",
+            "ไปกดปุ่ม Algo Trading ที่แถบเครื่องมือของ MT5 ให้เป็นสีเขียว — บอทเปิดแทนไม่ได้",
+        ], key="algo-trading")
+
+    def algo_trading_enabled_again(self, symbol):
+        self.send("lifecycle", "Algo Trading เปิดแล้ว", [
+            f"{escape(symbol)} — กลับไปส่งคำสั่งได้ตามปกติ",
+        ], key="algo-trading", loud=True)
+
     # ---------- ตลาด ----------
 
     def market_closed(self, symbol, sleep_seconds):

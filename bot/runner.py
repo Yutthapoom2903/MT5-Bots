@@ -528,6 +528,19 @@ def connection_is_alive():
     return mt5.terminal_info() is not None
 
 
+def algo_trading_enabled():
+    """
+    ปุ่ม Algo Trading บนหน้าต่าง terminal — ปิดอยู่แล้ว order/modify ทุกชนิดโดน
+    broker ตีกลับด้วย retcode 10027 เงียบๆ จนกว่าจะไปดู log
+
+    MetaTrader5 API ไม่มีทางเปิดปุ่มนี้แทนคนได้ — ตั้งใจให้เป็นแบบนั้น กันไม่ให้
+    สคริปต์ใดๆ เปิดเทรดอัตโนมัติเองได้โดยไม่มีคนกดยืนยันที่เครื่อง จึงทำได้แค่ตรวจ
+    แล้วแจ้งเตือนให้ไปกดเอง
+    """
+    info = mt5.terminal_info()
+    return info is not None and info.trade_allowed
+
+
 def reconnect(logger):
     """พยายามเชื่อมต่อใหม่ — บอทที่รันทิ้งไว้ต้องรอดจากการปิด/เปิด terminal"""
     logger.warning("ขาดการเชื่อมต่อ MT5 กำลังเชื่อมใหม่")
@@ -1056,6 +1069,7 @@ def run(trade_enabled=False):
 
     halted_reason = None
     market_was_closed = False
+    algo_trading_was_off = False
 
     while True:
         if not connection_is_alive():
@@ -1088,6 +1102,17 @@ def run(trade_enabled=False):
         if market_was_closed:
             market_was_closed = False
             NOTIFIER.market_reopened(SYMBOL)
+
+        # เช็กเฉพาะตอนตั้งใจส่งคำสั่งจริง โหมดเฝ้าดูเฉยๆ ไม่ยิงออเดอร์อยู่แล้วไม่ต้องสน
+        if trade_enabled:
+            if not algo_trading_enabled():
+                if not algo_trading_was_off:
+                    logger.warning("Algo Trading ปิดอยู่ที่ terminal — order/modify ทุกอย่างจะโดนตีกลับ")
+                    NOTIFIER.algo_trading_disabled(SYMBOL)
+                    algo_trading_was_off = True
+            elif algo_trading_was_off:
+                algo_trading_was_off = False
+                NOTIFIER.algo_trading_enabled_again(SYMBOL)
 
         context, candle = build_context()
 

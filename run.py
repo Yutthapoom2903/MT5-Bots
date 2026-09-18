@@ -282,6 +282,8 @@ def _sample_notifications(sender, strategy):
     )
     sender.connection_lost(symbol)
     sender.reconnected(symbol)
+    sender.algo_trading_disabled(symbol)
+    sender.algo_trading_enabled_again(symbol)
     sender.market_closed(symbol, 300)
     sender.market_reopened(symbol)
     sender.candle_verdict(decision, context, symbol, adx_min=strategy.ADX_MIN, watch_mode=True,
@@ -311,6 +313,7 @@ def _sample_notifications(sender, strategy):
     sender.partial_taken(symbol, 987654, 0.05, 0.10, 1.0)
     sender.partial_too_small(symbol, 987654, 0.01, 1.0)
     sender.closed_on_reverse(symbol, 987654, "BUY")
+    sender.closed_on_reverse(symbol, 555111, "SELL", manual=True)
     sender.position_closed(symbol, 987654, meta, 38.20, "USD", 4363.40)
     sender.entry_over_budget(symbol, "SELL", 19.10, 10.00, "USD", 1910)
     sender.halted(symbol, "แพ้ติดกัน 3 ไม้ หยุดพักถึงพรุ่งนี้", summary)

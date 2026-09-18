@@ -316,9 +316,15 @@ def build_levels(info, tick, action, atr):
     return entry, entry + sl_distance, entry - tp_distance, sl_distance
 
 
-def handle_existing_positions(signal, logger):
-    """คืน True ถ้าเปิดไม้ใหม่ต่อได้ — ทางเดียวกันข้าม สวนทางปิดก่อน"""
-    positions = trade.open_positions(SYMBOL, MAGIC)
+def handle_existing_positions(signal, state, logger):
+    """
+    คืน True ถ้าเปิดไม้ใหม่ต่อได้ — ทางเดียวกันข้าม สวนทางปิดก่อน
+
+    เมื่อ ADOPT_MANUAL_POSITIONS เปิดอยู่ ไม้ที่เปิดเองจากหน้าจอนับรวมด้วย — สัญญาณ
+    กลับทางจะปิดไม้เปิดเองที่สวนทางเหมือนไม้ของบอทเองทุกอย่าง (ผู้ใช้ขอไว้เอง)
+    """
+    positions = (trade.open_positions_all(SYMBOL) if ADOPT_MANUAL_POSITIONS
+                 else trade.open_positions(SYMBOL, MAGIC))
 
     if not positions:
         return True
@@ -335,14 +341,19 @@ def handle_existing_positions(signal, logger):
         return False
 
     for position in positions:
-        logger.info("สัญญาณกลับทาง — ปิด ticket %s ก่อน", position.ticket)
+        manual = state.get("position_meta", {}).get(str(position.ticket), {}).get("source") == "manual"
+        logger.info(core.paint(
+            "สัญญาณกลับทาง — ปิด ticket %s%s ก่อน" % (
+                position.ticket, " (ไม้เปิดเอง)" if manual else "",
+            ), core.YELLOW,
+        ))
         result = trade.close_position(position, DEVIATION, logger)
 
         if result is None or result.retcode != trade.RETCODE_DONE:
             logger.error("ปิดไม้เดิมไม่สำเร็จ ยกเลิกการเปิดไม้ใหม่รอบนี้")
             return False
 
-        NOTIFIER.closed_on_reverse(SYMBOL, position.ticket, signal)
+        NOTIFIER.closed_on_reverse(SYMBOL, position.ticket, signal, manual=manual)
 
     return True
 
@@ -418,7 +429,7 @@ def execute(decision, state, logger):
         logger.warning("%s ปิดการเทรดอยู่ (trade_mode %s)", SYMBOL, info.trade_mode)
         return
 
-    if not handle_existing_positions(signal, logger):
+    if not handle_existing_positions(signal, state, logger):
         return
 
     entry, sl, tp, sl_distance = build_levels(info, tick, signal, context["atr"])

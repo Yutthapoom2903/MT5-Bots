@@ -786,10 +786,13 @@ class Notifier:
 
     # ---------- ปิดไม้ ----------
 
-    def closed_on_reverse(self, symbol, ticket, new_signal):
-        self.send("exit", "ปิดไม้เพราะสัญญาณกลับทาง", [
-            f"สัญญาณใหม่เป็น <b>{direction(new_signal)}</b> จึงปิดไม้เดิมก่อนเปิดใหม่",
-        ], footer=f"{symbol} · ticket {ticket}")
+    def closed_on_reverse(self, symbol, ticket, new_signal, manual=False):
+        lines = [f"สัญญาณใหม่เป็น <b>{direction(new_signal)}</b> จึงปิดไม้เดิมก่อนเปิดใหม่"]
+
+        if manual:
+            lines.append("ไม้นี้เป็นไม้ที่เปิดเองจากหน้าจอ ไม่ใช่ไม้ของบอท")
+
+        self.send("exit", "ปิดไม้เพราะสัญญาณกลับทาง", lines, footer=f"{symbol} · ticket {ticket}")
 
     def position_closed(self, symbol, ticket, meta, profit, currency, price=None):
         """ไม้ปิดเอง (โดน SL/TP หรือปิดจาก terminal) — เหตุการณ์ที่ต้องรู้ที่สุด"""

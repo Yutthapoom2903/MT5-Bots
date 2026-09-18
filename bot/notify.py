@@ -742,6 +742,21 @@ class Notifier:
 
     # ---------- ดูแลไม้ ----------
 
+    def manual_position_adopted(self, symbol, ticket, signal, volume, entry, sl, tp):
+        distance = abs(entry - sl)
+        reward = abs(tp - entry)
+        ratio = reward / distance if distance else 0
+
+        self.send("manage", f"เจอไม้เปิดเอง · {signal}", [
+            f"<b>{direction(signal)} {volume} lot</b>",
+            "เปิดจากหน้าจอ ไม่ผ่านบอท — ใส่ SL/TP ให้แล้ว และจะดูแลต่อเหมือนไม้ของบอท",
+            "",
+            f"<code>เข้าที่  {entry:10,.2f}</code>",
+            f"<code>SL      {sl:10,.2f}  (ห่าง {distance:,.2f})</code>",
+            f"<code>TP      {tp:10,.2f}  (ห่าง {reward:,.2f})</code>",
+            f"<code>R:R     {ratio:10,.1f}</code>",
+        ], key=f"adopt-{ticket}", footer=f"{symbol} · ticket {ticket}")
+
     def stop_moved(self, symbol, ticket, old_sl, new_sl, entry, price, reason,
                    tp=None, risk=None, signal=None):
         moved = abs(new_sl - old_sl) if old_sl else None

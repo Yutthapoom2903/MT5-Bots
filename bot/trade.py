@@ -171,6 +171,16 @@ def open_positions(symbol, magic):
     return [position for position in positions if position.magic == magic]
 
 
+def open_positions_all(symbol):
+    """ทุก position ของ Symbol นี้ ไม่กรอง magic — รวมไม้ที่เปิดเองจากหน้าจอด้วย"""
+    positions = mt5.positions_get(symbol=symbol)
+
+    if positions is None:
+        return []
+
+    return list(positions)
+
+
 # ---------- ส่งคำสั่ง ----------
 
 def send_market_order(symbol, action, lots, sl, tp, magic, deviation, logger, attempts=3):

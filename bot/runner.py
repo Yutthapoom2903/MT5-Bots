@@ -71,6 +71,11 @@ USE_PARTIAL_TP = True         # เก็บกำไรบางส่วนแ
 PARTIAL_TP_AT_R = 1.0
 PARTIAL_TP_FRACTION = 0.5
 
+# ไม้ที่เปิดเองจากหน้าจอ (magic ไม่ตรงกับบอท) — เจอแล้วใส่ SL/TP ให้แบบเดียวกับ
+# ไม้ของบอท (ไม่ทับของเดิมถ้าตั้งไว้แล้ว) แล้วดูแลต่อ (เสมอทุน/trailing/แบ่งปิด)
+# เหมือนไม้ของบอททุกอย่าง ไม่รวมตัวตัดวงจรรายวันซึ่งยังนับเฉพาะไม้ที่บอทเปิดเอง
+ADOPT_MANUAL_POSITIONS = True
+
 # ---------- ตัวตัดวงจร หยุดเองเมื่อวันนี้ไม่เข้าทาง ----------
 MAX_DAILY_LOSS_PERCENT = 3.0  # ขาดทุนถึงกี่ % ของทุนต้นวันแล้วหยุดเทรดทั้งวัน
 MAX_TRADES_PER_DAY = 5
@@ -674,9 +679,66 @@ def report_closed_positions(live_tickets, state, logger):
     return pending
 
 
+def _adopt_foreign_position(position, atr, info, tick, account, state, logger):
+    """
+    เจอไม้ magic อื่น (เปิดเองจากหน้าจอ) ที่ยังไม่เคยเห็น — ใส่ SL/TP ที่ยังขาดให้
+    แบบเดียวกับที่บอทตั้งให้ไม้ของตัวเอง (ไม่ทับ SL/TP ที่ผู้ใช้ตั้งไว้แล้ว) แล้วจำ 1R
+    ไว้ให้ manage_positions ดูแลต่อจากรอบนี้เป็นต้นไป
+
+    ทำครั้งเดียวต่อ ticket — เข้าเงื่อนไขนี้เฉพาะตอนยังไม่มีใน position_meta
+    """
+    ticket = str(position.ticket)
+
+    if ticket in state.get("position_meta", {}):
+        return
+
+    minimum = trade.min_stop_distance(info, tick)
+    sl_distance = max(atr * SL_ATR_MULT, minimum)
+    tp_distance = max(atr * TP_ATR_MULT, minimum)
+    entry = position.price_open
+
+    if position.type == mt5.POSITION_TYPE_BUY:
+        sl = position.sl or (entry - sl_distance)
+        tp = position.tp or (entry + tp_distance)
+    else:
+        sl = position.sl or (entry + sl_distance)
+        tp = position.tp or (entry - tp_distance)
+
+    if sl != position.sl or tp != position.tp:
+        result = trade.modify_stops(position, sl, tp, logger)
+
+        if result is None or result.retcode != trade.RETCODE_DONE:
+            logger.warning("เติม SL/TP ให้ไม้เปิดเอง ticket %s ไม่สำเร็จ", position.ticket)
+            return
+
+        logger.info(core.paint(
+            "เจอไม้เปิดเอง ticket %s (%s) — ใส่ SL %.2f TP %.2f ให้" % (
+                position.ticket, _signal_of(position), sl, tp,
+            ), core.BOLD, VERDICT_STYLE.get(_signal_of(position), ""),
+        ))
+
+    risk = abs(entry - sl)
+    signal = _signal_of(position)
+    risk_money = trade.estimated_loss(info, position.volume, risk) if account else None
+
+    state.setdefault("position_risk", {})[ticket] = risk
+    state.setdefault("position_meta", {})[ticket] = {
+        "signal": signal,
+        "entry": round(entry, 2),
+        "volume": position.volume,
+        "risk_money": round(risk_money, 2) if risk_money is not None else None,
+        "currency": account.currency if account else "",
+        "opened_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "manual",
+    }
+
+    NOTIFIER.manual_position_adopted(SYMBOL, position.ticket, signal, position.volume, entry, sl, tp)
+
+
 def manage_positions(context, state, logger):
     """เรียกทุกรอบ ไม่ใช่แค่ตอนแท่งปิด — ราคาวิ่งระหว่างแท่งก็ต้องดูแล SL"""
-    positions = trade.open_positions(SYMBOL, MAGIC)
+    positions = (trade.open_positions_all(SYMBOL) if ADOPT_MANUAL_POSITIONS
+                 else trade.open_positions(SYMBOL, MAGIC))
 
     # ไม้ที่หายไปจากรายการแปลว่าปิดไปแล้ว — รายงานผลก่อน แล้วค่อยล้าง state ทิ้ง
     live_tickets = {str(position.ticket) for position in positions}
@@ -707,6 +769,13 @@ def manage_positions(context, state, logger):
 
     if info is None or tick is None:
         return
+
+    if ADOPT_MANUAL_POSITIONS:
+        account = mt5.account_info()
+
+        for position in positions:
+            if position.magic != MAGIC:
+                _adopt_foreign_position(position, context["atr"], info, tick, account, state, logger)
 
     minimum = trade.min_stop_distance(info, tick)
 
@@ -794,7 +863,8 @@ def heartbeat(state, account, logger, force=False):
 
     state["last_heartbeat"] = now.isoformat(timespec="seconds")
 
-    positions = trade.open_positions(SYMBOL, MAGIC)
+    positions = (trade.open_positions_all(SYMBOL) if ADOPT_MANUAL_POSITIONS
+                 else trade.open_positions(SYMBOL, MAGIC))
     summary = state.get("day_summary") or {}
 
     logger.info("ส่ง heartbeat: ถืออยู่ %d ไม้ equity %.2f", len(positions), account.equity)

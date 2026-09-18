@@ -305,6 +305,7 @@ def _sample_notifications(sender, strategy):
         )
     sender.entry_filled(symbol, "SELL", 0.01, 4401.62, 4420.73, 4363.40, "19.10", "USD", 987654)
     sender.entry_failed(symbol, "SELL", "retcode 10030: Unsupported filling mode")
+    sender.manual_position_adopted(symbol, 555111, "BUY", 0.02, 4398.10, 4379.40, 4436.50)
     sender.stop_moved(symbol, 987654, 4420.73, 4399.71, 4401.62, 4382.51, "เสมอทุนแล้ว",
                       tp=4363.40, risk=19.11, signal="SELL")
     sender.partial_taken(symbol, 987654, 0.05, 0.10, 1.0)

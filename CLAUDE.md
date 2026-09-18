@@ -53,7 +53,7 @@ analysis/               the offline side — reads what the bot wrote, never wri
     engine.py           scores the hand-labelled columns in data/market_training_data.csv
     report.py           offline digest of the CSVs and data/bot.log
 data/                   what the bot writes. CSVs are committed; log and state are not.
-tests/                  228 logic tests, no MT5 required
+tests/                  277 logic tests, no MT5 required
 ```
 
 The dependency arrow points one way: `analysis/` imports from `bot/` (indicators, the
@@ -86,7 +86,7 @@ python3 -m venv .venv && .venv/bin/pip install pandas requests python-dotenv
 ```
 
 ```bash
-python run.py test         # 228 logic tests, runs under WSL
+python run.py test         # 277 logic tests, runs under WSL
 python run.py review       # runs under WSL
 python run.py notify --dry # prints every notification shape, runs under WSL
 python run.py report       # runs under WSL (backtest/sweep need MT5 for history)

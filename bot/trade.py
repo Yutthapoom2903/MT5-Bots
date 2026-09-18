@@ -385,15 +385,19 @@ def modify_stops(position, new_sl, new_tp, logger):
 
 def summarize_deals(deals, symbol, magic):
     """
-    สรุปดีลที่ปิดแล้วของบอทตัวนี้
+    สรุปดีลที่ปิดแล้วของ Symbol นี้
 
     รับ list ของ deal object เพื่อให้เทสได้โดยไม่ต้องต่อ MT5
     นับเฉพาะดีลขาออก (entry == DEAL_ENTRY_OUT) เพราะนั่นคือตอนที่กำไร/ขาดทุนเกิดจริง
+
+    magic=None คือนับทุกไม้ของ Symbol นี้ไม่ว่าใครเปิด (ใช้ตอน ADOPT_MANUAL_POSITIONS
+    เปิดอยู่ — ไม้ที่เปิดเองก็ต้องเข้าตัวตัดวงจรเดียวกัน ไม่งั้นขาดทุนจากไม้เปิดเองจะ
+    ไม่ถูกนับและตัวตัดวงจรก็ป้องกันไม่ได้จริง) magic ตัวเลขคือกรองเฉพาะไม้ของบอทเอง
     """
     closed = [
         deal for deal in deals or []
         if deal.symbol == symbol
-        and deal.magic == magic
+        and (magic is None or deal.magic == magic)
         and deal.entry == mt5.DEAL_ENTRY_OUT
     ]
 
@@ -466,7 +470,11 @@ def closing_deals(ticket, logger=None):
 
 
 def deals_today(symbol, magic, now=None):
-    """สรุปผลของวันนี้จากประวัติจริงใน MT5 — ปลอดภัยต่อการ restart เพราะอ่านจากต้นทาง"""
+    """
+    สรุปผลของวันนี้จากประวัติจริงใน MT5 — ปลอดภัยต่อการ restart เพราะอ่านจากต้นทาง
+
+    magic=None ดู summarize_deals()
+    """
     from datetime import datetime, timedelta
 
     now = now or datetime.now()

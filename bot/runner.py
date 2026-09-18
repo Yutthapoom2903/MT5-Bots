@@ -845,8 +845,12 @@ def trading_allowed(state, logger):
     คืน (อนุญาตหรือไม่, เหตุผล, สรุปของวัน)
 
     อ่านผลจากประวัติจริงใน MT5 ทุกครั้ง จึงไม่พังเมื่อบอทถูก restart กลางวัน
+
+    ADOPT_MANUAL_POSITIONS เปิดอยู่ = นับไม้ทุกใบของ Symbol นี้ ไม่ใช่แค่ magic ของบอท
+    เพราะบอทดูแลไม้เปิดเองเหมือนไม้ตัวเองทุกอย่างแล้ว ขาดทุนจากไม้เปิดเองก็ต้องเข้า
+    ตัวตัดวงจรด้วย ไม่งั้นวันที่ไม้เปิดเองพังก็ยังปล่อยให้บอทเข้าไม้ใหม่ต่อได้เรื่อยๆ
     """
-    summary = trade.deals_today(SYMBOL, MAGIC)
+    summary = trade.deals_today(SYMBOL, None if ADOPT_MANUAL_POSITIONS else MAGIC)
     start_balance = state.get("day_start_balance")
 
     if summary["trades"] >= MAX_TRADES_PER_DAY:

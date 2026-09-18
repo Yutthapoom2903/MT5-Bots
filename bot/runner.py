@@ -1163,6 +1163,7 @@ def run(trade_enabled=False):
             "แท่งปิด %s | Close %.2f | H1 %s | M5 %s | RSI %.1f | ADX %.1f | ATR %.2f | Spread %s",
             candle_time, context["close"], context["h1_trend"], context["m5_trend"],
             context["rsi"], context["adx"], context["atr"], context["spread_points"],
+            extra={"new_cycle": True},
         )
         logger.info("คำตัดสิน: %s", verdict_line(decision))
 

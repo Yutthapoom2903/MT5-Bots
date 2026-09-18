@@ -105,13 +105,17 @@ class ConsoleFormatter(logging.Formatter):
         if record.exc_info:
             message = f"{message}\n{self.formatException(record.exc_info)}"
 
+        # เว้นบรรทัดก่อนแท่งใหม่เท่านั้น — runner.py สั่งด้วย extra={"new_cycle": True}
+        # ทำที่นี่แทนแทรก \n ในข้อความเอง เพราะไฟล์ log ใช้ Formatter คนละตัว ไม่โดนผลกระทบ
+        prefix = "\n" if getattr(record, "new_cycle", False) else ""
+
         if not self.use_color:
-            return f"{stamp} {mark} {message}"
+            return f"{prefix}{stamp} {mark} {message}"
 
         if record.levelno >= logging.WARNING:
             message = f"{style}{message}{RESET}"
 
-        return f"{DIM}{stamp}{RESET} {style}{mark}{RESET} {message}"
+        return f"{prefix}{DIM}{stamp}{RESET} {style}{mark}{RESET} {message}"
 
 
 

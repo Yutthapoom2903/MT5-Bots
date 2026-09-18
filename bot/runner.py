@@ -478,7 +478,10 @@ def execute(decision, state, logger):
     success = result is not None and result.retcode == trade.RETCODE_DONE
 
     if success:
-        logger.info("เข้าไม้สำเร็จ ticket %s ที่ราคา %.2f", result.order, result.price)
+        logger.info(core.paint(
+            "เข้าไม้สำเร็จ %s ticket %s ที่ราคา %.2f" % (signal, result.order, result.price),
+            core.BOLD, VERDICT_STYLE.get(signal, ""),
+        ))
         # จำ 1R ไว้ให้ตัวดูแลไม้ใช้ เพราะ SL จริงจะถูกขยับภายหลัง
         state.setdefault("position_risk", {})[str(result.order)] = sl_distance
 
@@ -634,10 +637,11 @@ def take_partial_profit(position, price, initial_risk, info, state, logger):
 
     if result is not None and result.retcode == trade.RETCODE_DONE:
         taken[key] = True
-        logger.info(
-            "เก็บกำไรบางส่วน ticket %s: ปิด %.2f จาก %.2f lot ที่ %.1fR",
-            position.ticket, volume, position.volume, PARTIAL_TP_AT_R,
-        )
+        logger.info(core.paint(
+            "เก็บกำไรบางส่วน ticket %s: ปิด %.2f จาก %.2f lot ที่ %.1fR" % (
+                position.ticket, volume, position.volume, PARTIAL_TP_AT_R,
+            ), core.GREEN,
+        ))
         NOTIFIER.partial_taken(
             SYMBOL, position.ticket, volume, position.volume, PARTIAL_TP_AT_R,
         )
@@ -691,10 +695,12 @@ def report_closed_positions(live_tickets, state, logger):
 
             continue
 
-        logger.info(
-            "ไม้ปิดแล้ว ticket %s: %.2f lot กำไรสุทธิ %.2f ที่ราคา %.2f",
-            ticket, closed["volume"], closed["profit"], closed["price"],
-        )
+        color = core.GREEN if closed["profit"] >= 0 else core.RED
+        logger.info(core.paint(
+            "ไม้ปิดแล้ว ticket %s: %.2f lot กำไรสุทธิ %.2f ที่ราคา %.2f" % (
+                ticket, closed["volume"], closed["profit"], closed["price"],
+            ), color,
+        ))
         NOTIFIER.position_closed(
             SYMBOL, ticket, meta, closed["profit"],
             meta.get("currency", ""), closed["price"],
@@ -826,10 +832,13 @@ def manage_positions(context, state, logger):
         result = trade.modify_stops(position, new_sl, position.tp, logger)
 
         if result is not None and result.retcode == trade.RETCODE_DONE:
-            logger.info(
-                "ขยับ SL ticket %s: %.2f -> %.2f (เข้าที่ %.2f, ราคาตอนนี้ %.2f)",
-                position.ticket, position.sl, new_sl, position.price_open, price,
-            )
+            reason = _stop_reason(position, new_sl)
+            color = core.GREEN if reason == "เสมอทุนแล้ว" else core.CYAN
+            logger.info(core.paint(
+                "ขยับ SL ticket %s: %.2f -> %.2f (เข้าที่ %.2f, ราคาตอนนี้ %.2f, %s)" % (
+                    position.ticket, position.sl, new_sl, position.price_open, price, reason,
+                ), color,
+            ))
             NOTIFIER.stop_moved(
                 SYMBOL, position.ticket, position.sl, new_sl,
                 position.price_open, price, _stop_reason(position, new_sl),

@@ -1,0 +1,2 @@
+logged_at,candle_time,symbol,signal,lots,intended_entry,filled_price,sl,tp,atr,adx,h1_trend,spread_points,risk_amount,status,ticket
+2026-09-19 02:45:30,2026-09-18 22:30:00,XAUUSD,BUY,0.01,4381.5,4381.5,4370.14,4404.22,7.57,21.65,UPTREND,29.0,11.36,OK,2048348856

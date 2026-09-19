@@ -578,26 +578,34 @@ def _remembered_risk(state, position):
 
 
 def _best_candidate(position, entry, price, initial_risk, atr):
-    """เลือก SL ใหม่ที่ดีที่สุดระหว่าง breakeven กับ trailing"""
+    """
+    เลือก SL ใหม่ที่ดีที่สุดระหว่าง breakeven กับ trailing พร้อมบอกว่าเลือกจากอันไหน
+
+    คืนที่มาด้วย ไม่ใช่แค่ค่า SL — เดาที่มาจาก "SL ใหม่อยู่เลยจุดเข้าไหม" ผิดตั้งแต่
+    trailing เริ่มทำงาน (TRAIL_START_R) เพราะ SL ที่ไล่ตามราคาก็อยู่เลยจุดเข้าเหมือนกัน
+    ข้อความเลยติดคำว่า "เสมอทุนแล้ว" ทุกครั้งทั้งที่ไม้วิ่งไปไกลกว่านั้นมากแล้ว
+    """
     candidates = []
 
     if USE_BREAKEVEN:
-        candidates.append(trade.breakeven_level(
+        candidates.append(("เสมอทุนแล้ว", trade.breakeven_level(
             position.type, entry, price, initial_risk, BREAKEVEN_AT_R, BREAKEVEN_BUFFER_R,
-        ))
+        )))
 
     if USE_TRAILING:
-        candidates.append(trade.trailing_level(
+        candidates.append(("ไล่ตามราคา", trade.trailing_level(
             position.type, entry, price, initial_risk, TRAIL_START_R, atr, TRAIL_ATR_MULT,
-        ))
+        )))
 
     best = None
-    for candidate in candidates:
-        improved = trade.better_stop(position.type, best, candidate)
+    best_reason = None
+    for reason, value in candidates:
+        improved = trade.better_stop(position.type, best, value)
         if improved is not None:
             best = improved
+            best_reason = reason
 
-    return best
+    return best, best_reason
 
 
 def take_partial_profit(position, price, initial_risk, info, state, logger):
@@ -647,14 +655,6 @@ def take_partial_profit(position, price, initial_risk, info, state, logger):
         )
 
 
-def _stop_reason(position, new_sl):
-    """บอกว่า SL ใหม่หมายถึงอะไร — คนอ่านอยากรู้ว่าเสมอทุนแล้วหรือแค่ไล่ตามราคา"""
-    if position.type == mt5.POSITION_TYPE_BUY:
-        beyond_entry = new_sl >= position.price_open
-    else:
-        beyond_entry = new_sl <= position.price_open
-
-    return "เสมอทุนแล้ว" if beyond_entry else "ไล่ตามราคา"
 
 
 def report_closed_positions(live_tickets, state, logger):
@@ -820,7 +820,7 @@ def manage_positions(context, state, logger):
 
         take_partial_profit(position, price, initial_risk, info, state, logger)
 
-        candidate = _best_candidate(position, position.price_open, price, initial_risk, context["atr"])
+        candidate, reason = _best_candidate(position, position.price_open, price, initial_risk, context["atr"])
         new_sl = trade.better_stop(position.type, position.sl, candidate)
 
         if new_sl is None:
@@ -832,7 +832,6 @@ def manage_positions(context, state, logger):
         result = trade.modify_stops(position, new_sl, position.tp, logger)
 
         if result is not None and result.retcode == trade.RETCODE_DONE:
-            reason = _stop_reason(position, new_sl)
             color = core.GREEN if reason == "เสมอทุนแล้ว" else core.CYAN
             logger.info(core.paint(
                 "ขยับ SL ticket %s: %.2f -> %.2f (เข้าที่ %.2f, ราคาตอนนี้ %.2f, %s)" % (
@@ -841,7 +840,7 @@ def manage_positions(context, state, logger):
             ))
             NOTIFIER.stop_moved(
                 SYMBOL, position.ticket, position.sl, new_sl,
-                position.price_open, price, _stop_reason(position, new_sl),
+                position.price_open, price, reason,
                 tp=getattr(position, "tp", None),
                 risk=_remembered_risk(state, position), signal=_signal_of(position),
             )

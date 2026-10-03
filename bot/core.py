@@ -156,6 +156,11 @@ def setup_logging(log_file=None, level=logging.INFO, console_level=logging.INFO)
         handlers=handlers,
         force=True,
     )
+
+    # urllib3 พิมพ์ URL เต็มของทุกคำขอที่ระดับ DEBUG และ URL ของ Telegram มี token ของบอทอยู่ในนั้น
+    # ไฟล์ log เก็บ DEBUG ทั้งหมด token เลยไปนอนอยู่ในไฟล์ที่คนมักแนบส่งเวลาขอความช่วยเหลือ
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
     return logging.getLogger()
 
 

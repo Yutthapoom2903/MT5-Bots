@@ -1052,6 +1052,23 @@ def switch_market(profile, symbol, state, logger):
 # จะเห็น tick ใหม่ครั้งแรกแล้วคิดว่าเพิ่งเปิด ทั้งที่ค้างอยู่ตั้งแต่เมื่อวาน
 TICK_WATCHES = {}
 
+# symbol ที่ขยับตลอดเวลา ใช้เป็นไม้บรรทัดวัดอายุ tick ของตลาดอื่น (ตั้งตอนเริ่มลูป)
+# tick ทั้งสองตัวเป็นเวลาเซิร์ฟเวอร์ broker เดียวกัน ลบกันได้ตรงๆ ไม่ต้องรู้ offset
+# ข้อดีคือรู้ทันทีตั้งแต่รันรอบแรกว่า tick ทองเก่ามาแปดชั่วโมงแล้ว ไม่ต้องยืนดูมันนิ่ง
+REFERENCE_SYMBOL = None
+
+
+def _tick_age_vs_reference(symbol, tick_time):
+    """tick ของ symbol เก่ากว่า REFERENCE_SYMBOL กี่วินาที — None ถ้าเทียบไม่ได้"""
+    if not REFERENCE_SYMBOL or REFERENCE_SYMBOL == symbol:
+        return None
+
+    reference = mt5.symbol_info_tick(REFERENCE_SYMBOL)
+    if reference is None or not reference.time:
+        return None
+
+    return max(0, reference.time - tick_time)
+
 
 def _market_closed_since(symbol):
     """เวลา (epoch) ที่ตลาดนี้ปิดมาตั้งแต่ — None ถ้าเปิดอยู่หรือดึงข้อมูลไม่ได้
@@ -1071,6 +1088,11 @@ def _market_closed_since(symbol):
     tick = mt5.symbol_info_tick(symbol)
     if tick is None or not tick.time:
         return None
+
+    # เทียบกับตลาดที่ยังขยับอยู่ก่อน — ตอบได้ทันทีแม้เพิ่งเริ่มรัน
+    age = _tick_age_vs_reference(symbol, tick.time)
+    if age is not None and age >= STALE_TICK_SECONDS:
+        return now - age
 
     watch = TICK_WATCHES.setdefault(symbol, trade.TickWatch())
     frozen = watch.observe(symbol, tick.time, now)
@@ -1171,6 +1193,15 @@ def run(trade_enabled=False):
     primary_symbol = SYMBOL
     fallback_key = profiles.fallback_for(primary_profile.symbol) if USE_MARKET_FALLBACK else None
     closed_since = None
+
+    global REFERENCE_SYMBOL
+    if fallback_key:
+        reference = profiles.PROFILES[fallback_key]
+        try:
+            REFERENCE_SYMBOL, _ = core.resolve_symbol(reference.symbol, reference.keywords)
+        except core.MT5Error as error:
+            logger.warning("หาตลาดสำรอง %s ไม่เจอ — ไม่สลับตลาด: %s", fallback_key, error)
+            fallback_key = None
 
     while True:
         if not connection_is_alive():

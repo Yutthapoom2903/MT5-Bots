@@ -547,7 +547,10 @@ at import time; `paths.configure()` repoints the per-symbol files.
   UTC because `broker_gmt_offset()` is derived from that same tick and goes wrong when it is
   stale. One watch per symbol and the primary is still observed while on the fallback —
   otherwise the switch back sees "a new tick" and flaps. After a restart it takes
-  `STALE_TICK_SECONDS` to notice, since there is no earlier tick to compare against.
+  `STALE_TICK_SECONDS` to notice, since there is no earlier tick to compare against —
+  unless `REFERENCE_SYMBOL` (the fallback market, always moving) is available: both ticks are
+  broker server time, so `reference.time - tick.time` is the true age at once, and a restart
+  on a closed weekend switches on the first cycle instead of after 10 min + 2 h.
 - Unverified against a live terminal, like everything else under Outstanding.
 
 ## Deliberately not built

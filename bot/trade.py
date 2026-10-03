@@ -161,6 +161,30 @@ def symbol_is_tradable(info):
     return info.trade_mode == mt5.SYMBOL_TRADE_MODE_FULL
 
 
+class TickWatch:
+    """จับว่า tick ของ symbol หยุดนิ่งมานานแค่ไหน — pure ไม่แตะ MT5
+
+    broker บางเจ้าตั้ง trade_mode เป็น FULL ตลอด แม้ตลาดปิดเสาร์-อาทิตย์ symbol_is_tradable()
+    จึงบอกว่าเปิดทั้งที่ไม่มีราคาใหม่เข้ามาเลย ตลาดที่เปิดอยู่ tick ขยับทุกไม่กี่วินาที
+    ตลาดปิดแล้วเวลาของ tick ค้างที่ค่าเดิม — ใช้ข้อนี้แทน ไม่ต้องรู้ offset ของ broker
+    ซึ่งคำนวณจาก tick ตัวเดียวกันนี้เอง (tick เก่าทำให้ offset เพี้ยนไปด้วย)
+    """
+
+    def __init__(self):
+        self.symbol = None
+        self.tick_time = None
+        self.changed_at = None
+
+    def observe(self, symbol, tick_time, now):
+        """บันทึกการดู tick ครั้งนี้ คืนจำนวนวินาทีที่ tick ของ symbol นี้ไม่ขยับ"""
+        if symbol != self.symbol or tick_time != self.tick_time:
+            self.symbol = symbol
+            self.tick_time = tick_time
+            self.changed_at = now
+
+        return now - self.changed_at
+
+
 def open_positions(symbol, magic):
     """position ของ Symbol นี้ที่เปิดโดยบอทตัวนี้ (กรองด้วย magic)"""
     positions = mt5.positions_get(symbol=symbol)

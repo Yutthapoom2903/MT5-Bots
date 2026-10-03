@@ -13,12 +13,25 @@ import os
 
 DATA_DIR = "data"
 
-SIGNAL_LOG = os.path.join(DATA_DIR, "signal_log.csv")
-FEATURE_LOG = os.path.join(DATA_DIR, "market_training_data.csv")
-TRADE_LOG = os.path.join(DATA_DIR, "trade_log.csv")
-STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
-LOG_FILE = os.path.join(DATA_DIR, "bot.log")
+# ปฏิทินข่าวเป็นของทั้งโลก ไม่ใช่ของ symbol ใด จึงอยู่ที่ data/ เสมอ ไม่ตามโฟลเดอร์ของ symbol
 NEWS_CACHE = os.path.join(DATA_DIR, "news_calendar.json")
+
+
+def configure(data_dir):
+    """ย้ายไฟล์ของ symbol ไปอยู่ใต้ data_dir — run.py เรียกก่อน import อย่างอื่นเท่านั้น
+
+    ไฟล์ที่ผูกกับ symbol (log, state, CSV) ต้องแยกกัน ไม่งั้นข้อมูลสองตลาดปนในไฟล์เดียว
+    """
+    global SIGNAL_LOG, FEATURE_LOG, TRADE_LOG, STATE_FILE, LOG_FILE
+
+    SIGNAL_LOG = os.path.join(data_dir, "signal_log.csv")
+    FEATURE_LOG = os.path.join(data_dir, "market_training_data.csv")
+    TRADE_LOG = os.path.join(data_dir, "trade_log.csv")
+    STATE_FILE = os.path.join(data_dir, "bot_state.json")
+    LOG_FILE = os.path.join(data_dir, "bot.log")
+
+
+configure(DATA_DIR)
 
 
 def ensure_parent(path):

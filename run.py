@@ -29,6 +29,7 @@ import subprocess
 import sys
 
 from bot import paths      # ชื่อไฟล์ข้อมูลอย่างเดียว ไม่แตะ MT5
+from bot import profiles   # ค่าต่อ symbol (XAUUSD / BTCUSD) ไม่แตะ MT5
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -146,13 +147,16 @@ def command_signal(args):
     print(strategy.evaluate(context).report())
 
 
-def _run_loop(trade_enabled):
+def _run_loop(trade_enabled, args=None):
     """
     เรียกลูปหลักโดยแจ้ง Telegram เสมอว่าจบด้วยเหตุใด
 
     บอทที่ตายเงียบคือบอทที่แย่ที่สุด โดยเฉพาะตอนถือไม้อยู่แล้วไม่มีใครขยับ SL ให้
     """
     from bot import runner
+
+    if args is not None and args.no_fallback:
+        runner.USE_MARKET_FALLBACK = False
 
     try:
         runner.run(trade_enabled=trade_enabled)
@@ -165,11 +169,11 @@ def _run_loop(trade_enabled):
 
 
 def command_watch(args):
-    _run_loop(trade_enabled=False)
+    _run_loop(trade_enabled=False, args=args)
 
 
 def command_trade(args):
-    _run_loop(trade_enabled=True)
+    _run_loop(trade_enabled=True, args=args)
 
 
 def command_notify(args):
@@ -404,7 +408,7 @@ def command_sweep(args):
     # ถามจาก broker เอา ไม่ให้ backtest ใช้ค่าเริ่มต้นที่อาจไม่ตรงกับโบรกเจ้านี้
     from bot import core
     offset = core.broker_gmt_offset(runner.SYMBOL)
-    base = {"spread_points": args.spread}
+    base = {"spread_points": args.spread, **_symbol_point()}
     if offset is not None:
         base["gmt_offset"] = offset
 
@@ -435,7 +439,7 @@ def command_walkforward(args):
     def progress(number, total):
         print(f"ช่วงที่ {number}/{total} ...")
 
-    result = backtest.walk_forward(m15, h1, m5, {"spread_points": args.spread}, grid,
+    result = backtest.walk_forward(m15, h1, m5, {"spread_points": args.spread, **_symbol_point()}, grid,
                                    folds=args.folds, progress=progress)
     print()
     print(backtest.format_walk_forward(result))
@@ -472,6 +476,16 @@ def _load_history(months):
     return m15, h1, m5
 
 
+def _symbol_point():
+    """point ของ symbol นี้จาก broker — backtest ใช้แปลง spread (points) เป็นราคา
+    ทองกับ BTC ไม่เท่ากัน ค่าเริ่มต้น 0.01 ของ backtest จึงใช้ได้แค่กับทอง"""
+    import MetaTrader5 as mt5
+    from bot import runner
+
+    info = mt5.symbol_info(runner.SYMBOL)
+    return {"point": info.point} if info is not None and info.point else {}
+
+
 def command_backtest(args):
     """จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริงจาก MT5"""
     from analysis import backtest
@@ -489,6 +503,7 @@ def command_backtest(args):
         "trail_start_r": runner.TRAIL_START_R,
         "trail_atr_mult": runner.TRAIL_ATR_MULT,
         "spread_points": args.spread,
+        **_symbol_point(),
     }
 
     if args.no_compare:
@@ -575,7 +590,7 @@ def _auto_symbol(args):
     from bot import runner
 
     core.connect()
-    resolved, candidates = core.resolve_symbol(runner.SYMBOL)
+    resolved, candidates = core.resolve_symbol(runner.SYMBOL, profiles.current().keywords)
 
     if not candidates:
         print(f"ใช้ Symbol: {resolved}")
@@ -629,22 +644,28 @@ def command_all(args):
     print(f"บันทึกทุกอย่างลง {paths.LOG_FILE} — เช้ามาสรุปด้วย: python run.py report")
     print("กด Ctrl+C เพื่อหยุด\n")
 
-    _run_loop(trade_enabled=args.trade)
+    _run_loop(trade_enabled=args.trade, args=args)
 
 
 def build_parser():
+    spread_default = profiles.current().backtest_spread
+
     parser = argparse.ArgumentParser(
-        description="บอท XAUUSD MA crossover หลาย timeframe",
+        description="บอท MA crossover หลาย timeframe บน MT5 (XAUUSD, BTCUSD)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     # พิมพ์ run.py เปล่าๆ ต้องทำงานได้ทันที จึงต้องมี default ของทุก flag ที่ all ใช้
     parser.set_defaults(
-        command=None, trade=False, months=6, spread=30.0,
-        top=15, quick=False, skip_backtest=False, no_compare=False, folds=4,
+        command=None, trade=False, months=6, spread=spread_default,
+        top=15, quick=False, skip_backtest=False, no_compare=False, folds=4, no_fallback=False,
         csv=paths.FEATURE_LOG, keywords=None, dry=False, check=False,
         horizon=8, refresh=False,
     )
+    parser.add_argument("--symbol", default=profiles.DEFAULT,
+                        help=f"ตลาดที่เฝ้า: {', '.join(profiles.PROFILES)} (ใส่ก่อนชื่อคำสั่ง)")
+    parser.add_argument("--no-fallback", action="store_true",
+                        help="ไม่สลับไปเฝ้า BTCUSD ตอนทองปิด (ค่าเริ่มต้นคือสลับ)")
     parser.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
     parser.add_argument("--skip-backtest", action="store_true",
                         help="ข้ามการจำลองย้อนหลังและการกวาดค่า เข้าเฝ้าดูเลย")
@@ -664,19 +685,19 @@ def build_parser():
 
     simulate = subparsers.add_parser("backtest", help="จำลองกลยุทธ์ย้อนหลังบนข้อมูลจริง")
     simulate.add_argument("--months", type=int, default=6, help="ย้อนหลังกี่เดือน (ค่าเริ่มต้น 6)")
-    simulate.add_argument("--spread", type=float, default=30.0, help="spread สมมติเป็น points")
+    simulate.add_argument("--spread", type=float, default=spread_default, help="spread สมมติเป็น points")
     simulate.add_argument("--no-compare", action="store_true", help="ไม่ต้องเทียบกับ crossover เปล่า")
 
     sweep = subparsers.add_parser("sweep", help="กวาดหลายชุดค่าเพื่อดูความทนของผล")
     sweep.add_argument("--months", type=int, default=6)
-    sweep.add_argument("--spread", type=float, default=30.0)
+    sweep.add_argument("--spread", type=float, default=spread_default)
     sweep.add_argument("--top", type=int, default=15, help="แสดงกี่แถว")
     sweep.add_argument("--quick", action="store_true", help="กวาดเฉพาะ SL/TP ไม่รวม ADX")
 
     forward_test = subparsers.add_parser(
         "walkforward", help="จูนจากอดีต แล้ววัดผลบนช่วงที่ยังไม่เคยเห็น")
     forward_test.add_argument("--months", type=int, default=6)
-    forward_test.add_argument("--spread", type=float, default=30.0)
+    forward_test.add_argument("--spread", type=float, default=spread_default)
     forward_test.add_argument("--folds", type=int, default=4, help="แบ่งกี่ช่วงทดสอบ")
     forward_test.add_argument("--quick", action="store_true", help="กวาดเฉพาะ SL/TP")
 
@@ -706,7 +727,7 @@ def build_parser():
     every.add_argument("--trade", action="store_true", help="ส่งคำสั่งจริงในขั้นสุดท้าย")
     every.add_argument("--skip-backtest", action="store_true", help="ข้ามการวิเคราะห์ย้อนหลัง")
     every.add_argument("--months", type=int, default=6)
-    every.add_argument("--spread", type=float, default=30.0)
+    every.add_argument("--spread", type=float, default=spread_default)
     every.add_argument("--top", type=int, default=10)
     every.add_argument("--quick", action="store_true")
 
@@ -737,7 +758,25 @@ COMMANDS = {
 OFFLINE_COMMANDS = {"review", "report", "outcomes", "news", "test", "notify", "menu"}
 
 
+def _select_symbol(argv):
+    """อ่าน --symbol ก่อนสร้าง parser — เพราะค่าเริ่มต้นของ parser และ path ของไฟล์ข้อมูล
+    ขึ้นกับตลาดที่เลือก และต้องตั้งก่อนที่ runner/report จะถูก import"""
+    early = argparse.ArgumentParser(add_help=False)
+    early.add_argument("--symbol", default=profiles.DEFAULT)
+    known, _ = early.parse_known_args(argv)
+
+    profile = profiles.select(known.symbol)
+    paths.configure(profile.data_dir)
+    return profile
+
+
 def main():
+    try:
+        _select_symbol(sys.argv[1:])
+    except ValueError as error:
+        print(error)
+        return 2
+
     parser = build_parser()
     args = parser.parse_args()
 

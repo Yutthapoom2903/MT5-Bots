@@ -511,6 +511,45 @@ only path that measures them at the rate they actually run.
 - **`MIN_SAMPLE` is the honesty guard.** `format_split()` still prints the difference when
   a side is thin, but labels it noise. A 0.5R edge over four candles is four candles.
 
+## Choosing the market (XAUUSD / BTCUSD)
+
+`python run.py --symbol BTCUSD <command>` (flag goes before the subcommand; default XAUUSD).
+Still single-symbol — one market per run, never two at once. Everything that differs per
+market lives in `bot/profiles.py`: broker-name keywords, `max_spread`, backtest spread, and
+the data directory. `run.py _select_symbol()` reads `--symbol` *before* the parser is built
+and before `runner`/`report` are imported, because the parser defaults and `paths.*` are read
+at import time; `paths.configure()` repoints the per-symbol files.
+
+- **Data is separated per symbol** (`data/btcusd/`; gold stays in `data/`). Mixing them would
+  append BTC rows to the gold CSVs, make `outcomes` label across markets, and let one
+  `bot_state.json` hold both markets' `position_risk`. `news_calendar.json` stays shared.
+- **`max_spread` and the backtest spread for BTCUSD are estimates**, not measured — spread is in
+  points and BTC's point differs by broker. Read `run.py check` and correct `profiles.py` before
+  concluding the bot "is not entering" for any other reason.
+- Backtest takes `point` from `symbol_info` (`_symbol_point()`); the 0.01 default is gold's.
+- BTC trades 24/7, so the market-closed path and session filter behave differently from gold;
+  `SESSION_UTC_HOURS` was written for gold and is meaningless for BTC (filter ships off).
+- **Automatic fallback when gold is closed.** `runner.run()` switches to BTCUSD once the
+  primary market has been closed `FALLBACK_AFTER_CLOSED_SECONDS` (2h — gold's daily break is
+  ~1h and must not cause a nightly flip; the weekend is what this is for) and switches back as
+  soon as the primary reopens. `profiles.FALLBACKS` maps market -> fallback; BTC has none.
+  `switch_market()` saves the old market's state file, repoints `SYMBOL`/CSV/state paths and
+  `strategy.MAX_SPREAD_POINTS`, and loads the new market's state. It **never leaves a market
+  while a position is open there** — stops still need moving — so a BTC trade held across
+  gold's reopening keeps the bot on BTC until it closes. Still one market at a time.
+  `--no-fallback` (or `USE_MARKET_FALLBACK = False`) turns it off; `--symbol BTCUSD` has no
+  fallback by construction. `LOG_FILE` does not follow the switch (the handler is bound at
+  start). The daily circuit breaker reads deals per symbol, so each market gets its own
+  daily limits rather than sharing one.
+- **"Market closed" is two signals, not one.** `trade_mode != FULL`, or the tick time frozen
+  for `STALE_TICK_SECONDS` (`trade.TickWatch`, pure). Some brokers report FULL all weekend, so
+  the first signal alone never fires. Frozen-tick is used instead of comparing the tick to
+  UTC because `broker_gmt_offset()` is derived from that same tick and goes wrong when it is
+  stale. One watch per symbol and the primary is still observed while on the fallback —
+  otherwise the switch back sees "a new tick" and flaps. After a restart it takes
+  `STALE_TICK_SECONDS` to notice, since there is no earlier tick to compare against.
+- Unverified against a live terminal, like everything else under Outstanding.
+
 ## Deliberately not built
 
 - **Multiple symbols.** Every risk limit, the circuit breaker, and the state file are

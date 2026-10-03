@@ -675,6 +675,12 @@ class Notifier:
             "กลับไปเฝ้าตามรอบปกติ",
         ], key="market-open", loud=True)
 
+    def market_switched(self, old, new, reason):
+        # key ตามตลาดปลายทาง ไม่งั้นข้อความสลับไปกับสลับกลับจะชน dedup กันเอง
+        self.send("market", f"สลับตลาด {old} → {new}", [
+            escape(reason),
+        ], key=f"market-switch-{new}", loud=True)
+
     # ---------- สัญญาณ ----------
 
     def candle_verdict(self, decision, context, symbol, adx_min=None, watch_mode=False,

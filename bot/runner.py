@@ -18,13 +18,14 @@ from dotenv import load_dotenv
 
 from bot import core
 from bot import paths
+from bot import profiles
 from bot import trade
 from bot import notify
 from bot import news
 from bot import strategy
 
 # ---------- ตลาดที่เฝ้า ----------
-SYMBOL = "XAUUSD"
+SYMBOL = profiles.current().symbol    # เปลี่ยนด้วย python run.py --symbol BTCUSD
 ENTRY_TIMEFRAME = mt5.TIMEFRAME_M15
 TREND_TIMEFRAME = mt5.TIMEFRAME_H1
 CONFIRM_TIMEFRAME = mt5.TIMEFRAME_M5
@@ -83,6 +84,16 @@ MAX_CONSECUTIVE_LOSSES = 3
 
 # ---------- ความทนทานของลูป ----------
 MARKET_CLOSED_SLEEP = 300     # ตลาดปิดแล้วไม่ต้อง poll ถี่
+
+# ตลาดหลักปิดนานเท่านี้ถึงสลับไปตลาดสำรอง (ทอง -> BTC ดู profiles.FALLBACKS)
+# 2 ชั่วโมง เพราะทองพักทุกวันราวหนึ่งชั่วโมง ไม่ควรสลับไปมาทุกคืน — ตั้งใจให้ครอบแค่เสาร์-อาทิตย์
+# False = ไม่สลับ เฝ้าตลาดเดียวตามที่สั่ง (python run.py --no-fallback)
+USE_MARKET_FALLBACK = True
+
+# tick ไม่ขยับนานเท่านี้ถือว่าตลาดปิด แม้ broker จะยังรายงาน trade_mode เป็น FULL
+# ทองตอนเปิดอยู่ขยับทุกไม่กี่วินาที แม้ช่วงเงียบสุดก็ไม่น่าถึงหลักนาที 10 นาทีจึงกว้างพอ
+STALE_TICK_SECONDS = 600
+FALLBACK_AFTER_CLOSED_SECONDS = 7200
 RECONNECT_DELAY = 30
 CLOSE_LOOKUP_ATTEMPTS = 10    # รอประวัติดีลของไม้ที่เพิ่งปิดกี่รอบก่อนเลิกรอ
 HEARTBEAT_EVERY_HOURS = 12    # แจ้ง Telegram เป็นระยะว่ายังทำงานอยู่ 0 = ปิด
@@ -1006,6 +1017,78 @@ def guard_account(account, trade_enabled, logger):
         )
 
 
+# ---------- สลับตลาดตอนตลาดหลักปิด ----------
+
+def _apply_market(profile, symbol):
+    """ชี้ทั้งโปรเจกต์ไปที่ตลาดนี้ — ชื่อ symbol, ไฟล์ข้อมูล, เพดาน spread
+
+    ไฟล์ของแต่ละตลาดแยกกัน (bot/profiles.py) เพราะแท่งสองตลาดห้ามปนใน CSV เดียว
+    และ state ต้องจำ last_candle_time / position_risk ของใครของมัน
+    LOG_FILE ไม่ย้ายตาม: handler ของ logger ผูกกับไฟล์ตอนเริ่มรันแล้ว
+    """
+    global SYMBOL, SIGNAL_LOG, FEATURE_LOG, TRADE_LOG, STATE_FILE
+
+    profiles.select(profile.symbol)
+    paths.configure(profile.data_dir)
+
+    SYMBOL = symbol
+    SIGNAL_LOG = paths.SIGNAL_LOG
+    FEATURE_LOG = paths.FEATURE_LOG
+    TRADE_LOG = paths.TRADE_LOG
+    STATE_FILE = paths.STATE_FILE
+    strategy.MAX_SPREAD_POINTS = profile.max_spread
+
+
+def switch_market(profile, symbol, state, logger):
+    """เก็บ state ของตลาดเดิม แล้วย้ายไปตลาดใหม่ คืน state ของตลาดใหม่"""
+    core.save_state(STATE_FILE, state)
+    _apply_market(profile, symbol)
+    core.prepare_symbol(SYMBOL)
+    logger.info("สลับไปเฝ้า %s (ข้อมูลที่ %s)", SYMBOL, profile.data_dir)
+    return core.load_state(STATE_FILE)
+
+
+# หนึ่ง watch ต่อ symbol — ตอนอยู่ตลาดสำรองยังต้องดูทองต่อทุกรอบ ไม่งั้นพอสลับกลับ
+# จะเห็น tick ใหม่ครั้งแรกแล้วคิดว่าเพิ่งเปิด ทั้งที่ค้างอยู่ตั้งแต่เมื่อวาน
+TICK_WATCHES = {}
+
+
+def _market_closed_since(symbol):
+    """เวลา (epoch) ที่ตลาดนี้ปิดมาตั้งแต่ — None ถ้าเปิดอยู่หรือดึงข้อมูลไม่ได้
+
+    ปิดได้สองทาง: broker รายงานว่าซื้อขายไม่ได้ หรือ tick หยุดนิ่งเกิน STALE_TICK_SECONDS
+    ตอนเพิ่งเริ่มรันยังไม่เคยเห็น tick เก่า จึงต้องรอ STALE_TICK_SECONDS ก่อนจะรู้
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return None
+
+    now = time.time()
+
+    if not trade.symbol_is_tradable(info):
+        return now
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or not tick.time:
+        return None
+
+    watch = TICK_WATCHES.setdefault(symbol, trade.TickWatch())
+    frozen = watch.observe(symbol, tick.time, now)
+
+    return now - frozen if frozen >= STALE_TICK_SECONDS else None
+
+
+def _market_is_open(symbol):
+    return mt5.symbol_info(symbol) is not None and _market_closed_since(symbol) is None
+
+
+def _holds_positions(symbol):
+    """ถือไม้ของ symbol นี้อยู่ไหม — ถ้าถือ ห้ามเดินจากไปเพราะไม้ต้องมีคนขยับ SL"""
+    positions = (trade.open_positions_all(symbol) if ADOPT_MANUAL_POSITIONS
+                 else trade.open_positions(symbol, MAGIC))
+    return bool(positions)
+
+
 def run(trade_enabled=False):
     """ลูปเดียวที่ทำทุกอย่าง — ดูแลไม้ที่เปิดอยู่ บันทึกข้อมูล ตัดสินใจ และเทรดถ้าเปิดไว้"""
     # ไฟล์เก็บ DEBUG ทั้งหมด จอเห็นแค่ INFO เวลามีปัญหาจะได้ย้อนดูได้ทีละรอบ
@@ -1083,6 +1166,12 @@ def run(trade_enabled=False):
     market_was_closed = False
     algo_trading_was_off = False
 
+    # ตลาดที่สั่งให้เฝ้าตอนเริ่ม — ตลาดสำรองเป็นแค่ที่พักตอนตัวนี้ปิด แล้วต้องกลับมาที่นี่
+    primary_profile = profiles.current()
+    primary_symbol = SYMBOL
+    fallback_key = profiles.fallback_for(primary_profile.symbol) if USE_MARKET_FALLBACK else None
+    closed_since = None
+
     while True:
         if not connection_is_alive():
             NOTIFIER.connection_lost(SYMBOL)
@@ -1102,8 +1191,52 @@ def run(trade_enabled=False):
         handle_commands(state, account, logger)
         heartbeat(state, account, logger)
 
-        info = mt5.symbol_info(SYMBOL)
-        if info is not None and not trade.symbol_is_tradable(info):
+        # อยู่ตลาดสำรอง: ตลาดหลักเปิดแล้วกลับไปทันที ยกเว้นยังถือไม้สำรองอยู่
+        # (ไม้ต้องมีคนขยับ SL — กลับทีหลังตอนไม้ปิดแล้ว)
+        if SYMBOL != primary_symbol and _market_is_open(primary_symbol):
+            if _holds_positions(SYMBOL):
+                logger.info("%s เปิดแล้ว แต่ยังถือไม้ %s อยู่ — อยู่ต่อจนไม้ปิดก่อนค่อยกลับ",
+                            primary_symbol, SYMBOL)
+            else:
+                old = SYMBOL
+                state = switch_market(primary_profile, primary_symbol, state, logger)
+                last_candle_time = state.get("last_candle_time")
+                halted_reason = None
+                market_was_closed = False
+                closed_since = None
+                NOTIFIER.market_switched(old, SYMBOL, f"{SYMBOL} เปิดแล้ว กลับมาเฝ้าตลาดหลัก")
+                continue
+
+        shut_since = _market_closed_since(SYMBOL)
+
+        if shut_since is None:
+            closed_since = None
+        elif fallback_key and SYMBOL == primary_symbol:
+            # ถ้าปิดเพราะ tick ค้าง นับจากตอนที่ tick หยุด ไม่ใช่ตอนที่เราเพิ่งสังเกตเห็น
+            closed_since = closed_since or shut_since
+
+            if time.time() - closed_since >= FALLBACK_AFTER_CLOSED_SECONDS:
+                target = profiles.PROFILES[fallback_key]
+
+                try:
+                    target_symbol, _ = core.resolve_symbol(target.symbol, target.keywords)
+                except core.MT5Error as error:
+                    # หาตลาดสำรองไม่เจอ = ไม่มีที่ให้ไป ไม่ใช่เหตุให้ลูปล้ม และไม่ต้องหาซ้ำทุกรอบ
+                    logger.warning("สลับไป %s ไม่ได้: %s", fallback_key, error)
+                    fallback_key = None
+                else:
+                    if _market_is_open(target_symbol):
+                        old = SYMBOL
+                        state = switch_market(target, target_symbol, state, logger)
+                        last_candle_time = state.get("last_candle_time")
+                        halted_reason = None
+                        market_was_closed = False
+                        NOTIFIER.market_switched(
+                            old, SYMBOL,
+                            f"{old} ปิดนานเกิน {FALLBACK_AFTER_CLOSED_SECONDS // 60} นาที")
+                        continue
+
+        if shut_since is not None:
             logger.info("ตลาด %s ปิดอยู่ รอ %d วินาที", SYMBOL, MARKET_CLOSED_SLEEP)
             NOTIFIER.market_closed(SYMBOL, MARKET_CLOSED_SLEEP)
             market_was_closed = True

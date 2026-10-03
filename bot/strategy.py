@@ -17,6 +17,8 @@ evaluate() เป็นฟังก์ชันบริสุทธิ์ ร�
 
 from collections import namedtuple
 
+from bot import profiles
+
 # ---------- สวิตช์ตัวกรอง เปิด/ปิดได้ทีละตัวเพื่อวัดผล ----------
 USE_H1_TREND_FILTER = True    # เทรดตามเทรนด์ H1 เท่านั้น
 USE_ADX_FILTER = True         # ข้ามตลาด sideway
@@ -30,7 +32,7 @@ USE_FVG_FILTER = False        # Fair Value Gap ต้องไม่สวนท
 ADX_MIN = 20.0                # ต่ำกว่านี้ถือว่าไม่มีเทรนด์
 RSI_MAX_FOR_BUY = 70.0        # RSI สูงกว่านี้แล้วไม่ตาม BUY
 RSI_MIN_FOR_SELL = 30.0       # RSI ต่ำกว่านี้แล้วไม่ตาม SELL
-MAX_SPREAD_POINTS = 50.0
+MAX_SPREAD_POINTS = profiles.current().max_spread    # ต่อ symbol ดู bot/profiles.py
 
 # ชั่วโมงที่อนุญาต — เขียนเป็น **UTC** แล้วค่อยแปลงเป็นเวลาเซิร์ฟเวอร์ตอนใช้
 #

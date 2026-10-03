@@ -77,6 +77,35 @@ PARTIAL_TP_FRACTION = 0.5
 # เหมือนไม้ของบอททุกอย่าง ไม่รวมตัวตัดวงจรรายวันซึ่งยังนับเฉพาะไม้ที่บอทเปิดเอง
 ADOPT_MANUAL_POSITIONS = True
 
+def log_position_status(state, logger):
+    """บรรทัดเดียวต่อไม้ว่าตอนนี้อยู่ตรงไหน — ออกจอทุกแท่งใหม่
+
+    manage_positions() เงียบตั้งแต่ตอนใส่ SL/TP จนกว่าไม้จะวิ่งถึงจุดเสมอทุน ซึ่งอาจเป็นชั่วโมง
+    ที่หน้าจอไม่ขยับเลย ดูแล้วเหมือนบอทไม่ได้เฝ้า ทั้งที่ log DEBUG ในไฟล์ยืนยันว่าเฝ้าทุก 30 วินาที
+    """
+    positions = (trade.open_positions_all(SYMBOL) if ADOPT_MANUAL_POSITIONS
+                 else trade.open_positions(SYMBOL, MAGIC))
+    tick = mt5.symbol_info_tick(SYMBOL)
+
+    if not positions or tick is None:
+        return
+
+    for position in positions:
+        risk = _remembered_risk(state, position)
+        is_buy = position.type == mt5.POSITION_TYPE_BUY
+        price = tick.bid if is_buy else tick.ask
+        move = (price - position.price_open) if is_buy else (position.price_open - price)
+        progress = f"{move / risk:+.2f}R" if risk else "ยังไม่รู้ 1R"
+
+        logger.info(
+            "เฝ้าไม้ %s %s %.2f lot เข้า %.2f ตอนนี้ %.2f (%s) SL %.2f TP %.2f | "
+            "เสมอทุนที่ +%.1fR ไล่ SL ที่ +%.1fR",
+            position.ticket, "BUY" if is_buy else "SELL", position.volume,
+            position.price_open, price, progress, position.sl, position.tp,
+            BREAKEVEN_AT_R, TRAIL_START_R,
+        )
+
+
 # ---------- ตัวตัดวงจร หยุดเองเมื่อวันนี้ไม่เข้าทาง ----------
 MAX_DAILY_LOSS_PERCENT = 3.0  # ขาดทุนถึงกี่ % ของทุนต้นวันแล้วหยุดเทรดทั้งวัน
 MAX_TRADES_PER_DAY = 5
@@ -1329,6 +1358,9 @@ def run(trade_enabled=False):
             extra={"new_cycle": True},
         )
         logger.info("คำตัดสิน: %s", verdict_line(decision))
+
+        if trade_enabled:
+            log_position_status(state, logger)
 
         # เหตุผลเต็มลงไฟล์เสมอ จะได้ย้อนดูได้ว่าตัวกรองไหนบล็อกและด้วยตัวเลขอะไร
         for check in decision.checks:
